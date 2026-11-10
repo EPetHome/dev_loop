@@ -53,7 +53,7 @@ export async function push(dir: string, o: {timeoutMs?: number} = {}): Promise<P
     return r;
   };
   const network = (args: string[], limit = timeoutMs) => childExec("git", args, {cwd: t.repo, timeoutMs: limit});
-  const fetched = await network(["fetch", "--no-tags", "--prune", "origin"]);
+  const fetched = await network(["fetch", "--no-tags", "--prune", "--no-prune-tags", "--refmap=", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
   if (fetched.code || fetched.killed) return finish("推送失败", "推送失败", "网络失败", fetched.output || "fetch 超时", "临时故障");
   if (gitTry(t.repo, ["rev-parse", "--verify", "refs/remotes/origin/dev"]).stdout.trim() === commit) return finish("已推送", "已推送", short, "远端已是最新");
   let hits: string[];

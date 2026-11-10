@@ -38,7 +38,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 输出字段：`executionId`、`commit`、`devBefore`、`devAfter`、`result`、`unverified`、`seconds`、`worktree`、`revert`。`revert` 给出 `git -C '<dev 检出目录>' revert -m 1 <devAfter>`；已在 dev 且 dev 未检出时，后两项为空。
 - 没有交付、版本不符、检查不足、dev 未检出等前置拒绝不写记录、不改阶段；合入结果（包括失败、已在 dev）写记录。
 
-**推送默认关闭**，只有 `合入 --推送` 在合入成功或已在 dev 后执行：确认 origin → `git fetch --no-tags --prune origin` → 扫描 dev 上、origin 所有分支都没有的提交 → `git push --no-follow-tags origin <完整sha>:refs/heads/dev`。显式关闭 follow-tags，即使配置 `push.followTags=true` 也不推标签。不强推、不推其他分支、不拉取、不重试；先清理远端已删除分支的陈旧跟踪引用，避免把已删除的 dev 误报成「已推送」。刷新后的远端 dev 等于本地时直接返回「已推送」。
+**推送默认关闭**，只有 `合入 --推送` 在合入成功或已在 dev 后执行：确认 origin → `git fetch --no-tags --prune --no-prune-tags --refmap= origin '+refs/heads/*:refs/remotes/origin/*'` → 扫描 dev 上、origin 所有分支都没有的提交 → `git push --no-follow-tags origin <完整sha>:refs/heads/dev`。显式关闭 follow-tags，即使配置 `push.followTags=true` 也不推标签。不强推、不推其他分支、不拉取、不重试；fetch 只清理 origin 的分支跟踪引用，关闭 prune-tags 并忽略配置的额外抓取映射，保留本地标签，同时避免把已删除的 dev 误报成「已推送」。刷新后的远端 dev 等于本地时直接返回「已推送」。
 
 推送非 0 时只做一次 `git ls-remote origin refs/heads/dev`：远端等于目标则「已推送」，不等则「推送失败」，核对也失败则「推送结果不确定」并给出核对命令。网络命令默认时限 120 秒，核对最多 30 秒。成功的合入输出增加 `push` 结果；推送失败在错误的 `result` 中返回已执行的推送结果，合入记录仍然保留。
 

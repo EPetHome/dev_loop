@@ -32,6 +32,18 @@ test("推送 A4/A5：默认不推，显式 --推送 仅更新裸仓库 dev，重
   assert.equal(checksOf(f.task.dir).filter(c=>c.step==="推送").length,2);
   assert.equal(existsSync(join(f.task.dir,"order")),false);assert.equal(existsSync(join(f.task.dir,"opened.json")),false);
 });
+for (const mode of ["remote.origin.pruneTags", "fetch.pruneTags", "tag-refspec"]) test("标签清理回归：" + mode + " 不删除本地标签、不抓取或推送标签", async t => {
+  const f = await delivered(t), remote = origin(f); reviewed(f.task, f.commit);
+  f.git("tag", "local-light", f.task.baseCommit); f.git("tag", "-a", "local-annotated", "-m", "keep local tag", f.commit);
+  gitText(remote, ["update-ref", "refs/tags/remote-only", f.task.baseCommit]);
+  f.git("config", "remote.origin.prune", "false");
+  f.git("config", mode === "fetch.pruneTags" ? mode : "remote.origin.pruneTags", "true");
+  if (mode === "tag-refspec") f.git("config", "--add", "remote.origin.fetch", "+refs/tags/*:refs/tags/*");
+  const args = ["for-each-ref", "--format=%(refname) %(objectname)", "refs/tags"], localTags = f.git(...args), remoteTags = gitText(remote, args);
+  const r = JSON.parse((await f.cli(["合入", f.task.executionId, "--推送", "--json"])).stdout);
+  assert.equal(r.push.result, "已推送"); assert.equal(gitText(remote, ["rev-parse", "refs/heads/dev"]), f.git("rev-parse", "dev"));
+  assert.equal(f.git(...args), localTags); assert.equal(gitText(remote, args), remoteTags);
+});
 test("评审必修4：远端删除 dev 后重推，不能把陈旧 origin/dev 当作已推送",async t=>{
   const f=await delivered(t),remote=origin(f);reviewed(f.task,f.commit);merge(f.task.dir,{acceptUnverified:false});
   assert.equal((await push(f.task.dir)).result,"已推送");const commit=f.git("rev-parse","dev");
