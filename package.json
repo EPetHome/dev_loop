@@ -1,0 +1,7 @@
+{
+  "name": "dev-loop",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": { "test": "node --test test/*.test.ts" }
+}

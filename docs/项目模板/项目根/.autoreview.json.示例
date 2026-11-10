@@ -1,0 +1,6 @@
+{
+  "localFiles": [
+    ".env.local"
+  ],
+  "setup": "npm ci"
+}

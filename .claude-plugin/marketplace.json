@@ -1,0 +1,15 @@
+{
+  "name": "dev-loop-local",
+  "owner": {
+    "name": "Dev Loop"
+  },
+  "description": "本机开发复测评审插件（Claude Code / Codex 共用一份 Hook）",
+  "plugins": [
+    {
+      "name": "dev-loop",
+      "source": "./plugins/dev-loop",
+      "description": "开发、复测、评审核心：开发方交付后复测并独立评审；有必修时用 Stop Hook 打回同一个会话返修。只在 dev-loop 执行目录里生效。",
+      "category": "development"
+    }
+  ]
+}

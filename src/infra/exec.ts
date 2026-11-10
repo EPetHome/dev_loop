@@ -1,0 +1,53 @@
+/** 从旧 createChildExec 精简：保留进程组、超时、取消和输出；不做释放账本。 */
+import { spawn, execFileSync } from "node:child_process";
+export interface Identity { pid: number; startedAt: string }
+export function identity(pid = process.pid): Identity {
+  let startedAt = "";
+  try { startedAt = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8" }).trim(); } catch {}
+  return { pid, startedAt };
+}
+export function alive(p?: Identity | null): boolean {
+  return Boolean(p?.pid && p.startedAt && identity(p.pid).startedAt === p.startedAt);
+}
+export function signalProcess(p?: Identity | null, group = false): void {
+  if (!p || p.pid === process.pid || !alive(p)) return;
+  try { process.kill(group ? -p.pid : p.pid, "SIGKILL"); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
+}
+export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
+export interface ExecOptions {
+  cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
+  onSpawn?: (p: Identity) => void;
+}
+export function createChildExec() {
+  return (command: string, args: string[], options: ExecOptions): Promise<ExecResult> => new Promise((accept) => {
+    let stdout = "", stderr = "", output = "", killed = false, done = false;
+    let timer: ReturnType<typeof setTimeout> | undefined, reap: ReturnType<typeof setTimeout> | undefined;
+    const child = spawn(command, args, { cwd: options.cwd, env: { ...process.env, ...options.env },
+      detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const finish = (code: number) => {
+      if (done) return;
+      done = true; clearTimeout(timer); clearTimeout(reap);
+      options.signal?.removeEventListener("abort", kill);
+      child.stdout.destroy(); child.stderr.destroy();
+      accept({ code, stdout, stderr, output, killed });
+    };
+    const kill = () => {
+      killed = true;
+      try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch {}
+      reap ??= setTimeout(() => finish(137), 250);
+    };
+    // StringDecoder 保留跨管道块的 UTF-8 字符，不能逐块 Buffer.toString 后拼接。
+    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (b) => { stdout += b.toString(); output += b.toString(); });
+    child.stderr.on("data", (b) => { stderr += b.toString(); output += b.toString(); });
+    child.on("error", (e) => { stderr += String(e); output += String(e); finish(127); });
+    child.on("close", (code, sig) => finish(code ?? (sig ? 137 : 1)));
+    if (options.timeoutMs > 0) timer = setTimeout(kill, options.timeoutMs);
+    options.signal?.addEventListener("abort", kill, { once: true });
+    try { if (child.pid) options.onSpawn?.(identity(child.pid)); }
+    catch (e) { stderr += String(e); output += String(e); kill(); }
+    if (options.signal?.aborted) kill();
+  });
+}
+export const childExec = createChildExec();

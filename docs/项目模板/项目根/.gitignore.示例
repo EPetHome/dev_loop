@@ -1,0 +1,4 @@
+# 本机配置：写入项目的 .git/info/exclude（或项目自己的 .gitignore）。
+.autoreview.json
+# 只在本机存在、不进仓库的文件；.autoreview.json 的 localFiles 要列出同样的路径。
+.env.local

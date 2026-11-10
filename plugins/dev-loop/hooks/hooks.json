@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${LOOP_NODE:-/Users/Admin/.hermes/node/bin/node}\" \"/Users/Admin/Desktop/dev-loop/hosts/hook.ts\" SessionStart",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${LOOP_NODE:-/Users/Admin/.hermes/node/bin/node}\" \"/Users/Admin/Desktop/dev-loop/hosts/hook.ts\" PostToolUse",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${LOOP_NODE:-/Users/Admin/.hermes/node/bin/node}\" \"/Users/Admin/Desktop/dev-loop/hosts/hook.ts\" Stop",
+            "timeout": 4900
+          }
+        ]
+      }
+    ]
+  }
+}

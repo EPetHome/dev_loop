@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "${LOOP_NODE:-/Users/Admin/.hermes/node/bin/node}" "$here/src/cli/main.ts" "$@"
