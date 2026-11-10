@@ -79,12 +79,12 @@ export function resume(dir: string): {reused: boolean; running: boolean; status:
     s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.loop.warned = false; s.state = "working";
     s.loop.reused = false;
   });
-  return { reused: false, running: Boolean(running), status: transition(dir, "working", "开发中", running ? "已续跑，请在原开发会话继续；到上限的步骤再给一轮" : "已续跑；到上限的步骤再给一轮", "developmentMs") };
+  return { reused: false, running: Boolean(running), status: transition(dir, "working", s.loop.ready ? "开发中" : "准备中", running ? "已续跑，请在原开发会话继续；到上限的步骤再给一轮" : "已续跑；到上限的步骤再给一轮", "developmentMs") };
 }
 export function stop(dir: string, abandon = false): Status {
   const t = taskOf(dir);
   // 取取消事务内的身份快照，不能先读状态再取消，否则会漏掉并发创建/登记的进程。
-  const stopped = transition(dir, "cancelled", "已停止", abandon ? "已放弃，保留分支和证据" : "已停止；可续跑", null);
+  const stopped = transition(dir, "cancelled", abandon ? "已放弃" : "已停止", abandon ? "已放弃，保留分支和证据" : "已停止；可续跑", null);
   signalProcess(stopped.loop.startingSession);
   signalProcess(stopped.loop.activeProcess, true); signalProcess(stopped.loop.launcher, true); signalProcess(stopped.loop.session);
   if (abandon) {

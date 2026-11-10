@@ -3,17 +3,23 @@ import { openSync, closeSync, mkdirSync, readFileSync, existsSync, realpathSync 
 import { join, resolve } from "node:path";
 import { APP_ROOT, tasksRoot } from "../infra/paths.ts";
 import { appendJson, jsonLines, withLock } from "../infra/files.ts";
-import { createTask, taskOf, statusOf, allTasks, locate, fail, type Task } from "../core/store.ts";
+import { createTask, taskOf, statusOf, allTasks, locate, fail, LoopError, type Task } from "../core/store.ts";
 import { InputError, UnsupportedError } from "../core/card.ts";
 import { deliver } from "../core/deliver.ts";
 import { resume, stop } from "../core/lifecycle.ts";
-interface Options { command: string; target?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string }
+import { merge } from "../steps/merge.ts";
+import { push, type PushResult } from "../steps/push.ts";
+import { deploy } from "../steps/deploy.ts";
+interface Options { command: string; target?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean }
 function options(args: string[]): Options {
-  const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "" };
+  const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false };
   while (args.length) {
     const arg = args.shift()!;
     if (["--all","--brief","--json"].includes(arg)) { out[arg.slice(2) as "all" | "brief" | "json"] = true; continue; }
-    const field = {"--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--text-file":"file"}[arg];
+    if (arg === "--接受未验证" && out.command === "合入") { out.acceptUnverified = true; continue; }
+    if (arg === "--推送" && out.command === "合入") { out.push = true; continue; }
+    if (arg === "--commit" && !["合入", "部署"].includes(out.command)) throw new InputError("未知选项：" + arg);
+    const field = {"--commit":"commit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--text-file":"file"}[arg];
     if (field) {
       const value = args.shift(); if (!value || value.startsWith("--")) throw new InputError(arg + " 缺值");
       if (field === "file") out.note = readFileSync(resolve(value),"utf8"); else (out as any)[field] = value;
@@ -51,8 +57,11 @@ const help = `bin/loop 启动 <version:1 单任务卡> [--派单编号 X] [--指
 bin/loop 交付 [--说明 文本 | --text-file 文件] [--json]
 bin/loop 查询 [<卡或执行编号> | --all] [--brief] [--json]
 bin/loop 续跑|停止|放弃 <卡或执行编号> [--task 名] [--json]
+bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] [--推送] [--json]
+bin/loop 部署 <执行编号或卡路径> [--commit <sha>] [--json]
+合入默认仅本地；仅 --推送 才扫描并推送 origin/dev；部署须登记 .autoreview.json 的 deploy.cmd。
 LOOP_TASKS_ROOT：执行根目录；开发方优先通过 LOOP_TASK_DIR 定位任务。
-第 1 步不含合入（第2步）、多任务/验收（第3步）、答复（第4步）、部署（以后）。`;
+多任务/整合/验收（第3步）、答复（第4步）尚不支持。`;
 export async function main(args = process.argv.slice(2)): Promise<unknown> {
   const o=options([...args]), root=tasksRoot();
   if (["帮助","help","--help","-h"].includes(o.command)) return help;
@@ -87,10 +96,16 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
     return {executionId:taskOf(dir).executionId,...result};
   }
   if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");
-  if(["合入","整合","验收","答复","开发","部署"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help);
+  if(o.command==="合入") {
+    const dir=select(o), r: ReturnType<typeof merge> & {push?: PushResult}=merge(dir, {commit:o.commit, acceptUnverified:o.acceptUnverified});
+    if(o.push) r.push=await push(dir);
+    return r;
+  }
+  if(o.command==="部署") return await deploy(select(o), {commit:o.commit});
+  if(["整合","验收","答复","开发"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help);
   throw new InputError("未知命令："+o.command+"\n"+help);
 }
 if(process.argv[1] && resolve(process.argv[1])===join(APP_ROOT,"src/cli/main.ts")) {
   main().then(result=>{console.log(typeof result==="string"?result:process.argv.includes("--json")?JSON.stringify(result):JSON.stringify(result,null,2));})
-    .catch(e=>{console.error(JSON.stringify({error:{category:e instanceof InputError?e.category:/EACCES|EPERM|Permission denied/.test(String(e))?"权限不足":"工具内部错误",raw:e instanceof Error?e.message:String(e)}}));process.exitCode=1;});
+    .catch(e=>{console.error(JSON.stringify({error:{category:e instanceof InputError || e instanceof LoopError?e.category:/EACCES|EPERM|Permission denied/.test(String(e))?"权限不足":"工具内部错误",raw:e instanceof Error?e.message:String(e),...(e instanceof LoopError && e.result !== undefined ? {result:e.result} : {})}}));process.exitCode=1;});
 }

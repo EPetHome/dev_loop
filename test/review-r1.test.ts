@@ -53,7 +53,7 @@ function fakeTerminal(env: NodeJS.ProcessEnv, cwd: string) {
       children.push({child, pid: identity(child.pid!), closed}); accepted = true;
     },
     get accepted() { return accepted; },
-    async close() { for (const c of children) { signalProcess(c.pid, true); await c.closed; } },
+    async close(expectedExit = false) { for (const c of children) { if (!expectedExit) signalProcess(c.pid, true); await c.closed; } },
   };
 }
 for (const missing of ["pi", "permission"]) test("r1 必修2：Terminal 接收成功，但 " + missing + " 缺失后状态 failed 并保留原文", async (t) => {
@@ -70,7 +70,7 @@ for (const missing of ["pi", "permission"]) test("r1 必修2：Terminal 接收�
     assert.ok(s.error?.category); assert.match(s.error!.raw, /pi-dev: 找不到 pi 或权限扩展/);
     const log = s.evidence.find(path => /launch-.*\.log$/.test(path))!;
     assert.match(readFileSync(log, "utf8"), /pi-dev: 找不到 pi 或权限扩展/);
-  } finally { await terminal.close(); }
+  } finally { await terminal.close(true); }
 });
 test("r1 必修2：确认本次真实进程登记后才结束启动监测", async (t) => {
   const f = fixture(t), task = await f.prepare(), pi = join(f.base, "fake-pi.cjs"), permission = join(f.base, "permission.ts");

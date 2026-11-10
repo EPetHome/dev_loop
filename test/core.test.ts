@@ -5,9 +5,11 @@ import { readFileSync, existsSync } from "node:fs";
 import { fixture, write, MUST, PASS, sq } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
-import { statusOf, checksOf } from "../src/core/store.ts";
+import { statusOf, checksOf, createTask, PHASES, fail } from "../src/core/store.ts";
 import { gitText, head } from "../src/infra/git.ts";
 import { parseScope, inScope } from "../src/core/card.ts";
+import { resume, stop } from "../src/core/lifecycle.ts";
+import { launchSession } from "../src/hosts/launch.ts";
 
 test("A2 core：复测先于评审，成功绑定交付 commit", async (t) => {
   const f = fixture(t), task = await f.prepare();
@@ -54,7 +56,9 @@ test("A4：复测与评审退回上限独立，转等你", async (t) => {
   const s = statusOf(task.dir);
   assert.equal(result.continue,false); assert.equal(s.state,"input_required");
   assert.equal(s.loop.testReturns,1); assert.equal(s.loop.reviewReturns,2);
+  assert.equal(s.loop.wait,"评审必修到上限");
   assert.match(s.message,/评审必修退回 2 次/); assert.match(s.message,/再给一轮[\s\S]*停止[\s\S]*接受未验证/);
+  assert.ok(s.message.includes("bin/loop 合入 "+task.executionId+" --接受未验证"));
 });
 test("A6：越界（含已提交/暂存/重命名）拒绝，不产生 commit", async (t) => {
   const f = fixture(t), task = await f.prepare(), before = head(task.worktree);
@@ -70,6 +74,8 @@ test("A7/A8：交付后又改只提醒；空停下保留开发方最后一段话
   const f = fixture(t), task = await f.prepare();
   const empty = await settle(task.dir,"需要你确认测试目标");
   assert.equal(empty.continue,false); assert.equal(statusOf(task.dir).state,"input_required"); assert.equal(statusOf(task.dir).message,"需要你确认测试目标");
+  assert.equal(statusOf(task.dir).loop.wait,"停下没交付");
+  resume(task.dir);assert.equal(statusOf(task.dir).loop.wait,null);
   assert.equal(existsSync(join(task.dir,"order")),false);
 });
 test("A7：交付之后的未提交改动不跑检查、不扣退回次数",async(t)=>{
@@ -78,6 +84,21 @@ test("A7：交付之后的未提交改动不跑检查、不扣退回次数",asyn
   write(join(task.worktree,"src/app.txt"),"good after delivery\n");
   const r=await settle(task.dir);assert.equal(r.continue,true);assert.match(r.reason,/重新运行 bin\/loop 交付/);
   const s=statusOf(task.dir);assert.equal(s.loop.testReturns+s.loop.reviewReturns,0);assert.equal(existsSync(join(task.dir,"order")),false);
+});
+test("阶段：19 个常量；准备中、已交付、已放弃与自行提交拆分",async(t)=>{
+  const f=fixture(t),initial=createTask(f.card,f.root);
+  assert.equal(PHASES.length,19);assert.equal(new Set(PHASES).size,19);
+  assert.equal(statusOf(initial.dir).loop.phase,"准备中");
+  fail(initial.dir,new Error("setup"));resume(initial.dir);assert.equal(statusOf(initial.dir).loop.phase,"准备中");
+  const task=await f.prepare();deliver(task.dir);assert.equal(statusOf(task.dir).loop.phase,"已交付");
+  gitText(task.worktree,["commit","--allow-empty","-m","same tree new commit"]);
+  assert.equal((await settle(task.dir)).continue,true);assert.equal(statusOf(task.dir).loop.phase,"开发中");
+  stop(task.dir,true);assert.equal(statusOf(task.dir).loop.phase,"已放弃");assert.throws(()=>resume(task.dir),/已放弃/);
+});
+for(const host of ["claude","codex"])test("等你原因："+host+" 需手动接入会话",async(t)=>{
+  const f=fixture(t,{card:{host}}),task=await f.prepare();
+  await launchSession(task.dir,false,{env:{}});assert.equal(statusOf(task.dir).loop.wait,"需手动接入会话");
+  stop(task.dir);assert.equal(statusOf(task.dir).loop.wait,null);assert.equal(statusOf(task.dir).loop.phase,"已停止");
 });
 test("scope：目录、**、deny 与非法路径", (t) => {
   fixture(t);

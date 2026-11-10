@@ -19,9 +19,9 @@ test("复测默认上限 3 次：连续失败转等你，不会调用评审",asy
     assert.equal((await settle(task.dir)).continue,i<3);
   }
   const s=statusOf(task.dir);assert.equal(s.loop.testReturns,3);assert.equal(s.loop.reviewReturns,0);
-  assert.equal(s.state,"input_required");assert.match(s.message,/复测退回 3 次/);
+  assert.equal(s.state,"input_required");assert.match(s.message,/复测退回 3 次/);assert.equal(s.loop.wait,"复测退回到上限");
   assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"test\ntest\ntest\n");
-  assert.equal(resume(task.dir).reused,false);assert.equal(statusOf(task.dir).loop.testAllowance,4);
+  assert.equal(resume(task.dir).reused,false);assert.equal(statusOf(task.dir).loop.testAllowance,4);assert.equal(statusOf(task.dir).loop.wait,null);
   write(join(task.worktree,"src/app.txt"),"good fixed\n");deliver(task.dir);await settle(task.dir);
   assert.equal(statusOf(task.dir).state,"completed");
 });
