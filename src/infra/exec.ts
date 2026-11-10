@@ -12,7 +12,16 @@ export function alive(p?: Identity | null): boolean {
 export function signalProcess(p?: Identity | null, group = false): void {
   if (!p || p.pid === process.pid || !alive(p)) return;
   try { process.kill(group ? -p.pid : p.pid, "SIGKILL"); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") throw e; }
+  catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    if (code === "EPERM") {
+      let stat = "";
+      try { stat = execFileSync("ps", ["-p", String(p.pid), "-o", "stat="], {encoding: "utf8"}).trim(); } catch {}
+      if (stat.startsWith("Z")) return; // macOS 僵尸进程组可能返回 EPERM；其他权限错误不能吞掉。
+    }
+    throw e;
+  }
 }
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
 export interface ExecOptions {

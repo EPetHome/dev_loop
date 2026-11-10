@@ -53,14 +53,14 @@ export async function push(dir: string, o: {timeoutMs?: number} = {}): Promise<P
     return r;
   };
   const network = (args: string[], limit = timeoutMs) => childExec("git", args, {cwd: t.repo, timeoutMs: limit});
-  const fetched = await network(["fetch", "--no-tags", "origin"]);
+  const fetched = await network(["fetch", "--no-tags", "--prune", "origin"]);
   if (fetched.code || fetched.killed) return finish("推送失败", "推送失败", "网络失败", fetched.output || "fetch 超时", "临时故障");
   if (gitTry(t.repo, ["rev-parse", "--verify", "refs/remotes/origin/dev"]).stdout.trim() === commit) return finish("已推送", "已推送", short, "远端已是最新");
   let hits: string[];
   try { hits = scan(t.repo, gitText(t.repo, ["rev-list", "--reverse", commit, "--not", "--remotes=origin"]).split("\n").filter(Boolean)); }
   catch { return finish("扫描出错，未推送", "推送失败", "扫描出错", "密钥扫描出错，未推送（不输出补丁内容）", "工具内部错误"); }
   if (hits.length) return finish("扫描命中，未推送", "推送失败", "扫描命中 " + hits.length + " 处", hits.join("\n"), "输入问题");
-  const sent = await network(["push", "origin", commit + ":refs/heads/dev"]);
+  const sent = await network(["push", "--no-follow-tags", "origin", commit + ":refs/heads/dev"]);
   if (!sent.code && !sent.killed) return finish("已推送", "已推送", short, sent.output);
   const verified = await network(["ls-remote", "origin", "refs/heads/dev"], Math.min(timeoutMs, 30000));
   if (verified.code || verified.killed) return finish("推送结果不确定", "推送结果不确定", "用 git ls-remote origin refs/heads/dev 核对", sent.output + "\n" + verified.output, "未知", "git -C " + shellQuote(t.repo) + " ls-remote origin refs/heads/dev");

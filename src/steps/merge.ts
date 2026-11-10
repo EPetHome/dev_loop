@@ -31,11 +31,12 @@ export function merge(dir: string, o: {commit?: string; acceptUnverified: boolea
   let name = t.name;
   try { name = readJson<{name: string}>(t.card).name || name; } catch {}
   const message = "Merge " + name + ": " + (unverified ? "unverified" : "reviewed") + " " + commit.slice(0, 7);
+  const merging = gitTry(holder, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).code === 0;
   const r = gitTry(holder, ["merge", "--no-ff", "--no-edit", "-m", message, commit], {GIT_MERGE_AUTOEDIT: "no"});
   if (r.code) {
     const conflicts = gitTry(holder, ["diff", "--name-only", "--diff-filter=U"]).stdout.trim().split("\n").filter(Boolean);
     let raw = r.stdout + r.stderr;
-    if (gitTry(holder, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).code === 0) {
+    if (!merging && gitTry(holder, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).code === 0) {
       const abort = gitTry(holder, ["merge", "--abort"]); if (abort.code) raw += abort.stdout + abort.stderr;
     }
     const result = finish("合入失败", gitText(t.repo, ["rev-parse", "refs/heads/dev"]), conflicts.length ? "冲突：" + conflicts.slice(0, 3).join("、") : "git 拒绝合并", raw);

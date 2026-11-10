@@ -47,6 +47,26 @@ test("合入 A3：冲突原文/退出1，abort 恢复 dev 的 HEAD、索引和�
   assert.equal(statusOf(f.task.dir).loop.phase,"合入失败");assert.match(statusOf(f.task.dir).message,/src\/app.txt/);
   assert.match(checksOf(f.task.dir).at(-1)!.detail!,/CONFLICT/);
 });
+for (const resolved of [false, true]) test("评审必修2：保留已有合并及用户手工解决内容，全部冲突已解决=" + resolved, async t => {
+  const f = await delivered(t); reviewed(f.task, f.commit);
+  f.git("checkout", "-b", "existing-merge", f.task.baseCommit);
+  write(join(f.repo, "src/app.txt"), "other app\n"); write(join(f.repo, "outside.txt"), "other outside\n");
+  f.git("add", "src/app.txt", "outside.txt"); f.git("commit", "-m", "other changes"); f.git("checkout", "dev");
+  write(join(f.repo, "src/app.txt"), "dev app\n"); write(join(f.repo, "outside.txt"), "dev outside\n");
+  f.git("add", "src/app.txt", "outside.txt"); f.git("commit", "-m", "dev changes");
+  assert.equal(gitTry(f.repo, ["merge", "--no-ff", "existing-merge"]).code, 1);
+  write(join(f.repo, "src/app.txt"), "user resolved app\n"); f.git("add", "src/app.txt");
+  if (resolved) { write(join(f.repo, "outside.txt"), "user resolved outside\n"); f.git("add", "outside.txt"); }
+  const snapshot = () => ({head: f.git("rev-parse", "dev"), mergeHead: f.git("rev-parse", "MERGE_HEAD"),
+    message: readFileSync(join(f.repo, ".git/MERGE_MSG"), "utf8"), index: f.git("ls-files", "--stage"), status: f.git("status", "--porcelain=v1"),
+    app: readFileSync(join(f.repo, "src/app.txt"), "utf8"), outside: readFileSync(join(f.repo, "outside.txt"), "utf8")});
+  const before = snapshot();
+  await assert.rejects(f.cli(["合入", f.task.executionId, "--json"]), (e: any) => {
+    assert.equal(e.code, 1); const err = JSON.parse(e.stderr).error;
+    assert.equal(err.result.result, "合入失败"); assert.match(err.raw, /unmerged|MERGE_HEAD|not concluded/); return true;
+  });
+  assert.deepEqual(snapshot(), before);
+});
 test("合入：本地文件将被覆盖时 git 拒绝，不运行 abort、不丢改动",async(t)=>{
   const f=await delivered(t);reviewed(f.task,f.commit);write(join(f.repo,"src/app.txt"),"local unsaved\n");const before=f.git("rev-parse","dev"),dirty=f.git("status","--porcelain");
   assert.throws(()=>merge(f.task.dir,{acceptUnverified:false}),/would be overwritten/);

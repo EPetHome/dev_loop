@@ -22,6 +22,7 @@ test("推送 A4/A5：默认不推，显式 --推送 仅更新裸仓库 dev，重
   const f=await delivered(t),remote=origin(f),before=gitText(remote,["rev-parse","dev"]);reviewed(f.task,f.commit);
   await f.cli(["合入",f.task.executionId,"--json"]);assert.equal(gitText(remote,["rev-parse","dev"]),before);
   f.git("tag","local-only");
+  f.git("tag","-a","annotated-only","-m","must stay local","dev");f.git("config","push.followTags","true");
   const r=JSON.parse((await f.cli(["合入",f.task.executionId,"--推送","--json"])).stdout);
   assert.equal(r.result,"已在 dev");assert.equal(r.push.result,"已推送");assert.equal(gitText(remote,["rev-parse","dev"]),f.git("rev-parse","dev"));
   assert.equal(gitText(remote,["for-each-ref","--format=%(refname)"]),"refs/heads/dev");assert.equal(statusOf(f.task.dir).loop.phase,"已推送");
@@ -30,6 +31,17 @@ test("推送 A4/A5：默认不推，显式 --推送 仅更新裸仓库 dev，重
   assert.equal(repeat.push.result,"已推送");assert.match(repeat.push.detail,/远端已是最新/);
   assert.equal(checksOf(f.task.dir).filter(c=>c.step==="推送").length,2);
   assert.equal(existsSync(join(f.task.dir,"order")),false);assert.equal(existsSync(join(f.task.dir,"opened.json")),false);
+});
+test("评审必修4：远端删除 dev 后重推，不能把陈旧 origin/dev 当作已推送",async t=>{
+  const f=await delivered(t),remote=origin(f);reviewed(f.task,f.commit);merge(f.task.dir,{acceptUnverified:false});
+  assert.equal((await push(f.task.dir)).result,"已推送");const commit=f.git("rev-parse","dev");
+  gitText(remote,["update-ref","refs/heads/keep",f.task.baseCommit]);gitText(remote,["update-ref","-d","refs/heads/dev"]);
+  f.git("config","fetch.prune","false");f.git("config","remote.origin.prune","false");f.git("fetch","--no-tags","origin");
+  assert.equal(f.git("rev-parse","refs/remotes/origin/dev"),commit);assert.equal(gitText(remote,["for-each-ref","--format=%(refname)"]),"refs/heads/keep");
+  const counter=join(f.base,"restore-push"),path=shim(f,"if(args[0]==='push')fs.appendFileSync("+JSON.stringify(counter)+",'push\\n');");
+  const r=JSON.parse((await f.cli(["合入",f.task.executionId,"--推送","--json"],f.repo,{PATH:path})).stdout);
+  assert.equal(r.push.result,"已推送");assert.equal(readFileSync(counter,"utf8"),"push\n");
+  assert.equal(gitText(remote,["rev-parse","refs/heads/dev"]),commit);assert.equal(gitText(remote,["rev-parse","refs/heads/keep"]),f.task.baseCommit);
 });
 test("推送 A6：中间提交密钥已删除仍拦截，中文文件:行/规则，无密钥内容",async(t)=>{
   const f=await delivered(t),remote=origin(f),before=gitText(remote,["rev-parse","dev"]),secret="AKIA"+"X".repeat(16);
