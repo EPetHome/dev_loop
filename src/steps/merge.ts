@@ -21,10 +21,16 @@ function target(dir: string, o: {commit?: string; acceptUnverified?: boolean}) {
 export function prepareMerge(dir: string, commit?: string): string {
   const {t, commit: sha} = target(dir, {commit}), before = gitText(t.repo, ["rev-parse", "refs/heads/dev"]);
   if (isAncestor(t.repo, sha, before)) return before;
-  if (!worktreeOf(t.repo, "dev")) throw new InputError("dev 没有检出到任何目录，无法合并");
+  const holder=worktreeOf(t.repo,"dev");
+  if (!holder) throw new InputError("dev 没有检出到任何目录，无法合并");
   const r = gitTry(t.repo, ["merge-tree", "--write-tree", before, sha]);
   if (r.code) throw new LoopError("输入问题", r.stdout + r.stderr, {conflict: r.code === 1});
-  return gitText(t.repo, ["commit-tree", r.stdout.trim().split("\n")[0], "-p", before, "-p", sha, "-m", "Merge " + t.name + ": reviewed " + sha.slice(0,7)]);
+  const prepared=gitText(t.repo, ["commit-tree", r.stdout.trim().split("\n")[0], "-p", before, "-p", sha, "-m", "Merge " + t.name + ": reviewed " + sha.slice(0,7)]);
+  if(!gitTry(holder,["rev-parse","-q","--verify","MERGE_HEAD"]).code)throw new InputError("dev 有未完成合并 MERGE_HEAD，无法快进；线上未动");
+  // 用真实索引/工作区做 Git 两树快进预检，不写入，也不拒绝无关改动。
+  const ready=gitTry(holder,["read-tree","--dry-run","-m","-u",before,prepared]);
+  if(ready.code)throw new InputError("dev 无法快进；线上未动\n"+ready.stdout+ready.stderr);
+  return prepared;
 }
 export function merge(dir: string, o: {commit?: string; acceptUnverified: boolean; prepared?: string}): MergeResult {
   const start = Date.now(), {t, commit, unverified} = target(dir, o);

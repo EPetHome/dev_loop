@@ -65,16 +65,16 @@ export async function deploy(dir: string, o: {commit?: string; timeoutMs?: numbe
   return r;
 }
 interface Deployment { executionId: string; commit: string; evidenceDir: string; rollback?: string }
-export async function rollback(dir: string) {
+export async function rollback(dir: string, failed: "manual" | "merge" = "manual") {
   const t = taskOf(dir), file = projectFile(dirname(dir),t.repo,"deployed"), last = optionalJson<Deployment>(file), start = Date.now();
   if (!last || last.executionId !== t.executionId) throw new InputError("只能退回此项目最新的一次部署");
   if (!last.rollback) throw new InputError("这次部署没有登记 rollback，无法退回");
-  const cfg = loadDeploy(t.repo), log = join(last.evidenceDir,"manual-rollback.log");
+  const cfg = loadDeploy(t.repo), log = join(last.evidenceDir,failed+"-rollback.log");
   const r = await checkout(t.repo,last.commit,async cwd => {
     const script = resolve(cwd,last.rollback!);
     try { if (!lstatSync(script).isFile() || !inside(realpathSync(cwd),realpathSync(script))) throw new Error(); accessSync(script,constants.X_OK); }
     catch { throw new InputError("脚本不存在或不可执行："+last.rollback); }
-    return childExec(script,[],{cwd,timeoutMs:(cfg?.timeoutMin || 20)*60000,env:{...cfg?.env,LOOP_DEPLOY_COMMIT:last.commit,LOOP_REPO:t.repo,LOOP_EVIDENCE_DIR:last.evidenceDir,LOOP_DEPLOY_FAILED:"manual"}});
+    return childExec(script,[],{cwd,timeoutMs:(cfg?.timeoutMin || 20)*60000,env:{...cfg?.env,LOOP_DEPLOY_COMMIT:last.commit,LOOP_REPO:t.repo,LOOP_EVIDENCE_DIR:last.evidenceDir,LOOP_DEPLOY_FAILED:failed}});
   });
   appendFileSync(log,r.output); const ok = !r.killed && r.code === 0, result = ok?"已退回":"退回失败";
   recordStep(dir,{step:"退回",result,commit:last.commit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:[last.evidenceDir,log],detail:r.output},ok?{phase:"已退回",message:"线上已退回；dev 未改动"}:undefined);

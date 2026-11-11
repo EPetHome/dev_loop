@@ -10,18 +10,20 @@ import { recordStep, type Task } from "./store.ts";
 import { run } from "./run.ts";
 export async function snapshot(t: Task, cwd: string, commit: string, out: string, mode: "scenario" | "live", active = false, signal?: AbortSignal): Promise<boolean> {
   const start = Date.now(); let tmp = "";
+  const clean = () => { try { rmSync(out,{recursive:true,force:true}); return ""; } catch(e) { return "\n留痕输出清理失败："+String(e); } };
   try {
     const path=loadSnapshot(t.repo); if (!path || !existsSync(resolve(cwd,path))) return false;
     const script=resolve(cwd,path);
     if (!lstatSync(script).isFile() || !inside(realpathSync(cwd),realpathSync(script))) throw new Error("snapshot 非仓库内普通文件");
-    accessSync(script,constants.X_OK); rmSync(out,{force:true}); tmp=mkdtempSync(join(active?tmpdir():cwd,".loop-snapshot-"));
+    accessSync(script,constants.X_OK); const cleanup=clean(); if(cleanup)throw new Error(cleanup);
+    tmp=mkdtempSync(join(active?tmpdir():cwd,".loop-snapshot-"));
     const env={LOOP_TASK_DIR:t.dir,LOOP_REPO:t.repo,LOOP_SNAPSHOT_MODE:mode,LOOP_SNAPSHOT_OUT:out,LOOP_SNAPSHOT_COMMIT:commit,TMPDIR:tmp};
     const r=active?await run(t,script,[],300000,signal,env):await childExec(script,[],{cwd,timeoutMs:300000,env});
     if (r.code || r.killed) throw new Error(r.output || "snapshot 失败或超时");
     const value=readJson<any>(out); if (!value || typeof value!=="object" || Array.isArray(value)) throw new Error("snapshot 须输出 JSON 对象");
     recordStep(t.dir,{step:"留痕",result:"已存",commit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:[out]}); return true;
   } catch(e) {
-    rmSync(out,{force:true}); recordStep(t.dir,{step:"留痕",result:"失败",commit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:[],detail:String(e)}); return false;
+    const detail=String(e)+clean(); recordStep(t.dir,{step:"留痕",result:"失败",commit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:[],detail}); return false;
   } finally { if(tmp) { try { rmSync(tmp,{recursive:true,force:true}); } catch {} } }
 }
 export function differences(a: string, b: string): string {

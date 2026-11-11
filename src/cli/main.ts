@@ -15,14 +15,15 @@ import { queued } from "./queue.ts";
 import { background } from "./background.ts";
 import { companion } from "./companion.ts";
 import { comparison, releaseWorktree } from "./inspect.ts";
-interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean }
+interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
 function options(args: string[]): Options {
-  const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false };
+  const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false, automatic: false };
   while (args.length) {
     const arg = args.shift()!;
     if (["--all","--brief","--json"].includes(arg)) { out[arg.slice(2) as "all" | "brief" | "json"] = true; continue; }
     if (arg === "--接受未验证" && out.command === "合入") { out.acceptUnverified = true; continue; }
     if (arg === "--推送" && out.command === "合入") { out.push = true; continue; }
+    if (arg === "--auto" && out.command === "收尾") { out.automatic = true; continue; }
     if (arg === "--commit" && !["合入", "部署"].includes(out.command)) throw new InputError("未知选项：" + arg);
     const field = {"--commit":"commit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--text-file":"file"}[arg];
     if (field) {
@@ -100,7 +101,7 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   if(o.command==="对比") return comparison(select(o),o.other?select({...o,target:o.other}):undefined);
   if(o.command==="陪跑") { const dir=select(o); await companion(dir); return {executionId:taskOf(dir).executionId}; }
   if(o.command==="释放") return releaseWorktree(select(o));
-  if(o.command==="收尾") return finish(select(o));
+  if(o.command==="收尾") return finish(select(o),o.automatic);
   if(o.command==="合入") {
     const dir=select(o);
     return queued(dir, async () => {

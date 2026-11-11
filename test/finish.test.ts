@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readdirSync, realpathSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { fixture, write, until, getJson, NODE, ROOT } from "./helpers.ts";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { finish, pendingAcceptance } from "../src/cli/finish.ts";
 import { queued } from "../src/cli/queue.ts";
 import { lock } from "../src/infra/files.ts";
@@ -215,4 +215,59 @@ test("启动整链预检：部署登记、origin、坏卡、环、中间批收�
   for (const raw of ["invalid", JSON.stringify({...f.raw,next:"card.json"}), JSON.stringify({...f.raw,flow:["开发评审","合入"],next:"card.json"})]) {
     write(next, raw); await assert.rejects(f.cli(["启动",f.card,"--json"])); assert.deepEqual(readdirSync(f.root), []);
   }
+});
+
+test("返修必修1：部署前发现阻碍快进的本地改动，保留索引和文件，线上不动",async t=>{
+  const f=await finishingFixture(t);await settle(f.task.dir);write(join(f.repo,"结果.md"),"existing notes\n");
+  write(join(f.repo,"src/app.txt"),"user unsaved app\n");write(join(f.repo,"outside.txt"),"user staged outside\n");f.git("add","outside.txt");
+  const dirty=f.git("status","--porcelain=v1"),index=f.git("write-tree");await finish(f.task.dir);
+  assert.equal(statusOf(f.task.dir).state,"input_required");assert.match(statusOf(f.task.dir).message,/overwritten|not uptodate|快进/);
+  assert.equal(existsSync(join(f.task.dir,"calls.jsonl")),false);assert.equal(f.git("rev-parse","dev"),f.before);
+  assert.equal(f.git("status","--porcelain=v1"),dirty);assert.equal(f.git("write-tree"),index);assert.equal(readFileSync(join(f.repo,"src/app.txt"),"utf8"),"user unsaved app\n");
+});
+test("返修必修1：无关的暂存、未暂存和未跟踪文件不阻断自动部署",async t=>{
+  const f=await finishingFixture(t);await settle(f.task.dir);write(join(f.repo,"结果.md"),"existing notes\n");
+  write(join(f.repo,"outside.txt"),"user staged\n");f.git("add","outside.txt");write(join(f.repo,"AGENTS.md"),"user unstaged\n");write(join(f.repo,"untracked.txt"),"user untracked\n");
+  const dirty=f.git("status","--porcelain=v1");await finish(f.task.dir);
+  assert.equal(statusOf(f.task.dir).state,"completed");assert.notEqual(f.git("rev-parse","dev"),f.before);assert.equal(received(f.task.dir).length,2);
+  assert.equal(f.git("status","--porcelain=v1"),dirty);assert.equal(f.git("show",":outside.txt"),"user staged");assert.equal(readFileSync(join(f.repo,"untracked.txt"),"utf8"),"user untracked\n");
+});
+for(const rollbackFails of [false,true])test("返修必修1：部署期间新增快进障碍，在项目锁内补偿，回退失败="+rollbackFails,async t=>{
+  const f=await finishingFixture(t,{cmd:"fs.writeFileSync(path.join(e.LOOP_REPO,'src/app.txt'),'user edit during deploy\\n');",rollback:
+    "const crypto=require('crypto'),queue=path.join(path.dirname(dir),'.queue-'+crypto.createHash('sha256').update(e.LOOP_REPO).digest('hex').slice(0,20)+'.lock');fs.writeFileSync(evidence+'/queue-held',String(fs.existsSync(queue)));"+(rollbackFails?"process.exit(9);":"")});
+  await settle(f.task.dir);write(join(f.repo,"outside.txt"),"user staged\n");f.git("add","outside.txt");const index=f.git("write-tree");
+  const marker=projectFile(f.root,f.task.repo,"deployed"),previous={executionId:f.task.executionId,commit:f.before,evidenceDir:join(f.task.dir,"previous-deployment"),rollback:"rollback.cjs"};
+  write(join(previous.evidenceDir,"record.txt"),"previous evidence\n");write(marker,JSON.stringify(previous));await finish(f.task.dir);
+  const state=statusOf(f.task.dir);assert.equal(state.state,"input_required");assert.equal(state.loop.wait,"收尾没走完");assert.match(state.message,rollbackFails?/回退也失败/:/线上已回退/);
+  assert.deepEqual(received(f.task.dir).map(c=>c.name),["deploy","check","rollback"]);assert.equal(readFileSync(join(received(f.task.dir)[0].evidence,"queue-held"),"utf8"),"true");
+  assert.equal(f.git("rev-parse","dev"),f.before);assert.equal(f.git("write-tree"),index);assert.equal(readFileSync(join(f.repo,"src/app.txt"),"utf8"),"user edit during deploy\n");
+  assert.equal(state.loop.deployReturns,0);assert.equal(state.loop.pendingReturn,null);
+  if(!rollbackFails)assert.deepEqual(getJson(marker),previous);else assert.equal(getJson(marker).commit,received(f.task.dir)[0].commit);
+});
+for(const phase of ["部署中","已部署","推送中"] as const)test("返修必修3：窗口关闭后可直接收尾接手死亡进程，阶段="+phase,async t=>{
+  const f=await finishingFixture(t);await settle(f.task.dir);const dead={pid:process.pid,startedAt:"dead identity"};
+  update(f.task.dir,s=>{s.loop.session=null;s.loop.finisher=dead;s.loop.phase=phase;});write(join(f.task.dir,"finish.lock"),JSON.stringify({...dead,token:"old finisher"}));
+  await f.cli(["收尾",f.task.executionId,"--json"]);assert.equal(existsSync(join(f.task.dir,"finish.lock")),false);
+  assert.equal(statusOf(f.task.dir).state,"completed");assert.equal(statusOf(f.task.dir).loop.phase,"已部署");assert.equal(statusOf(f.task.dir).loop.finisher,null);assert.equal(received(f.task.dir).length,2);
+});
+for(const fail of [false,true])test("返修必修4：两个自动收尾进程交错取锁，迟到者不重复执行，前者失败="+fail,async t=>{
+  const f=await finishingFixture(t,fail?{check:"process.exit(7);",rollback:"process.exit(8);"}:{});await settle(f.task.dir);
+  const gate=join(f.base,"finish-gate"),marker=join(f.base,"waiting-for-lock"),hook=join(f.base,"pause-lock.mjs");execFileSync("mkfifo",[gate]);
+  write(hook,`import {registerHooks} from 'node:module';registerHooks({load(url,context,next){const result=next(url,context);if(url.endsWith('/src/infra/files.ts'))result.source=String(result.source).replace('export function lock(path: string, waitMs = 0): () => void {',\"export function lock(path: string, waitMs = 0): () => void { if(path.endsWith('/finish.lock') && process.env.REVIEW_FINISH_GATE){writeFileSync(process.env.REVIEW_FINISH_MARKER!, 'waiting');readFileSync(process.env.REVIEW_FINISH_GATE!, 'utf8');}\");return result;}});`);
+  const child=spawn(NODE,["--import",hook,join(ROOT,"src/cli/main.ts"),"收尾",f.task.executionId,"--auto","--json"],{cwd:f.repo,env:{...f.env,REVIEW_FINISH_GATE:gate,REVIEW_FINISH_MARKER:marker},stdio:["ignore","pipe","pipe"]});
+  let stderr="";child.stderr.setEncoding("utf8");child.stderr.on("data",text=>{stderr+=text;});const exited=new Promise<number|null>((ok,no)=>{child.once("close",ok);child.once("error",no);});
+  t.after(()=>{if(child.exitCode===null)child.kill("SIGKILL");});
+  await until(f.base,()=>existsSync(marker),Boolean);await f.cli(["收尾",f.task.executionId,"--auto","--json"]);const completed=statusOf(f.task.dir);
+  assert.equal(completed.state,fail?"input_required":"completed");write(gate,"continue");assert.equal(await exited,1);assert.match(stderr,/当前不在待收尾|不自动重试/);
+  assert.deepEqual(statusOf(f.task.dir),completed);assert.equal(received(f.task.dir).length,fail?3:2);
+});
+test("返修必修3：死亡收尾不会被宿主原样自动重试，只由手工命令接手",async t=>{
+  const f=await finishingFixture(t);await settle(f.task.dir);update(f.task.dir,s=>{s.loop.session=null;s.loop.finisher={pid:process.pid,startedAt:"dead identity"};});
+  const before=statusOf(f.task.dir);await startFinish(f.task.dir,f.env);assert.deepEqual(statusOf(f.task.dir),before);assert.equal(existsSync(join(f.task.dir,"finish.log")),false);
+  await assert.rejects(f.cli(["收尾",f.task.executionId,"--auto","--json"]),/不自动重试/);assert.deepEqual(statusOf(f.task.dir),before);
+  await f.cli(["收尾",f.task.executionId,"--json"]);assert.equal(statusOf(f.task.dir).state,"completed");assert.equal(received(f.task.dir).length,2);
+});
+test("返修必修4：锁内发现存活 finisher，拒绝且不改状态或清除对方身份",async t=>{
+  const f=await finishingFixture(t);await settle(f.task.dir);update(f.task.dir,s=>{s.loop.finisher=identity();});const before=statusOf(f.task.dir);
+  await assert.rejects(finish(f.task.dir),/正在收尾/);assert.deepEqual(statusOf(f.task.dir),before);assert.equal(existsSync(join(f.task.dir,"finish.lock")),false);
 });

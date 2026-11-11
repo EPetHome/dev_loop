@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import fs, { chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { finish } from "../src/cli/finish.ts";
 import { join } from "node:path";
 import { fixture, write, getJson, NODE, until } from "./helpers.ts";
 import { companion } from "../src/cli/companion.ts";
@@ -72,4 +74,19 @@ test("live 留痕失败只记记录；缺基线对比不影响状态，没登记
   const f=snapshotFixture(t,"console.log('snapshot broken');process.exit(7);"),task=await f.prepare();transition(task.dir,"completed","完成","ready",null);
   const r=await deploy(task.dir);assert.equal(r.result,"已部署");assert.equal(statusOf(task.dir).loop.phase,"已部署");assert.equal(checksOf(task.dir).filter(c=>c.step==="留痕" && c.result==="失败").length,2);
   const seq=statusOf(task.dir).seq,out=await comparison(task.dir);assert.equal(out.diff,"没有基线");assert.equal(statusOf(task.dir).seq,seq);
+});
+test("返修必修2：snapshot 输出目录不阻断陪跑、复测评审、部署和 dev 快进",async t=>{
+  const f=snapshotFixture(t,"fs.mkdirSync(e.LOOP_SNAPSHOT_OUT);"),card={...f.raw,flow:["开发评审","测试","合入","部署"]};write(f.card,JSON.stringify(card));
+  const task=await f.prepare(),before=statusOf(task.dir);await companion(task.dir);assert.equal(statusOf(task.dir).seq,before.seq);assert.equal(existsSync(join(task.dir,"snapshot-base.json")),false);
+  write(join(task.worktree,"src/app.txt"),"good directory-output\n");const {commit}=deliver(task.dir);await settle(task.dir);assert.equal(statusOf(task.dir).loop.phase,"收尾中");
+  await finish(task.dir);assert.equal(statusOf(task.dir).state,"completed");assert.equal(statusOf(task.dir).loop.phase,"已部署");assert.equal(f.git("rev-parse","dev^2"),commit);
+  const failed=checksOf(task.dir).filter(c=>c.step==="留痕" && c.result==="失败");assert.equal(failed.length,4);assert.ok(failed.every(c=>/EISDIR|directory/.test(c.detail!)));
+  assert.equal(existsSync(join(task.dir,"snapshot-"+commit+".json")),false);
+});
+test("返修必修2：异常输出清理再失败只追加失败记录，核心仍完成",async t=>{
+  const f=snapshotFixture(t,"fs.mkdirSync(e.LOOP_SNAPSHOT_OUT);"),task=await f.prepare();write(join(task.worktree,"src/app.txt"),"good cleanup-failure\n");const {commit}=deliver(task.dir),out=join(task.dir,"snapshot-"+commit+".json"),original=fs.rmSync;let calls=0;
+  t.mock.method(fs,"rmSync",(path: Parameters<typeof original>[0],options?: Parameters<typeof original>[1])=>{if(String(path)===out && ++calls>1)throw Object.assign(new Error("simulated output EACCES"),{code:"EACCES"});return original(path,options);});syncBuiltinESMExports();
+  t.after(()=>{t.mock.restoreAll();syncBuiltinESMExports();});
+  await settle(task.dir);assert.equal(statusOf(task.dir).state,"completed");assert.ok(calls>=2);
+  const failed=checksOf(task.dir).filter(c=>c.step==="留痕" && c.result==="失败");assert.equal(failed.length,1);assert.match(failed[0].detail!,/清理失败[\s\S]*EACCES/);
 });
