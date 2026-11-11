@@ -66,9 +66,9 @@ test("A9：完整列表、PA 全字段、seq 单调、总结一屏、task 只写
 });
 for(const [label,change,pattern] of [
   ["多任务",(r:any)=>{r.tasks.push({...r.tasks[0],name:"second"});},/多任务.*第 3 步/],
-  ["提交",(r:any)=>{r.flow.push("提交");},/flow 不写提交：完成后运行 bin\/loop 合入 <执行编号>/],
+  ["提交",(r:any)=>{r.flow.push("提交");},/flow 不写提交：请改写合入，提交已由 bin\/loop 交付完成/],
   ["验收",(r:any)=>{r.flow.push("验收");},/验收.*第 3 步/],
-  ["部署",(r:any)=>{r.flow.push("部署");},/flow 不写部署：需要时运行 bin\/loop 部署 <执行编号>/],
+  ["部署登记",(r:any)=>{r.flow.push("合入","部署");},/自动部署须登记 deploy.cmd、check、rollback/],
 ] as const) test("A10："+label+"启动明确拒绝，不建执行目录",async(t)=>{
   const f=fixture(t);change(f.raw);write(f.card,JSON.stringify(f.raw));
   await assert.rejects(f.cli(["启动",f.card,"--json"]),e=>{assert.match((e as any).stderr,pattern);return true;});

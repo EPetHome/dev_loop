@@ -74,6 +74,16 @@ test("部署：只运行仓库内普通可执行文件，软链接/目录不能�
   for(const cmd of ["scripts/link.sh","scripts"]){write(join(f.repo,".autoreview.json"),JSON.stringify({deploy:{cmd}}));await assert.rejects(deploy(f.task.dir),/脚本不存在或不可执行/);}
   assert.equal(checksOf(f.task.dir).filter(c=>c.step==="部署").length,0);
 });
+test("deploy.env：键/值校验，当前配置覆盖宿主环境但不覆盖 LOOP_*",async(t)=>{
+  const f=await setup(t,{cmd:"fs.writeFileSync(process.env.LOOP_EVIDENCE_DIR+'/env.json',JSON.stringify({value:process.env.APP_DIR,commit:process.env.LOOP_DEPLOY_COMMIT}));"});
+  for(const env of [null,[],"bad",{lower:"x"},{"1BAD":"x"},{LOOP_REPO:"bad"},{APP_DIR:2}]){
+    write(join(f.repo,".autoreview.json"),JSON.stringify({deploy:{...f.cfg,env}}));assert.throws(()=>loadDeploy(f.repo),/env/);
+  }
+  write(join(f.repo,".autoreview.json"),JSON.stringify({deploy:{...f.cfg,env:{APP_DIR:"current value"}}}));
+  const r=await deploy(f.task.dir),env=getJson(join(r.evidenceDir,"env.json"));assert.equal(env.value,"current value");assert.equal(env.commit,r.commit);
+  write(join(f.repo,".autoreview.json"),JSON.stringify({deploy:{cmd:f.cfg.cmd,check:f.cfg.check}}));
+  const count=checksOf(f.task.dir).length;await assert.rejects(deploy(f.task.dir,{automatic:true}),/自动部署须登记/);assert.equal(checksOf(f.task.dir).length,count);
+});
 test("部署：cmd 超时注入 200ms，按失败处理并删除临时检出",async(t)=>{
   const f=await setup(t,{cmd:"setInterval(()=>{},60000);",check:false,rollback:false}),before=f.git("worktree","list","--porcelain");
   await assert.rejects(deploy(f.task.dir,{timeoutMs:200}),(e:any)=>{

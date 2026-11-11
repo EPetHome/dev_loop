@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-export interface DeployConfig { cmd: string; check?: string; rollback?: string; timeoutMin: number }
+export interface DeployConfig { cmd: string; check?: string; rollback?: string; timeoutMin: number; env: Record<string,string> }
 export function loadDeploy(repo: string): DeployConfig | undefined {
   try {
     const file = resolve(repo, ".autoreview.json"), cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8"))?.deploy : undefined;
@@ -12,8 +12,15 @@ export function loadDeploy(repo: string): DeployConfig | undefined {
     }
     const timeoutMin = cfg.timeoutMin === undefined ? 20 : cfg.timeoutMin;
     if (!Number.isInteger(timeoutMin) || timeoutMin < 1 || timeoutMin > 240) throw new Error("timeoutMin 须为 1–240 的整数");
-    return {cmd: cfg.cmd, ...(cfg.check !== undefined ? {check: cfg.check} : {}), ...(cfg.rollback !== undefined ? {rollback: cfg.rollback} : {}), timeoutMin};
+    const env = cfg.env === undefined ? {} : cfg.env;
+    if (!env || typeof env !== "object" || Array.isArray(env) || Object.entries(env).some(([k,v])=> !/^[A-Z][A-Z0-9_]*$/.test(k) || k.startsWith("LOOP_") || typeof v !== "string")) throw new Error("env 键须为大写环境变量且不能以 LOOP_ 开头，值须为字符串");
+    return {env, cmd: cfg.cmd, ...(cfg.check !== undefined ? {check: cfg.check} : {}), ...(cfg.rollback !== undefined ? {rollback: cfg.rollback} : {}), timeoutMin};
   } catch (e) { throw new Error(".autoreview.json 的 deploy 不合法：" + (e instanceof Error ? e.message : String(e))); }
+}
+export function loadSnapshot(repo: string): string | undefined {
+  const file = resolve(repo,".autoreview.json"), path = existsSync(file) ? JSON.parse(readFileSync(file,"utf8"))?.snapshot : undefined;
+  if (path !== undefined && (typeof path !== "string" || !safeRelative(path))) throw new Error("snapshot 须为仓库内可执行文件的相对路径");
+  return path;
 }
 export interface Config { reviewerModel: string; reviewerThinking: string; reviewerCmd: string; localFiles: string[]; setup: string }
 export function safeRelative(path: string): boolean {

@@ -62,12 +62,15 @@ export function shutdownSession(dir: string): void {
 }
 export function resume(dir: string): {reused: boolean; running: boolean; status: Status} {
   const t = taskOf(dir), s = statusOf(dir);
+  if (s.loop.released) throw new Error("工作区已释放，不能续跑；请重新启动卡");
   if (s.loop.abandoned) throw new Error("已放弃并删除 worktree，不能续跑；请重新启动卡");
-  if (alive(s.loop.startingSession) || alive(s.loop.activeProcess) || alive(s.loop.launcher)) throw new Error("执行正在准备或检查，请先停止再续跑");
+  if (s.loop.phase === "收尾中" || alive(s.loop.finisher) || alive(s.loop.startingSession) || alive(s.loop.activeProcess) || alive(s.loop.launcher)) throw new Error("执行正在准备或检查，请先停止再续跑");
   const running = alive(s.loop.session) && !s.loop.session?.endedAt;
-  if (s.loop.delivery && existsSync(t.worktree) && head(t.worktree) === s.loop.delivery.commit && !changes(t.worktree).length && checked(dir, s.loop.delivery.commit)) {
+  if (s.loop.wait !== "收尾没走完" && (!(t.after?.length || t.next) || s.state === "completed" || s.loop.afterCommit !== s.loop.delivery?.commit) && s.loop.delivery && existsSync(t.worktree) && head(t.worktree) === s.loop.delivery.commit && !changes(t.worktree).length && checked(dir, s.loop.delivery.commit)) {
     update(dir, (s) => { s.state = "working"; s.loop.reused = true; });
-    return { reused: true, running: Boolean(running), status: transition(dir, "completed", "完成", "沿用此 commit 的复测与评审通过记录", null) };
+    const pending = Boolean(t.after?.length || t.next) && s.loop.afterCommit !== s.loop.delivery.commit;
+    if (pending) update(dir, s => { s.loop.afterCommit = s.loop.delivery!.commit; });
+    return { reused: true, running: Boolean(running), status: transition(dir, pending ? "working" : "completed", pending ? "收尾中" : s.loop.phase === "等你" || s.loop.phase === "已停止" ? "完成" : s.loop.phase, "沿用此 commit 的复测与评审通过记录", pending ? "selfMs" : null) };
   }
   if (running && s.state !== "input_required") throw new Error("开发会话仍在运行；请在原会话继续或先停止");
   const startedAt = new Date(s.loop.stepStartedAt).toISOString();
