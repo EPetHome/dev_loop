@@ -58,9 +58,9 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
   if (raw.tasks.length > 1) throw new UnsupportedError("本步不支持多任务卡；第 3 步支持（须选验收并标明任务归属）");
   if (!Array.isArray(raw.flow) || !raw.flow.length) throw new InputError("flow 须为非空数组");
   for (const step of raw.flow) {
-    if (step === "提交") throw new UnsupportedError("本步不支持 flow 提交（合入）；第 2 步支持");
+    if (step === "提交") throw new UnsupportedError("开发卡的 flow 不写提交：完成后运行 bin/loop 合入 <执行编号>");
     if (step === "验收" || step === "整合") throw new UnsupportedError("本步不支持 flow " + step + "；第 3 步支持");
-    if (step === "部署") throw new UnsupportedError("本期不支持部署；以后 CI/CD 步骤支持（第 1–4 步均不做）");
+    if (step === "部署") throw new UnsupportedError("开发卡的 flow 不写部署：需要时运行 bin/loop 部署 <执行编号>");
     if (!["开发评审", "测试"].includes(step)) throw new UnsupportedError("不支持 flow " + step + "；本步仅开发评审、测试");
   }
   if (raw.nature !== "开发" || raw.flow[0] !== "开发评审" || new Set(raw.flow).size !== raw.flow.length) throw new InputError("须为 nature:开发，flow:[开发评审,可选测试]");

@@ -26,7 +26,7 @@ export function deliver(dir: string, note = "") {
     const reused = checked(dir, commit, h);
     update(dir, (s) => {
       s.loop.delivery = { commit, tree: deliveredTree, note, at: now }; s.loop.commit = commit; s.loop.warned = false; s.loop.reused = reused;
-      s.state = reused ? "completed" : "working"; s.loop.phase = reused ? "完成" : "开发中"; s.message = reused ? "已交付，沿用已有检查" : "已交付，等待会话停下后复测和评审";
+      s.state = reused ? "completed" : "working"; s.loop.phase = reused ? "完成" : "已交付"; s.loop.wait = null; s.message = reused ? "已交付，沿用已有检查" : "已交付，等待会话停下后复测和评审";
       s.loop.bucket = reused ? null : "developmentMs";
     });
     appendCheck(dir, { commit, tree: deliveredTree, step: "dev-loop 自身", result: "交付登记", startedAt: new Date(begin).toISOString(), endedAt: now,

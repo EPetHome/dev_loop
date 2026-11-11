@@ -8,6 +8,13 @@ import { digest, readJson, writeJson, withLock, jsonLines, appendJson } from "..
 import { gitText } from "../infra/git.ts";
 import { tasksRoot } from "../infra/paths.ts";
 import type { Identity } from "../infra/exec.ts";
+export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败"] as const;
+export type Phase = typeof PHASES[number];
+export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "需手动接入会话";
+export class LoopError extends Error {
+  category: string; result?: unknown;
+  constructor(category: string, message: string, result?: unknown) { super(message); this.category = category; this.result = result; }
+}
 export type State = "working" | "input_required" | "completed" | "failed" | "cancelled";
 export type Bucket = "developmentMs" | "testMs" | "reviewMs" | "inputMs" | "selfMs";
 export interface Task {
@@ -25,7 +32,7 @@ export interface Status {
   refs: {prompt: string; acceptance: string | null; card: string}; error: {category: string; raw: string} | null;
   evidence: string[]; actions: string[];
   loop: {
-    phase: string; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
+    phase: Phase; wait?: WaitReason | null; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
     startingSession: (Identity & {launchId: string}) | null;
     activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
@@ -44,6 +51,10 @@ export function summary(dir: string, s = statusOf(dir)): void {
   const checks = checksOf(dir), lines = ["# " + s.executionId, "", s.loop.phase + "：" + s.message.replace(/\s+/g, " ").slice(0, 220),
     s.loop.reused ? "结论：沿用此 commit 的已有检查。" : "", "", "| 步骤 | 结论 | 累计耗时 |", "|---|---|---|"];
   for (const [bucket, label] of Object.entries(labels)) {
+    if (bucket === "selfMs") for (const extra of new Set(checks.map(c => c.step).filter(step => !Object.values(labels).includes(step)))) {
+      const records = checks.filter(c => c.step === extra);
+      lines.push("| " + extra + " | " + records.at(-1)!.result + " | " + (records.reduce((n, c) => n + c.durationMs, 0) / 1000).toFixed(2) + "s |");
+    }
     const step = bucket === "testMs" ? "复测" : bucket === "reviewMs" ? "评审" : label;
     const last = checks.filter((c) => c.step === step).at(-1);
     const result = last?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
@@ -62,18 +73,22 @@ export function update(dir: string, action: (s: Status) => void): Status {
     writeJson(join(dir, "status.json"), s); summary(dir, s); return s;
   });
 }
-export function transition(dir: string, state: State, phase: string, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
+export function transition(dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
   return update(dir, (s) => {
     if (s.state === "cancelled" && state !== "cancelled") return;
     s.state = state; s.loop.phase = phase; s.message = message; s.loop.bucket = bucket; s.timeLimitSec = timeLimitSec;
-    s.error = null;
+    s.error = null; if (phase !== "等你") s.loop.wait = null;
   });
+}
+export function waitFor(dir: string, reason: WaitReason, message: string): void {
+  transition(dir, "input_required", "等你", message, "inputMs");
+  update(dir, (s) => { if (s.state === "input_required") s.loop.wait = reason; });
 }
 export function fail(dir: string, error: unknown, category?: string): void {
   const raw = error instanceof Error ? error.message : String(error);
   update(dir, (s) => {
     if (s.state === "cancelled") return;
-    s.state = "failed"; s.loop.phase = "失败"; s.message = raw; s.loop.bucket = null; s.timeLimitSec = null;
+    s.state = "failed"; s.loop.phase = "失败"; s.loop.wait = null; s.message = raw; s.loop.bucket = null; s.timeLimitSec = null;
     s.error = { category: category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知"), raw };
   });
 }
@@ -95,7 +110,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","停止","放弃"],
-    loop: { phase: "开发中", commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null,
+    loop: { phase: "准备中", wait: null, commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null,
       ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
@@ -116,7 +131,28 @@ export function inputs(t: Task) {
   const prompt = readFileSync(t.prompt, "utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance, "utf8") : "";
   return { prompt, acceptance, promptHash: digest(prompt), acceptanceHash: digest(acceptance) };
 }
-export function checked(dir: string, commit: string, hashes = inputs(taskOf(dir))): boolean {
-  const same = checksOf(dir).filter((c) => c.commit === commit && c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash);
-  return same.some((c) => c.step === "复测" && ["通过", "没验证"].includes(c.result)) && same.some((c) => c.step === "评审" && c.result === "通过");
+export function missingChecks(dir: string, commit: string, hashes = inputs(taskOf(dir))): string[] {
+  const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
+  const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash), missing: string[] = [];
+  if (!same.some(c => c.step === "复测" && ["通过", "没验证"].includes(c.result))) missing.push("复测：没有通过记录");
+  if (!same.some(c => c.step === "评审" && c.result === "通过")) missing.push("评审：没有通过记录");
+  if (missing.length && records.length !== same.length) missing.push("提示词或验收标准已变化，原检查不再算数");
+  return missing;
+}
+export const checked = (dir: string, commit: string, hashes = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
+interface StepView { phase: Phase; message: string; complete?: boolean }
+function stepView(dir: string, view: StepView): void {
+  update(dir, s => {
+    if (s.state !== "completed" && !(s.state === "input_required" && view.complete)) return;
+    s.state = "completed"; s.loop.bucket = null; s.loop.wait = null; s.timeLimitSec = null; s.error = null;
+    s.loop.phase = view.phase; s.message = view.message;
+  });
+}
+export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
+export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash" | "acceptanceHash">, view?: StepView): void {
+  const t = taskOf(dir); let hashes = {promptHash: "", acceptanceHash: ""};
+  try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
+  appendCheck(dir, {...entry, tree: gitText(t.repo, ["rev-parse", entry.commit + "^{tree}"]), promptHash: hashes.promptHash, acceptanceHash: hashes.acceptanceHash});
+  if (view) stepView(dir, view);
+  summary(dir);
 }

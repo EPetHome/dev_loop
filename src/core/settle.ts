@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { lock, BusyError } from "../infra/files.ts";
 import { git, head, tree, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, inputs, checked, appendCheck, checksOf, summary, fail, type Check, type Task } from "./store.ts";
+import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, summary, fail, type Check, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
 import { executeStaticReview } from "./review-call.ts";
 export interface SettleResult { continue: boolean; reason: string }
@@ -13,7 +13,7 @@ function returnToDeveloper(dir: string, kind: "test" | "review", reason: string)
   const count = kind === "test" ? s.loop.testReturns : s.loop.reviewReturns;
   const max = kind === "test" ? s.loop.testAllowance : s.loop.reviewAllowance;
   if (count >= max) {
-    transition(dir, "input_required", "等你", (kind === "test" ? "复测" : "评审必修") + "退回 " + count + " 次，已到上限。可选：再给一轮（bin/loop 续跑）/ 停止 / 接受未验证（本步只记录决定，不执行合入）。\n" + reason, "inputMs");
+    waitFor(dir, kind === "test" ? "复测退回到上限" : "评审必修到上限", (kind === "test" ? "复测" : "评审必修") + "退回 " + count + " 次，已到上限。可选：再给一轮（bin/loop 续跑）/ 停止 / 接受未验证（bin/loop 合入 " + taskOf(dir).executionId + " --接受未验证）。\n" + reason);
     return quiet(reason);
   }
   transition(dir, "working", "开发中", reason, "developmentMs");
@@ -37,7 +37,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
         update(dir, (s) => { s.loop.warned = true; s.loop.bucket = "developmentMs"; });
         return retry("尚未交付；做完后请运行 bin/loop 交付。");
       }
-      transition(dir, "input_required", "等你", lastReply || "开发方未交付；可续跑开发或停止。", "inputMs");
+      waitFor(dir, "停下没交付", lastReply || "开发方未交付；可续跑开发或停止。");
       return quiet(lastReply);
     }
     if (tree(t.worktree) !== delivery.tree || dirty.length) {
@@ -46,7 +46,10 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     }
     const commit = head(t.worktree);
     // HEAD 即使有内容相同的额外提交，也不拿旧 commit 的结论冒充新提交。
-    if (commit !== delivery.commit) return retry("HEAD 与登记交付不同，请重新运行 bin/loop 交付。");
+    if (commit !== delivery.commit) {
+      transition(dir, "working", "开发中", "HEAD 与登记交付不同，请重新运行 bin/loop 交付。", "developmentMs");
+      return retry("HEAD 与登记交付不同，请重新运行 bin/loop 交付。");
+    }
     const h = inputs(t); hashes = { promptHash: h.promptHash, acceptanceHash: h.acceptanceHash };
     if (checked(dir, commit, h)) {
       update(dir, (s) => { s.loop.reused = true; });

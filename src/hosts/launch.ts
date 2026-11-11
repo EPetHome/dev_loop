@@ -7,7 +7,7 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, transition, update, fail, inputs } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, update, fail, inputs } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 interface LaunchOptions {
   openTerminal?: (script: string) => Promise<void>;
@@ -97,7 +97,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
     return;
   }
   if (t.host !== "pi") {
-    transition(dir,"input_required","等你","工作区已就绪。本步 Claude/Codex 仅提供 hook 接入（插件未安装）；请手动在 worktree 开会话并连接 hosts/hook.ts，再续跑；或改用 pi。", "inputMs");
+    waitFor(dir,"需手动接入会话","工作区已就绪。本步 Claude/Codex 仅提供 hook 接入（插件未安装）；请手动在 worktree 开会话并连接 hosts/hook.ts，再续跑；或改用 pi。");
     return;
   }
   const id = randomUUID(), files = launchFiles(dir, id), timeoutMs = options.startupTimeoutMs ?? 60000;
