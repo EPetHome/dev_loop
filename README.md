@@ -1,7 +1,7 @@
 # dev-loop
 
 单任务核心：开发会话 → `交付` → 会话停下 → 复测 → 独立评审 → 返修或完成。
-合入、可选推送和部署是显式命令，不自动触发，不调用模型，不读取旧 loop 的运行数据。
+卡上约定的合入、部署、推送在评审通过后自动走完，不调用模型；未约定的卡保持完成即停。也支持显式命令，不读取旧 loop 的运行数据。
 
 ## 运行
 
@@ -15,10 +15,16 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 /Users/Admin/Desktop/dev-loop/bin/loop 续跑 <执行编号或卡路径> --json
 /Users/Admin/Desktop/dev-loop/bin/loop 停止 <执行编号或卡路径> --json
 /Users/Admin/Desktop/dev-loop/bin/loop 放弃 <执行编号或卡路径> --json
-# 完成后按需执行（不会自动触发）：
+# 没有约定收尾的卡，完成后按需执行：
 /Users/Admin/Desktop/dev-loop/bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] --json
 /Users/Admin/Desktop/dev-loop/bin/loop 合入 <执行编号或卡路径> --推送 --json
 /Users/Admin/Desktop/dev-loop/bin/loop 部署 <执行编号或卡路径> [--commit <sha>] --json
+/Users/Admin/Desktop/dev-loop/bin/loop 收尾 <执行编号或卡路径> --json
+/Users/Admin/Desktop/dev-loop/bin/loop 退回 <执行编号或卡路径> --json
+/Users/Admin/Desktop/dev-loop/bin/loop 对比 <执行编号> [<另一个执行编号>] --json
+/Users/Admin/Desktop/dev-loop/bin/loop 陪跑 <执行编号或卡路径> --json
+# 本人验收通过后由协调方运行：
+/Users/Admin/Desktop/dev-loop/bin/loop 释放 <执行编号或卡路径> --json
 ```
 
 - 启动回执只表示已接收；worktree、localFiles、setup、开会话均在后台完成。Terminal 接收命令不算会话启动成功：后台会在 60 秒内确认本次会话的进程登记；启动失败/超时写 failed，并保留 `launch-*.log` 原始错误。
@@ -27,6 +33,21 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 停止保留 worktree、分支和证据；放弃删除 worktree，保留本地分支和证据，不可原执行续跑。
 - 达到退回上限后，`续跑` 给耗尽的步骤再一轮；原会话仍在时，不另开第二个会话，请在原会话继续输入。
 - `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、第 4 步的答复/能力声明尚未实现。
+
+## 自动收尾与接力
+
+`flow` 必须以开发评审开头，是 `开发评审, 测试, 合入, 部署, 推送` 的不重复子序列；部署、推送均要求包含合入。不设项目默认走法。`提交` 请改写 `合入`，提交已由交付完成。
+
+- `开发评审, 测试`：完成即停；加合入停在「已合入」；再加部署停在「已部署」；再加推送停在「已推送」。推送仅卡上写了才执行。
+- 评审通过先转 working /「收尾中」，宿主拉起脱离会话的独立进程，关闭开发窗口仍继续。同一 commit 只自动发起一次；走完之前不报 completed。自动收尾绝不用「接受未验证」。
+- 写到部署：先检查合入资格、用 `merge-tree` 试合并，部署试合并 commit；部署成功后 dev 才快进。需要 Git ≥2.38。仅合入的卡仍用 `merge --no-ff`。
+- 同项目收尾、手工合入、部署、退回共用项目队列，等待不拒绝、心跳不停。`停止` 不杀正在运行的部署脚本，脚本及必要回退跑完后不进入后续步骤。
+- 冲突、部署失败且已回退：Pi 收到原因继续返修；窗口不在时精确恢复会话。默认最多自动返修 2 轮，可用 `limits.部署.maxRepairs` 调整。修好新 commit 再走复测、评审、收尾，不原样自动重试。
+- 回退也失败、返修耗尽、合入资格不足、推送失败，或 Claude/Codex 不能自动送回：转「等你」，原因为「收尾没走完」。`续跑` 回开发；`收尾` 可手工接手待收尾/收尾没走完的执行。收尾进行中不接受交付或续跑。
+- 可选 `next` 相对卡目录指向下一张卡。启动前检查整条链（坏卡、环、中间批收尾都拒绝）；中间批通过后不动 dev，自动启动下一批，其起点为上批交付 commit，沿用派单号，`loop.next` 给出新执行编号。最后一批才合入、部署。
+- 收尾结束在卡目录追加 `结果.md`：版本、时间、dev 前后、证据、退回原因、恢复入口、验收标准位置。完成 message 带同级其他目录 `验收.md` 第一行「状态：待验」的批次数。程序检查或部署成功不等于本人验收通过。
+
+开发方固定说明：有收尾时不要手工合入、推送、部署；无收尾时用户要求才运行命令，报错原文返回，不临时编部署步骤。
 
 ## 合入与推送
 
@@ -38,7 +59,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 输出字段：`executionId`、`commit`、`devBefore`、`devAfter`、`result`、`unverified`、`seconds`、`worktree`、`revert`。`revert` 给出 `git -C '<dev 检出目录>' revert -m 1 <devAfter>`；已在 dev 且 dev 未检出时，后两项为空。
 - 没有交付、版本不符、检查不足、dev 未检出等前置拒绝不写记录、不改阶段；合入结果（包括失败、已在 dev）写记录。
 
-**推送默认关闭**，只有 `合入 --推送` 在合入成功或已在 dev 后执行：确认 origin → `git fetch --no-tags --prune --no-prune-tags --refmap= origin '+refs/heads/*:refs/remotes/origin/*'` → 扫描 dev 上、origin 所有分支都没有的提交 → `git push --no-follow-tags origin <完整sha>:refs/heads/dev`。显式关闭 follow-tags，即使配置 `push.followTags=true` 也不推标签。不强推、不推其他分支、不拉取、不重试；fetch 只清理 origin 的分支跟踪引用，关闭 prune-tags 并忽略配置的额外抓取映射，保留本地标签，同时避免把已删除的 dev 误报成「已推送」。刷新后的远端 dev 等于本地时直接返回「已推送」。
+**手工推送默认关闭**，显式 `合入 --推送` 或卡上约定的推送步骤在合入成功或已在 dev 后执行：确认 origin → `git fetch --no-tags --prune --no-prune-tags --refmap= origin '+refs/heads/*:refs/remotes/origin/*'` → 扫描 dev 上、origin 所有分支都没有的提交 → `git push --no-follow-tags origin <完整sha>:refs/heads/dev`。显式关闭 follow-tags，即使配置 `push.followTags=true` 也不推标签。不强推、不推其他分支、不拉取、不重试；fetch 只清理 origin 的分支跟踪引用，关闭 prune-tags 并忽略配置的额外抓取映射，保留本地标签，同时避免把已删除的 dev 误报成「已推送」。刷新后的远端 dev 等于本地时直接返回「已推送」。
 
 推送非 0 时只做一次 `git ls-remote origin refs/heads/dev`：远端等于目标则「已推送」，不等则「推送失败」，核对也失败则「推送结果不确定」并给出核对命令。网络命令默认时限 120 秒，核对最多 30 秒。成功的合入输出增加 `push` 结果；推送失败在错误的 `result` 中返回已执行的推送结果，合入记录仍然保留。
 
@@ -82,7 +103,18 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 scope 也接受字符串数组；支持目录前缀、`*`、`**`、`?`。越界检测包含暂存、未跟踪、删除/重命名，以及开发方已经自行提交的改动。忽略文件不参与交付。
 
 `无：原因` 的测试记为“没验证”后继续评审；省略 flow 的测试步骤且没有 test 时同样不伪造测试通过。
-多任务/整合/验收尚不支持（第 3 步）。flow 不写「提交」「部署」：启动时仍明确拒绝、不建执行目录，完成后另用 `bin/loop 合入`、按需用 `bin/loop 部署`。
+多任务/整合/验收尚不支持（第 3 步）。要一条龙收尾，将示例 flow 改为 `["开发评审", "测试", "合入", "部署", "推送"]`；链路示例：第一张写 `"next": "../第2批/开发卡.json"` 且不写收尾，最后一张才写合入以后的步骤。`after`、`next` 和限额在启动时存进 task.json，旧执行没有 after 按无收尾处理。
+
+自动部署卡启动前必须登记 `deploy.cmd/check/rollback`，执行时也不能缺失；推送卡必须有 origin。不预查脚本文件（本批可能正是来添加脚本的），执行时在目标 commit 检出中检查。整链预检失败不建执行目录。
+
+| 新增拒绝 | 需求「约定收尾一条龙」第十一节 |
+|---|---|
+| 自动部署缺 cmd / check / rollback | 第 1 行 |
+| 推送没有 origin | 第 2 行 |
+| 收尾中交付或续跑 | 第 3 行 |
+| 接力链解析失败、有环、中间批收尾 | 第 4 行 |
+
+此外仅有方案所列的无法执行：没有约定或不在待收尾、同执行收尾已在运行、非项目最新部署/没有回退脚本、未完成或已释放的工作区。字段格式校验沿用卡/配置的输入校验，不增加其他项目级门槛。
 
 ## 项目配置
 
@@ -95,11 +127,13 @@ scope 也接受字符串数组；支持目录前缀、`*`、`**`、`?`。越界�
   "reviewerModel": "astra",
   "reviewerThinking": "xhigh",
   "reviewerCmd": "./reviewer.sh",
+  "snapshot": "scripts/snapshot.sh",
   "deploy": {
     "cmd": "scripts/deploy.sh",
     "check": "scripts/deploy-check.sh",
     "rollback": "scripts/deploy-rollback.sh",
-    "timeoutMin": 20
+    "timeoutMin": 20,
+    "env": {"APP_DIR": "/path/to/app", "OBSERVE_MIN": "5"}
   }
 }
 ```
@@ -111,7 +145,7 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 ### 部署
 
-未登记 `deploy` 默认关闭。`cmd` 必填，`check`、`rollback` 可选；三个值必须是仓库内普通可执行文件的相对路径，**不是 shell 命令串**。`timeoutMin` 为 1–240 的整数，默认 20，分别适用于每个脚本。部署命令读仓库根目录当前的登记，不读取启动时的配置快照；deploy 写错只影响部署，不影响启动。
+未登记 `deploy` 默认关闭。`cmd` 必填，`check`、`rollback` 可选；三个值必须是仓库内普通可执行文件的相对路径，**不是 shell 命令串**。`timeoutMin` 为 1–240 的整数，默认 20，分别适用于每个脚本。部署命令读仓库根目录当前的登记，不读取启动时的配置快照；无自动部署 flow 的卡，deploy 写错仍不影响启动。`deploy.env` 可选：键匹配 `^[A-Z][A-Z0-9_]*$`，不能以 `LOOP_` 开头，值为字符串；覆盖宿主同名变量，框架 `LOOP_*` 优先。不放密钥，改值下次部署立即生效。
 
 `部署` 默认取本地 dev 当前 commit，`--commit` 可指定其他 commit；输出 `onDev` 表明它是否已在 dev 上。代码临时独立检出，登记的所有脚本必须在该 commit 中存在且可执行，否则清理检出后拒绝，不写记录。
 
@@ -120,11 +154,33 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 - `LOOP_DEPLOY_COMMIT`：完整 sha。
 - `LOOP_REPO`：项目仓库根目录。
 - `LOOP_EVIDENCE_DIR`：本次部署的持久证据目录。
-- rollback 另有 `LOOP_DEPLOY_FAILED=cmd` 或 `check`。
+- rollback 另有 `LOOP_DEPLOY_FAILED=cmd`、`check` 或手工退回时的 `manual`。
 
 执行 cmd → 可选 check。cmd/check 失败或超时则运行一次已登记的 rollback；无重试，超时结束整个进程组。结果分别为「已部署」「已部署（未检查）」「部署失败，已回退」「部署失败，回退也失败」「部署失败，未回退」。不改 dev、不推送；部署副作用与健康判断由项目脚本负责。
 
 输出字段：`executionId`、`commit`、`onDev`、`result`、`steps`（每项 `name/path/code/seconds/killed`）、`log`、`evidenceDir`、`seconds`。三个脚本完整输出写到执行目录的 `deploy-<短sha>-<本地时间>.log`，证据目录同名不带 `.log`；同秒重复时加数字后缀，避免覆盖。部署重复请求就是再运行一次。无论结果如何删除临时检出，清理失败只记日志、不覆盖脚本结果。失败退出码 1，错误 raw 是日志最后 40 行。
+
+### 退回线上
+
+`退回` 只允许项目最新一次成功部署的执行，运行该部署 commit 中登记的 rollback，收到当次原证据目录；成功阶段为「已退回」，清除项目最新部署记录。只换线上，**不动 dev，不用 git revert**；修复向前走。重复退回、没有 rollback 或不是最新部署均无法执行。手工部署仍不强制登记 rollback。
+
+框架不实现项目迁移、备份、空闲检查或观察期，须由项目脚本负责；回退脚本不得用旧备份覆盖当前授权、设置等可变数据，应做反向转换。
+
+## 留痕、陪跑与释放
+
+`snapshot` 是可选仓库内普通可执行文件相对路径，不是命令串。未登记或目标 commit 没有脚本就跳过。脚本时限 5 分钟，写 JSON 对象到 `LOOP_SNAPSHOT_OUT`；`LOOP_SNAPSHOT_MODE=scenario` 跑固定替身场景，`live` 读线上指标。`TMPDIR` 是独立临时数据目录，完成即清理。失败只记「留痕 / 失败」，不改阶段或阻断任何流程。
+
+| 时机 | 模式 / 产出 |
+|---|---|
+| 开工，独立陪跑工作区，与开发同起点 | scenario → `snapshot-base.json` |
+| 复测通过、评审之前，开发工作区 | scenario → `snapshot-<commit>.json`，文件清单和基线差异进入评审「运行差异」 |
+| deploy.cmd 之前 / check 成功后 | live → 证据目录 `snapshot-before.json` / `snapshot-after.json` |
+
+部署证据中的 `snapshot-static.json` 内置保存 commit、依赖锁摘要、上次部署至本次的文件清单。陪跑复制 localFiles、运行 setup，产出只进任务目录；无论成功失败移除自己创建的陪跑 worktree，失败只记「陪跑 / 失败」，不改 state。`陪跑` 可手工运行。
+
+`对比 <执行>` 现场采 live，与该执行部署后的快照比；`对比 <执行> <另一执行>` 比两次部署后的快照。逐路径报新增、减少、变化，报告留在执行目录，不自动判断指标好坏；缺快照写「没有基线」。
+
+本人验收通过后运行 `释放`：仅 completed 且未释放可执行，删除登记的开发 worktree，保留分支、日志和证据，写 `loop.released=true`，阶段不变。已释放不能续跑。存量或未登记的目录不自动清理。
 
 ## 数据与状态
 
@@ -139,7 +195,7 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 状态协议 `loop-status/1`，state 仅 `working/input_required/completed/failed/cancelled`。`查询 --all --brief --json` 一次返回 `{complete:true, executions:[状态报告...]}`，不调用 git 或模型。
 
-合入/推送/部署通常不改 state：仅 state 为 completed 时更新阶段；其他 state 下只追加结果、不改阶段。唯一例外：「等你」时明确用 `合入 --接受未验证` 成功（含已在 dev），改为 completed，阶段「已合入」。失败的附加步骤不把 state 改成 failed。
+合入/推送/部署通常不改 state：手工执行仅 state 为 completed 时更新阶段；自动收尾登记 finisher 后可在 working 下更新阶段，仍维持 working 直到全程走完。其他 state 下只追加结果、不改阶段。唯一例外：「等你」时明确用 `合入 --接受未验证` 成功（含已在 dev），改为 completed，阶段「已合入」。失败的附加步骤不把 state 改成 failed。
 
 命令成功 stdout 为 JSON；失败 stderr 为 `{error:{category,raw,result?}}`，退出码 1，`result` 保留已执行部分。运行 `bin/loop 帮助` 查看参数。
 
@@ -149,20 +205,21 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 - pi：`bin/pi-dev` 默认 sol/max，显式加载权限扩展和 `src/hosts/pi.ts`，不加载旧 loop/Ponytail/其他扩展；`--session` 精确恢复。
 - pi 会话启动后每 60 秒心跳，仅 working 时更新；最终停下边界可注入 custom_message 并请求继续。
+- pi 每秒读到 `pendingReturn` 时发送 custom message 并 `triggerTurn:true`，清除待送原因，无 UI 也生效。独立收尾进程每 60 秒心跳，`loop.finisher` 是其身份，`loop.afterCommit` 防止同 commit 重复自动发起。
 - pi 另外每秒读状态，有变化刷新底部 `dev-loop【<阶段>】<任务名> · <附加信息>` 和标题 `【<阶段>】<任务名>`；无附加信息时不带分隔符。评审显示「第 N 轮」，等你显示原因，失败显示错误类别，附加步骤显示短 sha / 结果原因。无 UI 时不调用界面接口，关闭时清理定时器和状态栏。Claude/Codex 不做阶段显示。
 - Claude/Codex：薄入口 `hosts/hook.ts`，处理 SessionStart、PostToolUse（至少间隔 60 秒）、Stop；不处理 UserPromptSubmit。插件 Stop 外层时限为 4900 秒，保留 100 秒开销余量；两项 timeoutMin 合计超过 80 分钟的卡会在启动前明确拒绝，可降低时限或改用 pi。pi 不受这个外层上限约束。
 - 插件清单在 `plugins/dev-loop/`，**没有安装**。本步自动开终端只针对 pi；Claude/Codex 的真实插件加载没有验证，需手动接入 hook，其卡准备后转等你，不冒充已开会话。连续长时间不调工具的 hook 宿主没有定时心跳。
 - 生产 pi 启动在 macOS Terminal；自动测试用 `LOOP_LAUNCH_CMD` 可执行替身（收到 pi-dev 参数，cwd=worktree，环境含 LOOP_TASK_DIR），绝不打开真实终端。
 
-### 19 个阶段
+### 21 个阶段
 
 `src/core/store.ts` 的 `PHASES` 按顺序固定为：
 
-准备中、开发中、已交付、复测中、评审中、等你、完成、失败、已停止、已放弃、已合入、合入失败、推送中、已推送、推送失败、推送结果不确定、部署中、已部署、部署失败。
+准备中、开发中、已交付、复测中、评审中、等你、完成、失败、已停止、已放弃、已合入、合入失败、推送中、已推送、推送失败、推送结果不确定、部署中、已部署、部署失败、收尾中、已退回。
 
 启动或工作区未就绪的续跑为「准备中」；交付成功且未沿用为「已交付」；交付后又改代码/自行提交则回「开发中」；放弃并删除工作区为「已放弃」，不能续跑。
 
-`loop.wait` 只取四种原因：复测退回到上限、评审必修到上限、停下没交付、需手动接入会话。离开等你时清空；旧状态文件没有 wait 仍可读取，pi 用 message 第一行前 30 字补显原因。到上限后可运行 `bin/loop 续跑 <执行编号>` 再给一轮、停止，或 `bin/loop 合入 <执行编号> --接受未验证`。
+`loop.wait` 只取五种原因：复测退回到上限、评审必修到上限、停下没交付、需手动接入会话、收尾没走完。离开等你时清空；旧状态文件没有 wait 仍可读取，pi 用 message 第一行前 30 字补显原因。到上限后可运行 `bin/loop 续跑 <执行编号>` 再给一轮、停止，或 `bin/loop 合入 <执行编号> --接受未验证`。
 
 ## 自检
 
@@ -174,7 +231,9 @@ bash -n bin/loop bin/pi-dev
 
 测试只在系统临时目录里创建仓库/提交；origin 是本地裸仓库，部署、评审用脚本替身，宿主用模拟事件和假的 pi API，不调用真实模型、GitHub、服务或真实终端。文件事件和模拟时钟替代固定 sleep；超时注入毫秒数。技术测试不等于真实宿主/业务验收。
 
-合入/推送/部署与阶段显示的验收测试：
+本批一条龙 A1–A10 在 `test/finish.test.ts`：A1/A3/A8 自动部署与状态/去重，A2 只合入，A4/A5 失败回退和返修后推送，A6 回退失败，A7 接力，A9 同项目排队，A10 手工退回。`test/companion.test.ts` 覆盖陪跑、运行差异、live 前后、对比和释放；`test/deploy.test.ts` 补 deploy.env。仅用替身，不代表真实线上或真实 Pi 窗口验收。
+
+既有合入/推送/部署与阶段显示的验收测试：
 
 | 条目 | 测试文件与断言 |
 |---|---|

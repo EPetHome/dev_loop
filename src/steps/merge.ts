@@ -7,8 +7,8 @@ export interface MergeResult {
   executionId: string; commit: string; devBefore: string; devAfter: string; result: string; unverified: boolean;
   seconds: number; worktree: string; revert: string;
 }
-export function merge(dir: string, o: {commit?: string; acceptUnverified: boolean}): MergeResult {
-  const start = Date.now(), t = taskOf(dir), commit = statusOf(dir).loop.commit;
+function target(dir: string, o: {commit?: string; acceptUnverified?: boolean}) {
+  const t = taskOf(dir), commit = statusOf(dir).loop.commit;
   if (!commit) throw new InputError("没有交付记录");
   if (o.commit) {
     const confirmed = gitTry(t.repo, ["rev-parse", "--verify", "--end-of-options", o.commit + "^{commit}"]);
@@ -16,6 +16,18 @@ export function merge(dir: string, o: {commit?: string; acceptUnverified: boolea
   }
   const missing = missingChecks(dir, commit), unverified = missing.length > 0;
   if (unverified && !o.acceptUnverified) throw new InputError("合入资格不足：" + missing.join("；") + "。确需合入请加 --接受未验证");
+  return {t, commit, unverified};
+}
+export function prepareMerge(dir: string, commit?: string): string {
+  const {t, commit: sha} = target(dir, {commit}), before = gitText(t.repo, ["rev-parse", "refs/heads/dev"]);
+  if (isAncestor(t.repo, sha, before)) return before;
+  if (!worktreeOf(t.repo, "dev")) throw new InputError("dev 没有检出到任何目录，无法合并");
+  const r = gitTry(t.repo, ["merge-tree", "--write-tree", before, sha]);
+  if (r.code) throw new LoopError("输入问题", r.stdout + r.stderr, {conflict: r.code === 1});
+  return gitText(t.repo, ["commit-tree", r.stdout.trim().split("\n")[0], "-p", before, "-p", sha, "-m", "Merge " + t.name + ": reviewed " + sha.slice(0,7)]);
+}
+export function merge(dir: string, o: {commit?: string; acceptUnverified: boolean; prepared?: string}): MergeResult {
+  const start = Date.now(), {t, commit, unverified} = target(dir, o);
   const before = gitText(t.repo, ["rev-parse", "refs/heads/dev"]), holder = worktreeOf(t.repo, "dev");
   const finish = (result: string, after: string, message: string, detail = ""): MergeResult => {
     const failed = result === "合入失败", ended = Date.now();
@@ -32,7 +44,7 @@ export function merge(dir: string, o: {commit?: string; acceptUnverified: boolea
   try { name = readJson<{name: string}>(t.card).name || name; } catch {}
   const message = "Merge " + name + ": " + (unverified ? "unverified" : "reviewed") + " " + commit.slice(0, 7);
   const merging = gitTry(holder, ["rev-parse", "-q", "--verify", "MERGE_HEAD"]).code === 0;
-  const r = gitTry(holder, ["merge", "--no-ff", "--no-edit", "-m", message, commit], {GIT_MERGE_AUTOEDIT: "no"});
+  const r = gitTry(holder, o.prepared ? ["merge", "--ff-only", o.prepared] : ["merge", "--no-ff", "--no-edit", "-m", message, commit], {GIT_MERGE_AUTOEDIT: "no"});
   if (r.code) {
     const conflicts = gitTry(holder, ["diff", "--name-only", "--diff-filter=U"]).stdout.trim().split("\n").filter(Boolean);
     let raw = r.stdout + r.stderr;

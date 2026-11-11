@@ -1,8 +1,10 @@
-import { locate, fail, taskOf, statusOf, PHASES } from "../core/store.ts";
+import { locate, fail, taskOf, statusOf, update, PHASES } from "../core/store.ts";
 import { registerSession, heartbeat, shutdownSession } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
-import { APP_ROOT } from "../infra/paths.ts";
+import { convention } from "./convention.ts";
+import { alive } from "../infra/exec.ts";
 import { contentText } from "./hook-event.ts";
+import { startFinish } from "./after-settle.ts";
 /** 只用 Pi 的公开生命周期子集；结构类型让核心测试不依赖 pi 包。 */
 interface Context {
   cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean;
@@ -11,7 +13,7 @@ interface Context {
 }
 interface PiAPI {
   on(event: string, handler: (event: any, ctx: Context) => any): unknown;
-  sendMessage(message: {customType: string; content: string; display: boolean}): void;
+  sendMessage(message: {customType: string; content: string; display: boolean}, options?: {triggerTurn: boolean}): void;
 }
 export function registerPi(pi: PiAPI, options: {
   env?: NodeJS.ProcessEnv;
@@ -21,9 +23,14 @@ export function registerPi(pi: PiAPI, options: {
   let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "";
   const clear = options.clear || clearInterval;
   const refresh = () => {
-    if (!dir || !context?.ui || context.hasUI === false) return;
+    if (!dir) return;
     try {
-      const s = statusOf(dir), phase = s.loop.phase;
+      const s = statusOf(dir), phase = s.loop.phase, pending = s.loop.pendingReturn;
+      if (pending && s.state === "working" && phase === "开发中" && !alive(s.loop.finisher)) {
+        pi.sendMessage({customType:"dev-loop-return",content:pending,display:true},{triggerTurn:true});
+        update(dir,s=>{if(s.loop.pendingReturn===pending)s.loop.pendingReturn=null;});
+      }
+      if (!context?.ui || context.hasUI === false) return;
       const extra = phase === "评审中" ? "第 " + s.loop.reviewRounds + " 轮" : phase === "等你" ? s.loop.wait || s.message.split("\n")[0].slice(0, 30)
         : phase === "失败" ? s.error?.category : PHASES.indexOf(phase) >= 10 ? s.message : "";
       const title = "【" + phase + "】" + name, text = "dev-loop" + title + (extra ? " · " + extra : "");
@@ -46,7 +53,7 @@ export function registerPi(pi: PiAPI, options: {
     timer?.unref?.();
     name = taskOf(dir).name; refresh();
     viewTimer = (options.every || setInterval)(refresh, 1000); viewTimer?.unref?.();
-    pi.sendMessage({customType:"dev-loop-convention",content:"开发完成后运行 " + APP_ROOT + "/bin/loop 交付；会话停下后自动复测、评审。",display:true});
+    pi.sendMessage({customType:"dev-loop-convention",content:convention(taskOf(dir)),display:true});
   });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (!dir) return;
@@ -54,6 +61,7 @@ export function registerPi(pi: PiAPI, options: {
     const last = [...messages].reverse().find((m) => m.role === "assistant");
     const result = await settle(dir, contentText(last?.content), ctx.signal);
     refresh();
+    if (!result.continue) await startFinish(dir,options.env || process.env);
     if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};
   });
   pi.on("session_shutdown", () => {

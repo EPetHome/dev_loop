@@ -1,5 +1,6 @@
 import { gitText, head, tree, changes, changedSince } from "../infra/git.ts";
 import { lock } from "../infra/files.ts";
+import { alive } from "../infra/exec.ts";
 import { inScope, InputError } from "./card.ts";
 import { taskOf, statusOf, update, inputs, appendCheck, checked, fail, type Bucket } from "./store.ts";
 import { operationPath } from "./run.ts";
@@ -8,6 +9,7 @@ export function deliver(dir: string, note = "") {
   let previousBucket: Bucket | null | undefined;
   try {
     const s = statusOf(dir);
+    if (s.loop.phase === "收尾中" || alive(s.loop.finisher)) throw new InputError("正在收尾，不能交付");
     if (s.state === "cancelled" || s.state === "input_required" || s.state === "failed") throw new InputError("任务未运行，请先 bin/loop 续跑");
     if (!s.loop.ready) throw new InputError("工作区尚未准备好");
     const begin = Date.now(); previousBucket = s.loop.bucket;
@@ -26,8 +28,12 @@ export function deliver(dir: string, note = "") {
     const reused = checked(dir, commit, h);
     update(dir, (s) => {
       s.loop.delivery = { commit, tree: deliveredTree, note, at: now }; s.loop.commit = commit; s.loop.warned = false; s.loop.reused = reused;
-      s.state = reused ? "completed" : "working"; s.loop.phase = reused ? "完成" : "已交付"; s.loop.wait = null; s.message = reused ? "已交付，沿用已有检查" : "已交付，等待会话停下后复测和评审";
-      s.loop.bucket = reused ? null : "developmentMs";
+      const pending = Boolean(t.after?.length || t.next);
+      if (!(reused && s.state === "completed" && s.loop.phase !== "完成")) {
+        s.state = reused && !pending ? "completed" : "working"; s.loop.phase = reused && !pending ? "完成" : "已交付";
+        s.message = reused ? "已交付，沿用已有检查" : "已交付，等待会话停下后复测和评审";
+      }
+      s.loop.wait = null; s.loop.pendingReturn = null; s.loop.bucket = s.state === "completed" ? null : "developmentMs";
     });
     appendCheck(dir, { commit, tree: deliveredTree, step: "dev-loop 自身", result: "交付登记", startedAt: new Date(begin).toISOString(), endedAt: now,
       durationMs: Math.max(0, Date.now() - begin), evidence: [], promptHash: h.promptHash, acceptanceHash: h.acceptanceHash });

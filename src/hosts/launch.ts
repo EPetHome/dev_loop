@@ -9,6 +9,8 @@ import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
 import { taskOf, statusOf, waitFor, update, fail, inputs } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
+import { startCompanion } from "./after-settle.ts";
+import { convention } from "./convention.ts";
 interface LaunchOptions {
   openTerminal?: (script: string) => Promise<void>;
   startupTimeoutMs?: number;
@@ -86,7 +88,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   const t = taskOf(dir);
   if (statusOf(dir).state === "cancelled") return;
   const prompt = join(dir, "developer-prompt.md");
-  writeFileSync(prompt, "完成后运行 " + APP_ROOT + "/bin/loop 交付。交付只提交并登记；停下后自动复测、评审。\n\n" + inputs(t).prompt);
+  writeFileSync(prompt, convention(t) + "\n交付只提交并登记。\n\n" + inputs(t).prompt);
   const session = statusOf(dir).loop.session;
   const args = ["--cwd", t.worktree, "--name", t.executionId,
     ...(resuming && session?.id ? ["--session", session.file || session.id] : ["--session-id", t.executionId]), prompt];
@@ -122,7 +124,7 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
     if (!statusOf(dir).loop.ready) await prepare(dir);
-    if (statusOf(dir).state !== "cancelled") await launchSession(dir,resuming,options);
+    if (statusOf(dir).state !== "cancelled") { await startCompanion(dir,options.env || process.env); await launchSession(dir,resuming,options); }
   } catch (e) { fail(dir,e); throw e; }
   finally {
     clearInterval(timer);

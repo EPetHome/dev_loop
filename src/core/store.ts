@@ -8,9 +8,9 @@ import { digest, readJson, writeJson, withLock, jsonLines, appendJson } from "..
 import { gitText } from "../infra/git.ts";
 import { tasksRoot } from "../infra/paths.ts";
 import type { Identity } from "../infra/exec.ts";
-export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败"] as const;
+export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败", "收尾中", "已退回"] as const;
 export type Phase = typeof PHASES[number];
-export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "需手动接入会话";
+export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "需手动接入会话" | "收尾没走完";
 export class LoopError extends Error {
   category: string; result?: unknown;
   constructor(category: string, message: string, result?: unknown) { super(message); this.category = category; this.result = result; }
@@ -20,7 +20,7 @@ export type Bucket = "developmentMs" | "testMs" | "reviewMs" | "inputMs" | "self
 export interface Task {
   executionId: string; dir: string; repo: string; card: string; cardHash: string; name: string; prompt: string; acceptance?: string;
   scope: Card["tasks"][number]["scope"]; test: string; host: Card["host"]; limits: Card["limits"]; config: Config;
-  baseCommit: string; branch: string; worktree: string; createdAt: string; dispatchId: string | null;
+  baseCommit: string; branch: string; worktree: string; createdAt: string; dispatchId: string | null; after?: string[]; next?: string;
 }
 export interface Check {
   commit: string; tree: string; step: string; result: string; startedAt: string; endedAt: string; durationMs: number;
@@ -35,6 +35,7 @@ export interface Status {
     phase: Phase; wait?: WaitReason | null; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
     startingSession: (Identity & {launchId: string}) | null;
+    finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; next?: string; released?: boolean;
     activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
@@ -93,7 +94,7 @@ export function fail(dir: string, error: unknown, category?: string): void {
   });
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
-export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null): Task {
+export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {
   const parsed = readCard(file), { repo, card } = parsed, task = card.tasks[0];
   let config: Config;
   try { config = loadConfig(repo); } catch (e) { throw new InputError(e instanceof Error ? e.message : String(e)); }
@@ -102,7 +103,8 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
   const dir = join(root, executionId), createdAt = new Date().toISOString();
   const t: Task = { executionId, dir, repo, card: parsed.file, cardHash: parsed.cardHash, name: task.name,
     prompt: task.prompt, acceptance: card.acceptance, scope: task.scope, test: task.test, host: card.host, limits: card.limits, config,
-    baseCommit: gitText(repo, ["rev-parse", "refs/heads/" + card.base]), branch: "dev-loop/" + executionId,
+    after: card.after, ...(card.next ? {next: card.next} : {}),
+    baseCommit: baseCommit || gitText(repo, ["rev-parse", "refs/heads/" + card.base]), branch: "dev-loop/" + executionId,
     worktree: join(dir, "worktree"), createdAt, dispatchId };
   mkdirSync(dir); // 随机编号若碰撞，拒绝而不是覆盖已有执行。
   writeJson(join(dir, "task.json"), t);
@@ -110,7 +112,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","停止","放弃"],
-    loop: { phase: "准备中", wait: null, commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null,
+    loop: { phase: "准备中", wait: null, commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null,
       ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
@@ -143,8 +145,9 @@ export const checked = (dir: string, commit: string, hashes = inputs(taskOf(dir)
 interface StepView { phase: Phase; message: string; complete?: boolean }
 function stepView(dir: string, view: StepView): void {
   update(dir, s => {
-    if (s.state !== "completed" && !(s.state === "input_required" && view.complete)) return;
-    s.state = "completed"; s.loop.bucket = null; s.loop.wait = null; s.timeLimitSec = null; s.error = null;
+    if (s.state !== "completed" && !(s.state === "input_required" && view.complete) && !(s.state === "working" && s.loop.finisher)) return;
+    if (s.state !== "working") { s.state = "completed"; s.loop.bucket = null; }
+    s.loop.wait = null; s.timeLimitSec = null; s.error = null;
     s.loop.phase = view.phase; s.message = view.message;
   });
 }

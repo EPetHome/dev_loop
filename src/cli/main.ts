@@ -1,16 +1,21 @@
-import { spawn } from "node:child_process";
-import { openSync, closeSync, mkdirSync, readFileSync, existsSync, realpathSync } from "node:fs";
+import { mkdirSync, readFileSync, existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { APP_ROOT, tasksRoot } from "../infra/paths.ts";
 import { appendJson, jsonLines, withLock } from "../infra/files.ts";
-import { createTask, taskOf, statusOf, allTasks, locate, fail, LoopError, type Task } from "../core/store.ts";
+import { createTask, taskOf, statusOf, allTasks, locate, LoopError, type Task } from "../core/store.ts";
 import { InputError, UnsupportedError } from "../core/card.ts";
 import { deliver } from "../core/deliver.ts";
 import { resume, stop } from "../core/lifecycle.ts";
 import { merge } from "../steps/merge.ts";
 import { push, type PushResult } from "../steps/push.ts";
-import { deploy } from "../steps/deploy.ts";
-interface Options { command: string; target?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean }
+import { deploy, rollback } from "../steps/deploy.ts";
+import { validateStart } from "./start.ts";
+import { finish } from "./finish.ts";
+import { queued } from "./queue.ts";
+import { background } from "./background.ts";
+import { companion } from "./companion.ts";
+import { comparison, releaseWorktree } from "./inspect.ts";
+interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean }
 function options(args: string[]): Options {
   const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false };
   while (args.length) {
@@ -24,22 +29,11 @@ function options(args: string[]): Options {
       const value = args.shift(); if (!value || value.startsWith("--")) throw new InputError(arg + " 缺值");
       if (field === "file") out.note = readFileSync(resolve(value),"utf8"); else (out as any)[field] = value;
     } else if (arg.startsWith("-")) throw new InputError("未知选项：" + arg);
-    else if (out.target) throw new InputError("只能指定一个卡或执行编号");
+    else if (out.target) { if(out.command==="对比" && !out.other)out.other=arg; else throw new InputError("只能指定一个卡或执行编号（对比最多两个）"); }
     else out.target = arg;
   }
   if (out.command !== "启动" && (out.instruction || out.dispatch)) throw new UnsupportedError("第 4 步才支持续跑/停止等 PA 指令编号；本步编号只用于启动回执");
   return out;
-}
-async function background(t: Task, resuming = false): Promise<void> {
-  const fd = openSync(join(t.dir,"launcher.log"),"a");
-  try {
-    const child = spawn(process.execPath, [join(APP_ROOT,"src/hosts/launch.ts"),t.dir,...(resuming ? ["--resume"] : [])],
-      {cwd:t.repo,env:{...process.env,LOOP_TASK_DIR:t.dir},detached:true,stdio:["ignore",fd,fd]});
-    await new Promise<void>((accept,reject)=>{child.once("spawn",accept);child.once("error",reject);});
-    // 启动器在自身入口登记身份；前台不在后台退出后倒写一个过期的 PID。
-    child.unref();
-  } catch(e) { fail(t.dir,e); throw e; }
-  finally { closeSync(fd); }
 }
 function matching(target?: string): string[] {
   if (!target) { const dir = locate(process.cwd()); return dir ? [dir] : []; }
@@ -59,7 +53,12 @@ bin/loop 查询 [<卡或执行编号> | --all] [--brief] [--json]
 bin/loop 续跑|停止|放弃 <卡或执行编号> [--task 名] [--json]
 bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] [--推送] [--json]
 bin/loop 部署 <执行编号或卡路径> [--commit <sha>] [--json]
-合入默认仅本地；仅 --推送 才扫描并推送 origin/dev；部署须登记 .autoreview.json 的 deploy.cmd。
+bin/loop 收尾|退回|陪跑|释放 <执行编号或卡路径> [--json]
+bin/loop 对比 <执行编号或卡路径> [<另一个执行编号或卡路径>] [--json]
+flow 按 开发评审, 测试, 合入, 部署, 推送 的子序列；next 相对卡目录，最后一批才收尾。
+合入默认仅本地；手工仅 --推送 才扫描并推送 origin/dev；部署须登记 .autoreview.json 的 deploy.cmd。
+自动部署还须 check/rollback；deploy.env 为当前配置的大写字符串环境变量（禁止 LOOP_）。
+收尾走卡并脱离开发会话；退回只动线上不动 dev；陪跑/snapshot 失败不阻断；验收后可释放工作区。
 LOOP_TASKS_ROOT：执行根目录；开发方优先通过 LOOP_TASK_DIR 定位任务。
 多任务/整合/验收（第3步）、答复（第4步）尚不支持。`;
 export async function main(args = process.argv.slice(2)): Promise<unknown> {
@@ -73,6 +72,7 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
     let t: Task | undefined, receipt: any;
     const create=()=>{
       if(o.instruction){const found=previous();if(found){receipt=found.result;return;}}
+      validateStart(resolve(o.target!));
       t=createTask(resolve(o.target!),root,o.dispatch||null);
       receipt={executionId:t.executionId,taskDir:t.dir,status:join(t.dir,"status.json"),state:"working"};
       if(o.instruction)appendJson(join(t.dir,"instructions.jsonl"),{id:o.instruction,type:"启动",result:receipt});
@@ -92,16 +92,24 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   }
   if(o.command==="续跑") {
     const dir=select(o), result=resume(dir);
-    if(!result.reused && !result.running)await background(taskOf(dir),true);
+    if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
+    else if(!result.reused && !result.running)await background(taskOf(dir),true);
     return {executionId:taskOf(dir).executionId,...result};
   }
   if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");
+  if(o.command==="对比") return comparison(select(o),o.other?select({...o,target:o.other}):undefined);
+  if(o.command==="陪跑") { const dir=select(o); await companion(dir); return {executionId:taskOf(dir).executionId}; }
+  if(o.command==="释放") return releaseWorktree(select(o));
+  if(o.command==="收尾") return finish(select(o));
   if(o.command==="合入") {
-    const dir=select(o), r: ReturnType<typeof merge> & {push?: PushResult}=merge(dir, {commit:o.commit, acceptUnverified:o.acceptUnverified});
-    if(o.push) r.push=await push(dir);
-    return r;
+    const dir=select(o);
+    return queued(dir, async () => {
+      const r: ReturnType<typeof merge> & {push?: PushResult}=merge(dir, {commit:o.commit, acceptUnverified:o.acceptUnverified});
+      if(o.push) r.push=await push(dir); return r;
+    });
   }
-  if(o.command==="部署") return await deploy(select(o), {commit:o.commit});
+  if(o.command==="退回") { const dir=select(o); return queued(dir,()=>rollback(dir)); }
+  if(o.command==="部署") { const dir=select(o); return queued(dir,()=>deploy(dir, {commit:o.commit})); }
   if(["整合","验收","答复","开发"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help);
   throw new InputError("未知命令："+o.command+"\n"+help);
 }

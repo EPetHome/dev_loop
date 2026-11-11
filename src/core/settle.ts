@@ -1,10 +1,12 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { lock, BusyError } from "../infra/files.ts";
+import { alive } from "../infra/exec.ts";
 import { git, head, tree, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, summary, fail, type Check, type Task } from "./store.ts";
+import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, summary, fail, PHASES, type Check, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
 import { executeStaticReview } from "./review-call.ts";
+import { snapshot, differences } from "./snapshot.ts";
 export interface SettleResult { continue: boolean; reason: string }
 const quiet = (reason = ""): SettleResult => ({ continue: false, reason });
 const retry = (reason: string): SettleResult => ({ continue: true, reason });
@@ -28,6 +30,9 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     try { release = lock(operationPath(dir)); }
     catch (e) { if (e instanceof BusyError) return quiet("该任务的交付/检查正在处理中"); throw e; }
     const t = taskOf(dir), initial = statusOf(dir);
+    if (initial.loop.released) return quiet("工作区已释放");
+    if (alive(initial.loop.finisher)) return quiet("正在收尾");
+    if (initial.state === "working" && initial.loop.finisher) { waitFor(dir,"收尾没走完","收尾进程已退出，可运行 bin/loop 收尾 " + t.executionId + " 手工接手。"); return quiet("等你"); }
     if (["cancelled", "input_required", "failed"].includes(initial.state)) return quiet(initial.message);
     if (!initial.loop.ready) return quiet("工作区正在准备");
     task = t; ownStart = Date.now(); selfBefore = initial.loop.durations.selfMs; selfTime();
@@ -51,7 +56,21 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
       return retry("HEAD 与登记交付不同，请重新运行 bin/loop 交付。");
     }
     const h = inputs(t); hashes = { promptHash: h.promptHash, acceptanceHash: h.acceptanceHash };
+    const finishing = () => {
+      update(dir, s => { s.loop.afterCommit = commit; });
+      transition(dir, "working", "收尾中", "复测、评审通过，等待收尾", "selfMs");
+      return quiet("收尾");
+    };
     if (checked(dir, commit, h)) {
+      if (t.after?.length || t.next) {
+        if (initial.loop.afterCommit !== commit) return finishing();
+        if (["开发中", "已交付"].includes(initial.loop.phase)) {
+          waitFor(dir, "收尾没走完", "代码没有改动。可运行 bin/loop 收尾 " + t.executionId + " 重试，或修改后重新交付。");
+          return quiet("等你");
+        }
+        return quiet("沿用");
+      }
+      if (PHASES.indexOf(initial.loop.phase) > PHASES.indexOf("完成")) return quiet("沿用");
       update(dir, (s) => { s.loop.reused = true; });
       transition(dir, "completed", "完成", "沿用此 commit 的复测与评审通过记录", null);
       return quiet("沿用");
@@ -84,6 +103,9 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     selfTime();
     record("复测", testResult, testStart, [log], "命令：" + t.test);
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
+    const runtime = join(dir,"snapshot-"+commit+".json");
+    await snapshot(t,t.worktree,commit,runtime,"scenario",true,signal);
+    if (statusOf(dir).state === "cancelled") return quiet("已停止");
     const previous = statusOf(dir).loop, round = previous.reviewRounds + 1;
     update(dir, (s) => { s.loop.reviewRounds = round; });
     const lastReview = checksOf(dir).filter((c) => c.step === "评审" && c.commit === previous.previousReviewCommit && ["通过", "必修"].includes(c.result)).at(-1);
@@ -93,6 +115,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     const added = git(t.worktree, ["diff", "--name-only", "--diff-filter=A", "-z", base, commit, "--"]).split("\0").filter(Boolean);
     const material = ["## 提示词原文", h.prompt, ...(h.acceptance ? ["## 验收标准", h.acceptance] : []),
       "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff || "（无改动）", "## 新增文件", added.join("\n") || "无",
+      "## 运行差异", git(t.worktree,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
       "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 复测结果", "命令：" + t.test, "结果：" + testResult, output,
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
     transition(dir, "working", "评审中", "正在评审第 " + round + " 轮", "reviewMs", t.limits.开发评审.timeoutMin * 60);
@@ -112,6 +135,12 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
       return retry("提示词或验收标准在检查期间变化，请重新交付后检查。");
     }
     if (mustFix.length) return returnToDeveloper(dir, "review", "评审必修：\n" + mustFix.map((s, i) => (i + 1) + ". " + s).join("\n") + "\n修好后重新运行 bin/loop 交付；请逐条回复。");
+    if (t.after?.length || t.next) {
+      if (initial.loop.afterCommit !== commit) return finishing();
+      if (initial.state === "completed") transition(dir,"completed",initial.loop.phase,"沿用此 commit 已走完的收尾",null);
+      else waitFor(dir,"收尾没走完","同一 commit 不重复自动收尾；请修改后交付或手工运行 bin/loop 收尾 " + t.executionId);
+      return quiet("沿用");
+    }
     transition(dir, "completed", "完成", "此 commit 复测" + (testResult === "没验证" ? "没验证（" + t.test + "）" : "通过") + "，评审通过", null);
     return quiet("完成");
   } catch (e) {
@@ -120,7 +149,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
   } finally {
     try {
       if (task && ownStart) {
-        const s = update(dir, (s) => { if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? "developmentMs" : null; });
+        const s = update(dir, (s) => { if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? s.loop.phase === "收尾中" ? "selfMs" : "developmentMs" : null; });
         appendCheck(dir, { commit: s.loop.commit || task.baseCommit, tree: s.loop.delivery?.tree || "", step: "dev-loop 自身",
           result: s.loop.reused ? "沿用" : s.state === "failed" ? "失败" : "推进", startedAt: new Date(ownStart).toISOString(), endedAt: new Date().toISOString(),
           durationMs: Math.max(0, s.loop.durations.selfMs - selfBefore), evidence: [], ...hashes });
