@@ -75,6 +75,44 @@ test("live 留痕失败只记记录；缺基线对比不影响状态，没登记
   const r=await deploy(task.dir);assert.equal(r.result,"已部署");assert.equal(statusOf(task.dir).loop.phase,"已部署");assert.equal(checksOf(task.dir).filter(c=>c.step==="留痕" && c.result==="失败").length,2);
   const seq=statusOf(task.dir).seq,out=await comparison(task.dir);assert.equal(out.diff,"没有基线");assert.equal(statusOf(task.dir).seq,seq);
 });
+test("留痕 A1–A3：四个时机读取 deploy.env，覆盖宿主且保留框架变量和独立 TMPDIR",async t=>{
+  const previous=process.env.PROBE;process.env.PROBE="0";t.after(()=>{if(previous===undefined)delete process.env.PROBE;else process.env.PROBE=previous;});
+  const f=snapshotFixture(t,"fs.writeFileSync(e.LOOP_SNAPSHOT_OUT,JSON.stringify({probe:e.PROBE,tmp:e.TMPDIR,mode:e.LOOP_SNAPSHOT_MODE,task:e.LOOP_TASK_DIR,repo:e.LOOP_REPO,commit:e.LOOP_SNAPSHOT_COMMIT,out:e.LOOP_SNAPSHOT_OUT,isolated:fs.statSync(e.TMPDIR).isDirectory()}));");
+  const cfg=getJson(join(f.repo,".autoreview.json"));cfg.deploy.env={PROBE:"1",TMPDIR:join(f.base,"别处")};write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));
+  const task=await f.prepare();await companion(task.dir);write(join(task.worktree,"src/app.txt"),"good env snapshot\n");const {commit}=deliver(task.dir);await settle(task.dir);
+  assert.equal(statusOf(task.dir).state,"completed");const r=await deploy(task.dir,{commit});assert.equal(r.result,"已部署");
+  const outputs=[
+    [join(task.dir,"snapshot-base.json"),"scenario",task.baseCommit],
+    [join(task.dir,"snapshot-"+commit+".json"),"scenario",commit],
+    [join(r.evidenceDir,"snapshot-before.json"),"live",commit],
+    [join(r.evidenceDir,"snapshot-after.json"),"live",commit]
+  ];
+  for(const [out,mode,sha] of outputs){
+    const value=getJson(out);assert.equal(value.probe,"1");assert.equal(value.mode,mode);assert.equal(value.task,task.dir);assert.equal(value.repo,task.repo);assert.equal(value.commit,sha);assert.equal(value.out,out);
+    assert.notEqual(value.tmp,cfg.deploy.env.TMPDIR);assert.match(value.tmp,/[/\\]\.loop-snapshot-/);assert.equal(value.isolated,true);assert.equal(existsSync(value.tmp),false);
+  }
+  const records=checksOf(task.dir).filter(c=>c.step==="留痕");assert.deepEqual(records.map(c=>c.result),["已存","已存","已存","已存"]);assert.deepEqual(records.map(c=>c.evidence[0]),outputs.map(([out])=>out));assert.equal(process.env.PROBE,"0");
+});
+test("留痕 A4：没有 deploy 段仍可陪跑和评审前采集",async t=>{
+  const f=snapshotFixture(t),cfg=getJson(join(f.repo,".autoreview.json"));delete cfg.deploy;write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));
+  const task=await f.prepare();await companion(task.dir);write(join(task.worktree,"src/app.txt"),"good no deploy\n");const {commit}=deliver(task.dir);await settle(task.dir);
+  assert.deepEqual(getJson(join(task.dir,"snapshot-base.json")),{value:"good",mode:"scenario"});assert.deepEqual(getJson(join(task.dir,"snapshot-"+commit+".json")),{value:"good no deploy",mode:"scenario"});
+  assert.equal(statusOf(task.dir).state,"completed");assert.deepEqual(checksOf(task.dir).filter(c=>c.step==="留痕").map(c=>c.result),["已存","已存"]);
+});
+test("留痕 A5：deploy 登记不合法记录原因，不改陪跑阶段也不阻断开发复测评审",async t=>{
+  const f=snapshotFixture(t),cfg=getJson(join(f.repo,".autoreview.json"));cfg.deploy.env={lower:"invalid"};write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));
+  const task=await f.prepare(),before=statusOf(task.dir);await companion(task.dir);assert.deepEqual(statusOf(task.dir),before);assert.equal(existsSync(join(task.dir,"snapshot-base.json")),false);assert.equal(existsSync(join(task.dir,"companion")),false);
+  const records=checksOf(task.dir).filter(c=>c.step==="留痕");assert.equal(records.length,1);assert.equal(records[0].result,"失败");assert.match(records[0].detail!,/\.autoreview\.json 的 deploy 不合法：[\s\S]*env/);assert.deepEqual(records[0].evidence,[]);
+  write(join(task.worktree,"src/app.txt"),"good invalid deploy\n");const {commit}=deliver(task.dir);await settle(task.dir);assert.equal(statusOf(task.dir).state,"completed");assert.equal(existsSync(join(task.dir,"snapshot-"+commit+".json")),false);
+  assert.deepEqual(checksOf(task.dir).filter(c=>c.step==="留痕").map(c=>c.result),["失败","失败"]);
+});
+test("留痕 A6：live 对比读取仓库根目录最新 deploy.env，不用启动或检出中的旧登记",async t=>{
+  const f=snapshotFixture(t,"fs.writeFileSync(e.LOOP_SNAPSHOT_OUT,JSON.stringify({probe:e.PROBE}));"),cfg=getJson(join(f.repo,".autoreview.json"));cfg.deploy.env={PROBE:"startup"};write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));
+  const task=await f.prepare();cfg.deploy.env.PROBE="1";write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));const deployed=await deploy(task.dir);
+  assert.deepEqual(getJson(join(deployed.evidenceDir,"snapshot-before.json")),{probe:"1"});assert.deepEqual(getJson(join(deployed.evidenceDir,"snapshot-after.json")),{probe:"1"});
+  cfg.deploy.env.PROBE="2";write(join(f.repo,".autoreview.json"),JSON.stringify(cfg));const out=await comparison(task.dir);assert.equal(out.diff,'变化 /probe："1" → "2"');
+  const records=checksOf(task.dir).filter(c=>c.step==="留痕");assert.deepEqual(records.map(c=>c.result),["已存","已存","已存"]);assert.deepEqual(getJson(records.at(-1)!.evidence[0]),{probe:"2"});
+});
 test("返修必修2：snapshot 输出目录不阻断陪跑、复测评审、部署和 dev 快进",async t=>{
   const f=snapshotFixture(t,"fs.mkdirSync(e.LOOP_SNAPSHOT_OUT);"),card={...f.raw,flow:["开发评审","测试","合入","部署"]};write(f.card,JSON.stringify(card));
   const task=await f.prepare(),before=statusOf(task.dir);await companion(task.dir);assert.equal(statusOf(task.dir).seq,before.seq);assert.equal(existsSync(join(task.dir,"snapshot-base.json")),false);

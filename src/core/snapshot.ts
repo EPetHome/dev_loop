@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, lstatSync, realpathSync, mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { inside, loadSnapshot } from "../infra/config.ts";
+import { inside, loadDeploy, loadSnapshot } from "../infra/config.ts";
 import { childExec } from "../infra/exec.ts";
 import { digest, readJson, writeJson } from "../infra/files.ts";
 import { gitText } from "../infra/git.ts";
@@ -17,7 +17,7 @@ export async function snapshot(t: Task, cwd: string, commit: string, out: string
     if (!lstatSync(script).isFile() || !inside(realpathSync(cwd),realpathSync(script))) throw new Error("snapshot 非仓库内普通文件");
     accessSync(script,constants.X_OK); const cleanup=clean(); if(cleanup)throw new Error(cleanup);
     tmp=mkdtempSync(join(active?tmpdir():cwd,".loop-snapshot-"));
-    const env={LOOP_TASK_DIR:t.dir,LOOP_REPO:t.repo,LOOP_SNAPSHOT_MODE:mode,LOOP_SNAPSHOT_OUT:out,LOOP_SNAPSHOT_COMMIT:commit,TMPDIR:tmp};
+    const env={...loadDeploy(t.repo)?.env,LOOP_TASK_DIR:t.dir,LOOP_REPO:t.repo,LOOP_SNAPSHOT_MODE:mode,LOOP_SNAPSHOT_OUT:out,LOOP_SNAPSHOT_COMMIT:commit,TMPDIR:tmp};
     const r=active?await run(t,script,[],300000,signal,env):await childExec(script,[],{cwd,timeoutMs:300000,env});
     if (r.code || r.killed) throw new Error(r.output || "snapshot 失败或超时");
     const value=readJson<any>(out); if (!value || typeof value!=="object" || Array.isArray(value)) throw new Error("snapshot 须输出 JSON 对象");
