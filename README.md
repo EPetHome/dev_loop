@@ -32,6 +32,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 交付可用 `--text-file 文件` 代替 `--说明`，不在此命令里跑检查。
 - 停止保留 worktree、分支和证据；放弃删除 worktree，保留本地分支和证据，不可原执行续跑。
 - 达到退回上限后，`续跑` 给耗尽的步骤再一轮；原会话仍在时，不另开第二个会话，请在原会话继续输入。
+- 评审调用「临时故障」失败后，若最后一次核心检查是「评审 / 失败」、HEAD 仍是最后交付 commit、工作区干净、提示词/验收标准哈希未变，且同 commit、同哈希下有复测「通过」或「没验证」，`续跑` 立即返回回执，在后台只补评审：不开开发会话、不重跑复测或留痕。失败调用不计一次退回；补评审通过后照常完成/收尾，必修照常返修。任一条件不满足仍走原续跑逻辑；检查原文丢失不影响复用。
 - `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、第 4 步的答复/能力声明尚未实现。
 
 ## 自动收尾与接力
@@ -143,6 +144,8 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 未配置 reviewerCmd 时用 `pi -p`、全新会话、只读工具 `read,grep,find,ls`，关闭全局/项目扩展、MCP 和上下文文件发现。
 配置 reviewerCmd 时，它是**可执行脚本的路径，不是 shell 命令串**，相对 worktree；参数为：`轮次 输入文件路径 本次会话编号`。标准输出按 `src/core/review-prompt.md` 的标题格式返回，标准错误保留原文。两次调用共享本轮时限。
 
+评审材料的「本轮改动」diff 排除被删文件，另在「删除的文件」列路径和原行数（空文件 0 行，二进制不适用行数），不附被删内容。返修轮按上次评审 commit 计算，需求变化则按任务起点计算；新增文件和运行差异等材料不变。
+
 ### 部署
 
 未登记 `deploy` 默认关闭。`cmd` 必填，`check`、`rollback` 可选；三个值必须是仓库内普通可执行文件的相对路径，**不是 shell 命令串**。`timeoutMin` 为 1–240 的整数，默认 20，分别适用于每个脚本。部署命令读仓库根目录当前的登记，不读取启动时的配置快照；无自动部署 flow 的卡，deploy 写错仍不影响启动。`deploy.env` 可选：键匹配 `^[A-Z][A-Z0-9_]*$`，不能以 `LOOP_` 开头，值为字符串；覆盖宿主同名变量，框架 `LOOP_*` 优先。不放密钥，改值下次部署立即生效。
@@ -197,11 +200,27 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 状态协议 `loop-status/1`，state 仅 `working/input_required/completed/failed/cancelled`。`查询 --all --brief --json` 一次返回 `{complete:true, executions:[状态报告...]}`，不调用 git 或模型。
 
+`loop.facts` 是可直接照抄的执行事实，所有公开查询（含 `--brief`）原样带出：
+
+- `name`：卡上 `tasks[].name`，等于 task.json 的 `name`；`startedAt`：执行开始时间，等于 task.json 的 `createdAt`（ISO）。
+- `resumes`：成功续跑次数，初始为 0；收尾、合入不计入。
+- `stops`：最近 50 条停下记录。进入 `input_required/failed/cancelled` 时追加，每条包含 `at`（ISO）、`step`（停下前的 PHASES 阶段）、`state`、`reason`、`message`（当时原话，最多 200 字）、`resumedAt`、`resolvedBy`。
+- `reason`：等你取 `loop.wait` 的五种原因；失败取 `error.category`；停止写「已停止」，放弃写「已放弃」。原因不随 `loop.wait` 清空而丢失。
+- 未解开时 `resumedAt/resolvedBy` 为 null；成功续跑、收尾、`合入 --接受未验证` 离开停下状态时补上时间和去向。去向为「续跑 / 收尾 / 合入（接受未验证） / 停止 / 放弃 / 沿用通过记录」；若已有未解开的停下记录，进入新停下状态前先关闭旧记录，例如等你后停止，旧条目写「停止」。
+
+没有 `facts` 的旧状态仍可读取、查询和续跑；查询不回写，下一次状态更新起补齐基本事实并开始记录，不倒推、编造旧的停下历史。
+
 合入/推送/部署通常不改 state：手工执行仅 state 为 completed 时更新阶段；自动收尾登记 finisher 后可在 working 下更新阶段，仍维持 working 直到全程走完。其他 state 下只追加结果、不改阶段。唯一例外：「等你」时明确用 `合入 --接受未验证` 成功（含已在 dev），改为 completed，阶段「已合入」。失败的附加步骤不把 state 改成 failed。
 
 命令成功 stdout 为 JSON；失败 stderr 为 `{error:{category,raw,result?}}`，退出码 1，`result` 保留已执行部分。运行 `bin/loop 帮助` 查看参数。
 
 通过资格只取 commit + 提示词内容哈希 + 验收标准内容哈希；当前两份输入从 task 中的源文件引用读取。聊天、原目录 AGENTS/CLAUDE、忽略产物、证据文件不参与资格判定。同 tree 再交付不造重复提交。
+
+## 防止空闲睡眠
+
+macOS 有执行处于 `working` 且进程持续干活/心跳时，使用用户态 `caffeinate -i -t 120`，每 60 秒由现有心跳续期；复测/评审推进也有心跳。各执行独立持有短时租约，不加常驻监控。转等你、完成、失败、停止时释放；进程崩溃、心跳中断后最长 120 秒自动失效。仅阻止**空闲**睡眠，不阻止关屏或合盖睡眠，不改系统设置、不需管理员权限。防睡命令异常只在执行目录 `idle-sleep.log` 留原文，不阻断任务。
+
+测试用 `LOOP_CAFFEINATE_CMD` 指向可执行替身（收到相同参数和 `LOOP_TASK_DIR`）；全套测试强制替身，绝不调用真实 `caffeinate`。真实机器断言由协调方在合入后的任务中检查。
 
 ## 宿主边界
 
@@ -232,6 +251,8 @@ bash -n bin/loop bin/pi-dev
 ```
 
 测试只在系统临时目录里创建仓库/提交；origin 是本地裸仓库，部署、评审用脚本替身，宿主用模拟事件和假的 pi API，不调用真实模型、GitHub、服务或真实终端。文件事件和模拟时钟替代固定 sleep；超时注入毫秒数。技术测试不等于真实宿主/业务验收。
+
+停下事实与防睡批次 A1–A9 的替身验证在 `test/facts.test.ts`、`test/retry-review.test.ts`、`test/idle-sleep.test.ts`、`test/review-material.test.ts`，包括旧状态兼容、只补评审的条件回退、后台回执/返修/收尾、心跳租约与删除材料。A10 真实 `pmset -g assertions` **未验证**，由协调方在合入后执行；技术测试不替代本机验收。
 
 本批一条龙 A1–A10 在 `test/finish.test.ts`：A1/A3/A8 自动部署与状态/去重，A2 只合入，A4/A5 失败回退和返修后推送，A6 回退失败，A7 接力，A9 同项目排队，A10 手工退回。`test/companion.test.ts` 覆盖陪跑、运行差异、live 前后、对比和释放；`test/deploy.test.ts` 补 deploy.env。仅用替身，不代表真实线上或真实 Pi 窗口验收。
 

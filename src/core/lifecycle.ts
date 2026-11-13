@@ -4,7 +4,7 @@ import { gitText, head, changes } from "../infra/git.ts";
 import { inside } from "../infra/config.ts";
 import { lock } from "../infra/files.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
-import { taskOf, statusOf, update, transition, appendCheck, inputs, checked, type Status } from "./store.ts";
+import { taskOf, statusOf, update, transition, appendCheck, checksOf, inputs, checked, type Status } from "./store.ts";
 import { operationPath, run } from "./run.ts";
 export async function prepare(dir: string): Promise<void> {
   const release = lock(operationPath(dir), 2000), t = taskOf(dir), start = Date.now();
@@ -60,17 +60,33 @@ export function shutdownSession(dir: string): void {
     if (s.loop.bucket === "developmentMs") s.loop.bucket = null;
   });
 }
-export function resume(dir: string): {reused: boolean; running: boolean; status: Status} {
+/** 只复用同一交付、同一输入下的复测；检查失败记录仍须是最近一次核心检查。 */
+export function retryReview(dir: string) {
+  const t = taskOf(dir), s = statusOf(dir), commit = s.loop.delivery?.commit;
+  if (!commit || !existsSync(t.worktree) || head(t.worktree) !== commit || changes(t.worktree).length) return;
+  const h = inputs(t), records = checksOf(dir), last = records.filter(c => ["复测", "评审"].includes(c.step)).at(-1);
+  const same = (c: typeof last) => c?.commit === commit && c.promptHash === h.promptHash && c.acceptanceHash === h.acceptanceHash;
+  if (last?.step !== "评审" || last.result !== "失败" || !same(last)) return;
+  return records.filter(c => c.step === "复测" && ["通过", "没验证"].includes(c.result) && same(c)).at(-1);
+}
+export function resume(dir: string): {reused: boolean; running: boolean; reviewOnly?: boolean; status: Status} {
   const t = taskOf(dir), s = statusOf(dir);
   if (s.loop.released) throw new Error("工作区已释放，不能续跑；请重新启动卡");
   if (s.loop.abandoned) throw new Error("已放弃并删除 worktree，不能续跑；请重新启动卡");
   if (s.loop.phase === "收尾中" || alive(s.loop.finisher) || alive(s.loop.startingSession) || alive(s.loop.activeProcess) || alive(s.loop.launcher)) throw new Error("执行正在准备或检查，请先停止再续跑");
   const running = alive(s.loop.session) && !s.loop.session?.endedAt;
   if (s.loop.wait !== "收尾没走完" && (!(t.after?.length || t.next) || s.state === "completed" || s.loop.afterCommit !== s.loop.delivery?.commit) && s.loop.delivery && existsSync(t.worktree) && head(t.worktree) === s.loop.delivery.commit && !changes(t.worktree).length && checked(dir, s.loop.delivery.commit)) {
-    update(dir, (s) => { s.state = "working"; s.loop.reused = true; });
+    update(dir, (s) => { s.loop.facts!.resumes++; s.state = "working"; s.loop.reused = true; }, "沿用通过记录");
     const pending = Boolean(t.after?.length || t.next) && s.loop.afterCommit !== s.loop.delivery.commit;
     if (pending) update(dir, s => { s.loop.afterCommit = s.loop.delivery!.commit; });
     return { reused: true, running: Boolean(running), status: transition(dir, pending ? "working" : "completed", pending ? "收尾中" : s.loop.phase === "等你" || s.loop.phase === "已停止" ? "完成" : s.loop.phase, "沿用此 commit 的复测与评审通过记录", pending ? "selfMs" : null) };
+  }
+  if (s.state === "failed" && s.error?.category === "临时故障" && retryReview(dir)) {
+    const status = update(dir, s => {
+      s.loop.facts!.resumes++; s.state = "working"; s.loop.phase = "评审中"; s.loop.wait = null; s.error = null;
+      s.loop.reused = false; s.loop.bucket = "selfMs"; s.timeLimitSec = null; s.message = "已续跑，后台只重做评审";
+    });
+    return {reused: false, running: Boolean(running), reviewOnly: true, status};
   }
   if (running && s.state !== "input_required") throw new Error("开发会话仍在运行；请在原会话继续或先停止");
   const startedAt = new Date(s.loop.stepStartedAt).toISOString();
@@ -80,7 +96,7 @@ export function resume(dir: string): {reused: boolean; running: boolean; status:
   update(dir, (s) => {
     s.loop.testAllowance = Math.max(t.limits.测试.maxRepairs, s.loop.testReturns + 1);
     s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.loop.warned = false; s.state = "working";
-    s.loop.reused = false;
+    s.loop.facts!.resumes++; s.loop.reused = false;
   });
   return { reused: false, running: Boolean(running), status: transition(dir, "working", s.loop.ready ? "开发中" : "准备中", running ? "已续跑，请在原开发会话继续；到上限的步骤再给一轮" : "已续跑；到上限的步骤再给一轮", "developmentMs") };
 }

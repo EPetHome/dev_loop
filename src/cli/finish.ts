@@ -42,7 +42,7 @@ export async function finish(dir: string, automatic = false) {
         if(!s.loop.commit)throw new InputError("没有交付记录");
         commit=s.loop.commit; s.loop.finisher=owner; s.loop.afterCommit=commit;
         s.state="working"; s.loop.phase="收尾中"; s.loop.wait=null; s.loop.bucket="selfMs"; s.timeLimitSec=null; s.error=null; s.message="开始收尾";
-      }); claimed=true;
+      }, "收尾"); claimed=true;
     } finally { operation(); }
     await queued(dir, async () => {
       const cancelled = () => statusOf(dir).state === "cancelled", after = t.after || [];

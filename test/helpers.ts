@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import { createTask, statusOf, type Task } from "../src/core/store.ts";
 import { prepare } from "../src/core/lifecycle.ts";
 import { signalProcess } from "../src/infra/exec.ts";
+// 所有测试（含子进程）强制替身，绝不调用本机 caffeinate。
+process.env.LOOP_CAFFEINATE_CMD = "/usr/bin/true";
 export const ROOT = resolve(import.meta.dirname, "..");
 export const NODE = process.execPath;
 export const PASS = "## 结论：通过\n## 必修\n无\n## 小问题\n- 建议示例\n## 需求疑问\n- 疑问示例\n## 上轮必修复查\n无\n";
@@ -36,11 +38,12 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   const launch = join(base, "fake-launch.cjs");
   write(launch, "#!" + NODE + "\nconst fs=require('fs'); fs.writeFileSync(process.env.LOOP_TASK_DIR+'/opened.json',JSON.stringify({cwd:process.cwd(),args:process.argv.slice(2),task:process.env.LOOP_TASK_DIR}));\n");
   execFileSync("chmod", ["+x", launch]);
-  const env = {...process.env, LOOP_TASK_DIR: undefined, LOOP_HOST: undefined, LOOP_TASKS_ROOT: root, LOOP_LAUNCH_CMD: launch, PATH: resolve(NODE, "..") + ":" + process.env.PATH};
+  const env: NodeJS.ProcessEnv = {...process.env, LOOP_TASK_DIR: undefined, LOOP_HOST: undefined, LOOP_TASKS_ROOT: root, LOOP_LAUNCH_CMD: launch, PATH: resolve(NODE, "..") + ":" + process.env.PATH};
   let task: Task | undefined;
   t.after(() => {
     if (existsSync(root)) for (const entry of execFileSync("ls", [root], {encoding:"utf8"}).trim().split("\n").filter(Boolean)) {
-      try { const s = statusOf(join(root, entry)); signalProcess(s.loop.activeProcess, true); signalProcess(s.loop.launcher, true); } catch {}
+      try { const s = statusOf(join(root, entry)); signalProcess(s.loop.activeProcess, true); signalProcess(s.loop.launcher, true);
+        signalProcess(getJson(join(root, entry, "idle-sleep.json"))); } catch {}
     }
     rmSync(base, {recursive: true, force: true});
   });
