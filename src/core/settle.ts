@@ -1,10 +1,11 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { lock, BusyError } from "../infra/files.ts";
 import { alive } from "../infra/exec.ts";
 import { git, head, tree, changes } from "../infra/git.ts";
 import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, summary, fail, PHASES, type Check, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
+import { heartbeat, retryReview } from "./lifecycle.ts";
 import { executeStaticReview } from "./review-call.ts";
 import { snapshot, differences } from "./snapshot.ts";
 export interface SettleResult { continue: boolean; reason: string }
@@ -22,8 +23,8 @@ function returnToDeveloper(dir: string, kind: "test" | "review", reason: string)
   return retry(reason);
 }
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
-export async function settle(dir: string, lastReply = "", signal?: AbortSignal): Promise<SettleResult> {
-  let release: (() => void) | undefined, task: Task | undefined, ownStart = 0, selfBefore = 0;
+export async function settle(dir: string, lastReply = "", signal?: AbortSignal, reviewOnly = false): Promise<SettleResult> {
+  let release: (() => void) | undefined, pulse: ReturnType<typeof setInterval> | undefined, task: Task | undefined, ownStart = 0, selfBefore = 0;
   let hashes = { promptHash: "", acceptanceHash: "" };
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
   try {
@@ -35,6 +36,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     if (initial.state === "working" && initial.loop.finisher) { waitFor(dir,"收尾没走完","收尾进程已退出，可运行 bin/loop 收尾 " + t.executionId + " 手工接手。"); return quiet("等你"); }
     if (["cancelled", "input_required", "failed"].includes(initial.state)) return quiet(initial.message);
     if (!initial.loop.ready) return quiet("工作区正在准备");
+    pulse = setInterval(() => heartbeat(dir), 60000); pulse.unref();
     task = t; ownStart = Date.now(); selfBefore = initial.loop.durations.selfMs; selfTime();
     const delivery = initial.loop.delivery, dirty = changes(t.worktree);
     if (!delivery) {
@@ -75,46 +77,57 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
       transition(dir, "completed", "完成", "沿用此 commit 的复测与评审通过记录", null);
       return quiet("沿用");
     }
+    const reviewTest = reviewOnly ? retryReview(dir) : undefined;
+    if (reviewOnly && !reviewTest) {
+      transition(dir, "working", "开发中", "评审续跑条件已变化，请重新交付。", "developmentMs");
+      return retry("评审续跑条件已变化，请重新交付。");
+    }
     const record = (step: string, result: string, start: number, evidence: string[], detail = "") => {
       const c: Check = { commit, tree: delivery.tree, step, result, startedAt: new Date(start).toISOString(),
         endedAt: new Date().toISOString(), durationMs: Date.now() - start, evidence,
         promptHash: h.promptHash, acceptanceHash: h.acceptanceHash, ...(detail ? { detail } : {}) };
       appendCheck(dir, c);
     };
-    transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", t.limits.测试.timeoutMin * 60);
     const testStart = Date.now(), log = join(dir, "test-" + commit + ".log");
-    let testResult = "", output = "";
-    if (/^无\s*[:：]/.test(t.test)) {
-      testResult = "没验证"; output = t.test; writeFileSync(log, output + "\n");
-    } else {
-      const result = await run(t, "sh", ["-c", t.test], t.limits.测试.timeoutMin * 60000, signal);
-      selfTime();
-      output = result.output; testResult = result.code === 0 && !result.killed ? "通过" : "失败";
-      writeFileSync(log, output + (result.killed ? "\n复测超时或取消\n" : ""));
-      if (statusOf(dir).state === "cancelled") { record("复测", "已停止", testStart, [log]); return quiet("已停止"); }
-      if (testResult === "失败") {
-        const lines = output.trimEnd().split(/\r?\n/);
-        const reason = ["复测失败" + (result.killed ? "（超时或取消）" : "") + "，请修复后重新交付。", "命令：" + t.test,
-          "输出最后 60 行：", ...lines.slice(-60), "error/fail 行：", ...lines.filter((s) => /error|fail/i.test(s))].join("\n");
-        record("复测", "失败", testStart, [log], reason);
-        return returnToDeveloper(dir, "test", reason);
+    let testResult = reviewTest?.result || "", output = "";
+    if (reviewTest) { try { output = readFileSync(log, "utf8"); } catch { output = "复测原文缺失，沿用已有" + testResult + "记录。"; } }
+    else {
+      transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", t.limits.测试.timeoutMin * 60);
+      if (/^无\s*[:：]/.test(t.test)) {
+        testResult = "没验证"; output = t.test; writeFileSync(log, output + "\n");
+      } else {
+        const result = await run(t, "sh", ["-c", t.test], t.limits.测试.timeoutMin * 60000, signal);
+        selfTime();
+        output = result.output; testResult = result.code === 0 && !result.killed ? "通过" : "失败";
+        writeFileSync(log, output + (result.killed ? "\n复测超时或取消\n" : ""));
+        if (statusOf(dir).state === "cancelled") { record("复测", "已停止", testStart, [log]); return quiet("已停止"); }
+        if (testResult === "失败") {
+          const lines = output.trimEnd().split(/\r?\n/);
+          const reason = ["复测失败" + (result.killed ? "（超时或取消）" : "") + "，请修复后重新交付。", "命令：" + t.test,
+            "输出最后 60 行：", ...lines.slice(-60), "error/fail 行：", ...lines.filter((s) => /error|fail/i.test(s))].join("\n");
+          record("复测", "失败", testStart, [log], reason);
+          return returnToDeveloper(dir, "test", reason);
+        }
       }
+      selfTime();
+      record("复测", testResult, testStart, [log], "命令：" + t.test);
     }
-    selfTime();
-    record("复测", testResult, testStart, [log], "命令：" + t.test);
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
     const runtime = join(dir,"snapshot-"+commit+".json");
-    await snapshot(t,t.worktree,commit,runtime,"scenario",true,signal);
+    if (!reviewTest) await snapshot(t,t.worktree,commit,runtime,"scenario",true,signal);
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
     const previous = statusOf(dir).loop, round = previous.reviewRounds + 1;
     update(dir, (s) => { s.loop.reviewRounds = round; });
     const lastReview = checksOf(dir).filter((c) => c.step === "评审" && c.commit === previous.previousReviewCommit && ["通过", "必修"].includes(c.result)).at(-1);
     const sameRequirement = lastReview?.promptHash === h.promptHash && lastReview?.acceptanceHash === h.acceptanceHash;
     const base = sameRequirement && previous.previousReviewCommit ? previous.previousReviewCommit : t.baseCommit;
-    const diff = git(t.worktree, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", base, commit, "--"]);
+    const diff = git(t.worktree, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--diff-filter=d", base, commit, "--"]);
+    const deleted = git(t.worktree, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "--diff-filter=D", "-z", base, commit, "--"]).split("\0").filter(Boolean).map(entry => {
+      const [, lines, ...path] = entry.split("\t"); return path.join("\t") + "（" + (lines === "-" ? "二进制，行数不适用" : "原 " + lines + " 行") + "）";
+    });
     const added = git(t.worktree, ["diff", "--name-only", "--diff-filter=A", "-z", base, commit, "--"]).split("\0").filter(Boolean);
     const material = ["## 提示词原文", h.prompt, ...(h.acceptance ? ["## 验收标准", h.acceptance] : []),
-      "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff || "（无改动）", "## 新增文件", added.join("\n") || "无",
+      "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff || "（无改动）", "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", added.join("\n") || "无",
       "## 运行差异", git(t.worktree,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
       "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 复测结果", "命令：" + t.test, "结果：" + testResult, output,
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
@@ -147,6 +160,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal):
     if (release) fail(dir, e);
     return quiet(e instanceof Error ? e.message : String(e));
   } finally {
+    clearInterval(pulse);
     try {
       if (task && ownStart) {
         const s = update(dir, (s) => { if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? s.loop.phase === "收尾中" ? "selfMs" : "developmentMs" : null; });

@@ -9,12 +9,14 @@ import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
 import { taskOf, statusOf, waitFor, update, fail, inputs } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
-import { startCompanion } from "./after-settle.ts";
+import { settle } from "../core/settle.ts";
+import { startCompanion, startFinish } from "./after-settle.ts";
 import { convention } from "./convention.ts";
 interface LaunchOptions {
   openTerminal?: (script: string) => Promise<void>;
   startupTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  reviewOnly?: boolean;
 }
 const launchFiles = (dir: string, id: string) => ({
   request: join(dir, "launch-" + id + ".json"), pid: join(dir, "launch-" + id + "-pid.json"),
@@ -105,7 +107,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   const id = randomUUID(), files = launchFiles(dir, id), timeoutMs = options.startupTimeoutMs ?? 60000;
   const deadline = Date.now() + timeoutMs, script = join(dir, "open-session.sh");
   writeJson(files.request, {args, deadline}); writeFileSync(files.log, "");
-  const exports = ["PI_BIN", "PI_NODE_BIN", "PERMISSION_EXTENSION"].filter((key) => env[key] !== undefined)
+  const exports = ["PI_BIN", "PI_NODE_BIN", "PERMISSION_EXTENSION", "LOOP_CAFFEINATE_CMD"].filter((key) => env[key] !== undefined)
     .map((key) => "export " + key + "=" + shellQuote(env[key]!) + "\n").join("");
   writeFileSync(script, "#!/bin/sh\nexport LOOP_TASK_DIR=" + shellQuote(dir) + "\n" + exports + "exec " +
     [process.execPath, join(APP_ROOT, "src/hosts/launch.ts"), "--terminal", dir, id].map(shellQuote).join(" ") + "\n", {mode:0o700});
@@ -123,6 +125,17 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   update(dir, (s) => { s.loop.launcher = identity(); });
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
+    if (options.reviewOnly) {
+      const result = await settle(dir, "", undefined, true);
+      if (!result.continue) { await startFinish(dir, options.env || process.env); return; }
+      if (taskOf(dir).host !== "pi") {
+        waitFor(dir, "需手动接入会话", "补评审需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
+      }
+      update(dir, s => { s.loop.pendingReturn = result.reason; });
+      const session = statusOf(dir).loop.session;
+      if (alive(session) && !session?.endedAt) return;
+      resuming = true;
+    }
     if (!statusOf(dir).loop.ready) await prepare(dir);
     if (statusOf(dir).state !== "cancelled") { await startCompanion(dir,options.env || process.env); await launchSession(dir,resuming,options); }
   } catch (e) { fail(dir,e); throw e; }
@@ -134,6 +147,6 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const main = process.argv[2] === "--terminal"
     ? terminalSession(resolve(process.argv[3]), process.argv[4]).then((code) => { process.exitCode = code; })
-    : launchMain(resolve(process.argv[2]), process.argv.includes("--resume"));
+    : launchMain(resolve(process.argv[2]), process.argv.includes("--resume"), {reviewOnly: process.argv.includes("--review")});
   main.catch((e)=>{console.error(e);process.exitCode=1;});
 }

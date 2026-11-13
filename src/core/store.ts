@@ -8,6 +8,7 @@ import { digest, readJson, writeJson, withLock, jsonLines, appendJson } from "..
 import { gitText } from "../infra/git.ts";
 import { tasksRoot } from "../infra/paths.ts";
 import type { Identity } from "../infra/exec.ts";
+import { idleSleep } from "../infra/idle-sleep.ts";
 export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败", "收尾中", "已退回"] as const;
 export type Phase = typeof PHASES[number];
 export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "需手动接入会话" | "收尾没走完";
@@ -16,6 +17,12 @@ export class LoopError extends Error {
   constructor(category: string, message: string, result?: unknown) { super(message); this.category = category; this.result = result; }
 }
 export type State = "working" | "input_required" | "completed" | "failed" | "cancelled";
+export type Resolution = "续跑" | "收尾" | "合入（接受未验证）" | "停止" | "放弃" | "沿用通过记录";
+interface Facts {
+  name: string; startedAt: string; resumes: number;
+  stops: {at: string; step: Phase; state: State; reason: string; message: string; resumedAt: string | null; resolvedBy: Resolution | null}[];
+}
+const newFacts = (t: Task): Facts => ({name: t.name, startedAt: t.createdAt, resumes: 0, stops: []});
 export type Bucket = "developmentMs" | "testMs" | "reviewMs" | "inputMs" | "selfMs";
 export interface Task {
   executionId: string; dir: string; repo: string; card: string; cardHash: string; name: string; prompt: string; acceptance?: string;
@@ -32,7 +39,7 @@ export interface Status {
   refs: {prompt: string; acceptance: string | null; card: string}; error: {category: string; raw: string} | null;
   evidence: string[]; actions: string[];
   loop: {
-    phase: Phase; wait?: WaitReason | null; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
+    phase: Phase; wait?: WaitReason | null; facts?: Facts; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
     startingSession: (Identity & {launchId: string}) | null;
     finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; next?: string; released?: boolean;
@@ -64,14 +71,24 @@ export function summary(dir: string, s = statusOf(dir)): void {
   lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl"));
   writeFileSync(join(dir, "summary.md"), lines.filter((s, i, a) => s || a[i - 1] !== "").join("\n") + "\n");
 }
-export function update(dir: string, action: (s: Status) => void): Status {
+export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑"): Status {
   return withLock(join(dir, "status.lock"), () => {
-    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket;
+    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase};
+    s.loop.facts ||= newFacts(taskOf(dir));
     if (s.loop.bucket) s.loop.durations[s.loop.bucket] += Math.max(0, now - s.loop.clockAt);
     s.loop.clockAt = now; action(s);
+    const stopped = ["input_required", "failed", "cancelled"].includes(s.state), at = new Date(now).toISOString();
+    const entered = stopped && (before.state !== s.state || before.phase !== s.loop.phase), facts = s.loop.facts!, last = facts.stops.at(-1);
+    const destination = s.state === "cancelled" ? s.loop.phase === "已放弃" ? "放弃" : "停止" : resolvedBy;
+    if (last && !last.resumedAt && (entered || !stopped)) { last.resumedAt = at; last.resolvedBy = destination; }
+    if (entered) facts.stops.push({at, step: before.phase, state: s.state,
+      reason: s.state === "input_required" ? s.loop.wait || "" : s.state === "failed" ? s.error?.category || "未知" : s.loop.phase === "已放弃" ? "已放弃" : "已停止",
+      message: [...s.message].slice(0, 200).join(""), resumedAt: null, resolvedBy: null});
+    facts.stops = facts.stops.slice(-50);
     if (s.loop.bucket !== previousBucket) s.loop.stepStartedAt = now;
-    s.seq++; s.updatedAt = new Date(now).toISOString();
-    writeJson(join(dir, "status.json"), s); summary(dir, s); return s;
+    s.seq++; s.updatedAt = at;
+    const session = s.loop.session, owner = session && ["claude", "codex"].includes(session.host) && ["开发中", "已交付"].includes(s.loop.phase) && !session.endedAt ? session : undefined;
+    writeJson(join(dir, "status.json"), s); idleSleep(dir, s.state === "working", now, process.env, owner); summary(dir, s); return s;
   });
 }
 export function transition(dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
@@ -81,9 +98,13 @@ export function transition(dir: string, state: State, phase: Phase, message: str
     s.error = null; if (phase !== "等你") s.loop.wait = null;
   });
 }
-export function waitFor(dir: string, reason: WaitReason, message: string): void {
-  transition(dir, "input_required", "等你", message, "inputMs");
-  update(dir, (s) => { if (s.state === "input_required") s.loop.wait = reason; });
+export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void {
+  update(dir, s => {
+    if (s.state === "cancelled") return;
+    s.state = "input_required"; s.loop.phase = "等你"; s.loop.wait = reason; s.message = message;
+    s.loop.bucket = "inputMs"; s.timeLimitSec = null; s.error = null;
+    if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
+  });
 }
 export function fail(dir: string, error: unknown, category?: string): void {
   const raw = error instanceof Error ? error.message : String(error);
@@ -112,11 +133,11 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","停止","放弃"],
-    loop: { phase: "准备中", wait: null, commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null,
+    loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null,
       ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
-  writeJson(join(dir, "status.json"), s);
+  writeJson(join(dir, "status.json"), s); idleSleep(dir, true);
   writeFileSync(join(dir, "checks.jsonl"), ""); writeFileSync(join(dir, "instructions.jsonl"), ""); summary(dir, s);
   return t;
 }
@@ -149,7 +170,7 @@ function stepView(dir: string, view: StepView): void {
     if (s.state !== "working") { s.state = "completed"; s.loop.bucket = null; }
     s.loop.wait = null; s.timeLimitSec = null; s.error = null;
     s.loop.phase = view.phase; s.message = view.message;
-  });
+  }, "合入（接受未验证）");
 }
 export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
 export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash" | "acceptanceHash">, view?: StepView): void {

@@ -1,9 +1,21 @@
-import { locate, fail, taskOf } from "../core/store.ts";
+import { locate, fail, taskOf, statusOf, update } from "../core/store.ts";
 import { convention } from "./convention.ts";
 import { registerSession, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startFinish } from "./after-settle.ts";
 import { sessionIdOf, lastAssistantMessage, type HookEvent } from "./hook-event.ts";
+/** 只有实际返回宿主的事件才确认交接；Stop 必须 block，不能只改状态冒充唤起。 */
+function takeReturn(dir: string): string {
+  if (!statusOf(dir).loop.pendingReturn) return "";
+  let reason = "";
+  update(dir, s => {
+    if (!(s.state === "working" && s.loop.phase === "开发中") && !(s.state === "input_required" && s.loop.wait === "需手动接入会话")) return;
+    reason = s.loop.pendingReturn || ""; if (!reason) return;
+    s.loop.pendingReturn = null; s.state = "working"; s.loop.phase = "开发中"; s.loop.wait = null;
+    s.loop.bucket = "developmentMs"; s.timeLimitSec = null; s.error = null; s.message = "返修要求已通过 hook 交接。\n" + reason;
+  });
+  return reason;
+}
 export async function handleHook(event: HookEvent, eventName = event.hook_event_name || "", env = process.env): Promise<string> {
   if (!["SessionStart", "PostToolUse", "Stop"].includes(eventName)) return "";
   const dir = locate(event.cwd || process.cwd(), env);
@@ -14,10 +26,15 @@ export async function handleHook(event: HookEvent, eventName = event.hook_event_
       const pid = Number(event.session_pid || event.pid || process.ppid);
       if (!registerSession(dir, host, sessionIdOf(event), pid, event.transcript_path)) return "";
       return JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:
-        convention(taskOf(dir)) + "聊天不改变检查结论。"}});
+        convention(taskOf(dir)) + "聊天不改变检查结论。\n" + takeReturn(dir)}});
     }
-    if (eventName === "PostToolUse") { heartbeat(dir, Date.now(), true); return ""; }
+    if (eventName === "PostToolUse") {
+      heartbeat(dir, Date.now(), true); const reason = takeReturn(dir);
+      return reason ? JSON.stringify({hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:reason}}) : "";
+    }
     heartbeat(dir);
+    const pending = takeReturn(dir);
+    if (pending) return JSON.stringify({decision:"block",reason:pending});
     const r = await settle(dir, lastAssistantMessage(event));
     if (!r.continue) await startFinish(dir,env);
     return r.continue ? JSON.stringify({decision:"block",reason:r.reason}) : "";

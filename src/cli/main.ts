@@ -93,7 +93,8 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   }
   if(o.command==="续跑") {
     const dir=select(o), result=resume(dir);
-    if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
+    if(result.reviewOnly)await background(taskOf(dir),"review");
+    else if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
     else if(!result.reused && !result.running)await background(taskOf(dir),true);
     return {executionId:taskOf(dir).executionId,...result};
   }
