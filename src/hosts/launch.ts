@@ -128,6 +128,9 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
     if (options.reviewOnly) {
       const result = await settle(dir, "", undefined, true);
       if (!result.continue) { await startFinish(dir, options.env || process.env); return; }
+      if (taskOf(dir).host !== "pi") {
+        waitFor(dir, "需手动接入会话", "补评审需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
+      }
       update(dir, s => { s.loop.pendingReturn = result.reason; });
       const session = statusOf(dir).loop.session;
       if (alive(session) && !session?.endedAt) return;

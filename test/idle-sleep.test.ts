@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { fixture, write, until, getJson, ROOT, NODE } from "./helpers.ts";
+import { fixture, write, until, getJson, ROOT, NODE, hook, hostProcess } from "./helpers.ts";
 import { statusOf, waitFor, transition, fail } from "../src/core/store.ts";
 import { heartbeat, stop } from "../src/core/lifecycle.ts";
 import { alive, type Identity } from "../src/infra/exec.ts";
@@ -15,11 +15,11 @@ function inhibitor(t: Parameters<typeof fixture>[0], f: ReturnType<typeof fixtur
   const clock = join(f.base, "clock.json"), log = join(f.base, "assertions.jsonl"), cmd = join(f.base, "fake-caffeinate.cjs"), previous = process.env.LOOP_CAFFEINATE_CMD;
   write(clock, JSON.stringify(Date.now()));
   write(cmd, "#!" + NODE + "\n" +
-    'const fs=require("fs"),clock=' + JSON.stringify(clock) + ',log=' + JSON.stringify(log) + ';' +
-    'const now=()=>JSON.parse(fs.readFileSync(clock,"utf8")),args=process.argv.slice(2),start=now(),expires=start+Number(args[args.indexOf("-t")+1])*1000;' +
+    'const fs=require("fs"),cp=require("child_process"),clock=' + JSON.stringify(clock) + ',log=' + JSON.stringify(log) + ';' +
+    'const now=()=>JSON.parse(fs.readFileSync(clock,"utf8")),args=process.argv.slice(2),start=now(),seconds=args.includes("-t")?Number(args[args.indexOf("-t")+1]):Infinity,owner=args.includes("-w")?args[args.indexOf("-w")+1]:"",expires=start+seconds*1000;' +
     'const emit=event=>fs.appendFileSync(log,JSON.stringify({event,pid:process.pid,task:process.env.LOOP_TASK_DIR,args,at:now()})+"\\n");' +
     'let done=false;const end=()=>{if(done)return;done=true;emit("off");process.exit(0);};' +
-    'process.on("SIGTERM",end);fs.watch(clock,()=>{if(now()>=expires)end();});setTimeout(end,Number(args[args.indexOf("-t")+1])*1000);emit("on");\n');
+    'process.on("SIGTERM",end);fs.watch(clock,()=>{const p=owner?cp.spawnSync("ps",["-p",owner,"-o","stat="],{encoding:"utf8"}):null;if(now()>=expires||(p&&(p.status!==0||p.stdout.trim().startsWith("Z"))))end();else emit("checked");});if(Number.isFinite(seconds))setTimeout(end,seconds*1000);emit("on");\n');
   execFileSync("chmod", ["+x", cmd]); process.env.LOOP_CAFFEINATE_CMD = f.env.LOOP_CAFFEINATE_CMD = cmd;
   t.after(() => { process.env.LOOP_CAFFEINATE_CMD = previous; });
   const events = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -69,6 +69,26 @@ test("无宿主定时器的复测/评审推进也会每60秒续期", async t => 
   t.mock.timers.tick(60000); write(driver.clock, JSON.stringify(Date.now()));
   const renewed = getJson<Identity>(join(task.dir, "idle-sleep.json")); assert.notEqual(renewed.pid, original.pid); await driver.event("on", renewed.pid);
   stop(task.dir); await active; await driver.event("off", renewed.pid);
+});
+for (const host of ["claude", "codex"]) test("r1必修1：" + host + "真实hook登记后无事件超过120秒仍防睡，等你后释放", async t => {
+  const f = fixture(t, {card: {host}}), driver = inhibitor(t, f), task = await f.prepare(), worker = await hostProcess(t);
+  await hook(f, task.dir, "SessionStart", {cwd: task.worktree, host, session_pid: worker.owner.pid, session_id: host + "-long-call"});
+  const bound = getJson<Identity & {owner: Identity}>(join(task.dir, "idle-sleep.json")); await driver.event("on", bound.pid);
+  assert.deepEqual(driver.events().find(e => e.event === "on" && e.pid === bound.pid).args, ["-i", "-w", String(worker.owner.pid)]);
+  assert.equal(bound.owner.pid, worker.owner.pid); const seq = statusOf(task.dir).seq;
+  t.mock.timers.enable({apis: ["Date"], now: Date.now()}); t.mock.timers.tick(121000); write(driver.clock, JSON.stringify(Date.now()));
+  await until(f.base, driver.events, events => events.some(e => e.pid === bound.pid && e.at === Date.now() && ["checked", "off"].includes(e.event)));
+  assert.equal(alive(bound), true); assert.equal(driver.events().some(e => e.pid === bound.pid && e.event === "off"), false);
+  assert.equal(statusOf(task.dir).state, "working"); assert.equal(statusOf(task.dir).seq, seq, "没有工具事件或心跳来续期");
+  await hook(f, task.dir, "Stop", {cwd: task.worktree, last_assistant_message: "需要确认，暂不交付"});
+  await driver.event("off", bound.pid); assert.equal(statusOf(task.dir).state, "input_required"); assert.equal(alive(worker.owner), true);
+});
+for (const host of ["claude", "codex"]) test("r1必修1：" + host + "宿主退出后进程绑定断言自行释放", async t => {
+  const f = fixture(t, {card: {host}}), driver = inhibitor(t, f), task = await f.prepare(), worker = await hostProcess(t);
+  await hook(f, task.dir, "SessionStart", {cwd: task.worktree, host, session_pid: worker.owner.pid});
+  const lease = getJson<Identity>(join(task.dir, "idle-sleep.json")); await driver.event("on", lease.pid);
+  await worker.exit(); write(driver.clock, JSON.stringify(Date.now())); await driver.event("off", lease.pid);
+  assert.equal(statusOf(task.dir).state, "working", "退出释放不依赖新状态更新或人工清理");
 });
 test("防睡命令不可用只记原始错误，不成为新拒绝点", async t => {
   const f = fixture(t), previous = process.env.LOOP_CAFFEINATE_CMD;

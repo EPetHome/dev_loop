@@ -1,11 +1,12 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, watch, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { execFileSync, execFile } from "node:child_process";
+import { execFileSync, execFile, spawn } from "node:child_process";
+import { once } from "node:events";
 import { promisify } from "node:util";
 import { createTask, statusOf, type Task } from "../src/core/store.ts";
 import { prepare } from "../src/core/lifecycle.ts";
-import { signalProcess } from "../src/infra/exec.ts";
+import { signalProcess, identity } from "../src/infra/exec.ts";
 // 所有测试（含子进程）强制替身，绝不调用本机 caffeinate。
 process.env.LOOP_CAFFEINATE_CMD = "/usr/bin/true";
 export const ROOT = resolve(import.meta.dirname, "..");
@@ -55,6 +56,20 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   };
 }
 export const sq = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
+/** 真实 hook CLI + 宿主进程替身，不调用模型或安装插件。 */
+export async function hook(f: ReturnType<typeof fixture>, dir: string, eventName: string, event: Record<string, unknown> = {}) {
+  return new Promise<{stdout: string; stderr: string}>((accept, reject) => {
+    const child = execFile(NODE, [join(ROOT, "hosts/hook.ts"), eventName], {cwd: f.repo, env: {...f.env, LOOP_TASK_DIR: dir}, timeout: 15000},
+      (error, stdout, stderr) => error ? reject(error) : accept({stdout, stderr}));
+    child.stdin!.end(JSON.stringify(event));
+  });
+}
+export async function hostProcess(t: {after: (f: () => any) => any}) {
+  const child = spawn(NODE, ["-e", 'process.on("message",()=>process.exit(0));process.send("ready");'], {stdio: ["ignore", "ignore", "ignore", "ipc"]});
+  const closed = once(child, "close"); await once(child, "message"); const owner = identity(child.pid!);
+  t.after(async () => { signalProcess(owner); await closed; });
+  return {owner, async exit() { child.send("exit"); await closed; }};
+}
 /** 事件驱动地等文件/状态变化；只有总截止时间，没有固定 sleep。 */
 export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean): Promise<T> {
   return new Promise((accept, reject) => {

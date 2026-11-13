@@ -32,7 +32,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 交付可用 `--text-file 文件` 代替 `--说明`，不在此命令里跑检查。
 - 停止保留 worktree、分支和证据；放弃删除 worktree，保留本地分支和证据，不可原执行续跑。
 - 达到退回上限后，`续跑` 给耗尽的步骤再一轮；原会话仍在时，不另开第二个会话，请在原会话继续输入。
-- 评审调用「临时故障」失败后，若最后一次核心检查是「评审 / 失败」、HEAD 仍是最后交付 commit、工作区干净、提示词/验收标准哈希未变，且同 commit、同哈希下有复测「通过」或「没验证」，`续跑` 立即返回回执，在后台只补评审：不开开发会话、不重跑复测或留痕。失败调用不计一次退回；补评审通过后照常完成/收尾，必修照常返修。任一条件不满足仍走原续跑逻辑；检查原文丢失不影响复用。
+- 评审调用「临时故障」失败后，若最后一次核心检查是「评审 / 失败」、HEAD 仍是最后交付 commit、工作区干净、提示词/验收标准哈希未变，且同 commit、同哈希下有复测「通过」或「没验证」，`续跑` 立即返回回执，在后台只补评审：不开开发会话、不重跑复测或留痕。失败调用不计一次退回；补评审通过后照常完成/收尾，必修照常返修。Claude/Codex 的后台必修先保留 `pendingReturn`，用已有「需手动接入会话」明确等待交接，不因原进程存活就假报 working；下一次已接入的 Stop hook 用 `decision:block` 返回必修，SessionStart/PostToolUse 则用 `additionalContext` 交接，之后才转开发中。宿主已空闲时需在原会话继续或重新接入，不冒充已主动唤起。任一条件不满足仍走原续跑逻辑；检查原文丢失不影响复用。
 - `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、第 4 步的答复/能力声明尚未实现。
 
 ## 自动收尾与接力
@@ -218,7 +218,7 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 ## 防止空闲睡眠
 
-macOS 有执行处于 `working` 且进程持续干活/心跳时，使用用户态 `caffeinate -i -t 120`，每 60 秒由现有心跳续期；复测/评审推进也有心跳。各执行独立持有短时租约，不加常驻监控。转等你、完成、失败、停止时释放；进程崩溃、心跳中断后最长 120 秒自动失效。仅阻止**空闲**睡眠，不阻止关屏或合盖睡眠，不改系统设置、不需管理员权限。防睡命令异常只在执行目录 `idle-sleep.log` 留原文，不阻断任务。
+macOS 只在执行 `working` 时持有防睡：Pi、准备/复测/评审/收尾用用户态 `caffeinate -i -t 120`，由现有的 60 秒心跳续期，干活进程崩溃/心跳中断后最长 120 秒失效。Claude/Codex 已登记的开发会话（含已交付待停下）改用 `caffeinate -i -w <宿主PID>`，绑定核对过启动时间的真实宿主进程；长工具调用或思考没有 hook 事件也持续生效，宿主退出时由 caffeinate 自行释放，不依赖下一次心跳。各执行独立持有，转等你、完成、失败、停止时主动释放；不新增常驻监控进程。仅阻止**空闲**睡眠，不阻止关屏或合盖睡眠，不改系统设置、不需管理员权限。防睡命令异常只在执行目录 `idle-sleep.log` 留原文，不阻断任务。
 
 测试用 `LOOP_CAFFEINATE_CMD` 指向可执行替身（收到相同参数和 `LOOP_TASK_DIR`）；全套测试强制替身，绝不调用真实 `caffeinate`。真实机器断言由协调方在合入后的任务中检查。
 
@@ -229,7 +229,7 @@ macOS 有执行处于 `working` 且进程持续干活/心跳时，使用用户�
 - pi 每秒读到 `pendingReturn` 时发送 custom message 并 `triggerTurn:true`，清除待送原因，无 UI 也生效。独立收尾进程每 60 秒心跳，`loop.finisher` 是其身份，`loop.afterCommit` 防止同 commit 重复自动发起。
 - pi 另外每秒读状态，有变化刷新底部 `dev-loop【<阶段>】<任务名> · <附加信息>` 和标题 `【<阶段>】<任务名>`；无附加信息时不带分隔符。评审显示「第 N 轮」，等你显示原因，失败显示错误类别，附加步骤显示短 sha / 结果原因。无 UI 时不调用界面接口，关闭时清理定时器和状态栏。Claude/Codex 不做阶段显示。
 - Claude/Codex：薄入口 `hosts/hook.ts`，处理 SessionStart、PostToolUse（至少间隔 60 秒）、Stop；不处理 UserPromptSubmit。插件 Stop 外层时限为 4900 秒，保留 100 秒开销余量；两项 timeoutMin 合计超过 80 分钟的卡会在启动前明确拒绝，可降低时限或改用 pi。pi 不受这个外层上限约束。
-- 插件清单在 `plugins/dev-loop/`，**没有安装**。本步自动开终端只针对 pi；Claude/Codex 的真实插件加载没有验证，需手动接入 hook，其卡准备后转等你，不冒充已开会话。连续长时间不调工具的 hook 宿主没有定时心跳。
+- 插件清单在 `plugins/dev-loop/`，**没有安装**。本步自动开终端只针对 pi；Claude/Codex 的真实插件加载没有验证，需手动接入 hook，其卡准备后转等你，不冒充已开会话。连续长时间不调工具的 hook 宿主没有定时心跳，防睡按上一节绑定宿主进程，不以租约过期冒充任务停下。
 - 生产 pi 启动在 macOS Terminal；自动测试用 `LOOP_LAUNCH_CMD` 可执行替身（收到 pi-dev 参数，cwd=worktree，环境含 LOOP_TASK_DIR），绝不打开真实终端。
 
 ### 21 个阶段
@@ -252,7 +252,7 @@ bash -n bin/loop bin/pi-dev
 
 测试只在系统临时目录里创建仓库/提交；origin 是本地裸仓库，部署、评审用脚本替身，宿主用模拟事件和假的 pi API，不调用真实模型、GitHub、服务或真实终端。文件事件和模拟时钟替代固定 sleep；超时注入毫秒数。技术测试不等于真实宿主/业务验收。
 
-停下事实与防睡批次 A1–A9 的替身验证在 `test/facts.test.ts`、`test/retry-review.test.ts`、`test/idle-sleep.test.ts`、`test/review-material.test.ts`，包括旧状态兼容、只补评审的条件回退、后台回执/返修/收尾、心跳租约与删除材料。A10 真实 `pmset -g assertions` **未验证**，由协调方在合入后执行；技术测试不替代本机验收。
+停下事实与防睡批次 A1–A9 的替身验证在 `test/facts.test.ts`、`test/retry-review.test.ts`、`test/idle-sleep.test.ts`、`test/review-material.test.ts`，包括旧状态兼容、只补评审的条件回退、后台回执/返修/收尾、心跳租约与删除材料。A10 真实 `pmset -g assertions` **未验证**，由协调方在合入后执行；技术测试不替代本机验收。`test/idle-sleep.test.ts` 补 Claude/Codex 真实 hook 入口登记后超过 120 秒无事件仍防睡、等你和宿主退出释放；`test/hook-return.test.ts` 经真实 hook CLI 验证后台必修交接的 block/context 输出、只消费一次及后续修复交付，而非只断言状态字段。
 
 本批一条龙 A1–A10 在 `test/finish.test.ts`：A1/A3/A8 自动部署与状态/去重，A2 只合入，A4/A5 失败回退和返修后推送，A6 回退失败，A7 接力，A9 同项目排队，A10 手工退回。`test/companion.test.ts` 覆盖陪跑、运行差异、live 前后、对比和释放；`test/deploy.test.ts` 补 deploy.env。仅用替身，不代表真实线上或真实 Pi 窗口验收。
 

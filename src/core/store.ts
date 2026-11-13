@@ -87,7 +87,8 @@ export function update(dir: string, action: (s: Status) => void, resolvedBy: Res
     facts.stops = facts.stops.slice(-50);
     if (s.loop.bucket !== previousBucket) s.loop.stepStartedAt = now;
     s.seq++; s.updatedAt = at;
-    writeJson(join(dir, "status.json"), s); idleSleep(dir, s.state === "working", now); summary(dir, s); return s;
+    const session = s.loop.session, owner = session && ["claude", "codex"].includes(session.host) && ["开发中", "已交付"].includes(s.loop.phase) && !session.endedAt ? session : undefined;
+    writeJson(join(dir, "status.json"), s); idleSleep(dir, s.state === "working", now, process.env, owner); summary(dir, s); return s;
   });
 }
 export function transition(dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
@@ -97,11 +98,12 @@ export function transition(dir: string, state: State, phase: Phase, message: str
     s.error = null; if (phase !== "等你") s.loop.wait = null;
   });
 }
-export function waitFor(dir: string, reason: WaitReason, message: string): void {
+export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void {
   update(dir, s => {
     if (s.state === "cancelled") return;
     s.state = "input_required"; s.loop.phase = "等你"; s.loop.wait = reason; s.message = message;
     s.loop.bucket = "inputMs"; s.timeLimitSec = null; s.error = null;
+    if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
   });
 }
 export function fail(dir: string, error: unknown, category?: string): void {
