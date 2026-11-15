@@ -100,7 +100,11 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
   update(dir, (s) => {
     requireWaiting(s);
     if (answering) { appendJson(join(dir, "answers.jsonl"), {at: new Date().toISOString(), text}); s.loop.answerCount = answersOf(dir).length; }
-    if (text !== undefined) { s.loop.pendingReturn = answering ? "本人答复：" + text : text; s.loop.pendingOpening = !running && t.host === "pi"; }
+    if (text !== undefined) {
+      const message = answering ? "本人答复：" + text : text;
+      s.loop.pendingReturn = [s.loop.pendingReturn, message].filter(Boolean).join("\n\n");
+      s.loop.pendingOpening = !running && t.host === "pi";
+    }
     s.loop.testAllowance = Math.max(t.limits.测试.maxRepairs, s.loop.testReturns + 1);
     s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.loop.warned = false; s.state = "working";
     s.loop.facts!.resumes++; s.loop.reused = false;

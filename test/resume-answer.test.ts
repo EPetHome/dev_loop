@@ -164,6 +164,34 @@ for (const host of ["claude", "codex"]) test("续跑/答复 A9：" + host + "回
   assert.equal(statusOf(task.dir).loop.pendingReturn, "退出后仍待 hook");
 });
 
+for (const host of ["claude", "codex"]) for (const eventName of ["SessionStart", "PostToolUse", "Stop"]) test("r1 必修1：" + host + "退出后连续答复，由下一次 " + eventName + " hook 按序原文交接一次", async t => {
+  const f = fixture(t, {card: {host}}), task = await f.prepare(), worker = await hostProcess(t);
+  const event = {cwd: task.worktree, host, session_id: "exited-" + host, session_pid: worker.owner.pid};
+  await hook(f, task.dir, "SessionStart", event); await worker.exit();
+  waitFor(task.dir, "停下没交付", "等待本人答复");
+  const texts = ["  答复 A：保留前后空格\r\n和换行🙂  ", "\n答复 B：仍按原话\n"], path = join(task.dir, "answers.jsonl");
+  let prefix = "";
+  for (const [i, text] of texts.entries()) {
+    const file = join(f.base, "答复原话.txt"); write(file, text);
+    const r = JSON.parse((await f.cli(["答复", task.executionId, ...(i ? ["--text-file", file] : ["--话", text]), "--json"], f.repo, {LOOP_LAUNCH_CMD: undefined})).stdout);
+    assert.equal(r.running, false); assert.match(r.status.message, /未送达，需在窗口里说/);
+    const s = await until(task.dir, () => statusOf(task.dir), s => s.state === "input_required" && s.loop.wait === "需手动接入会话" && !s.loop.launcher);
+    assert.match(s.message, /未送达，需在窗口里说/); assert.equal(s.loop.answerCount, i + 1);
+    const raw = readFileSync(path, "utf8"); assert.ok(raw.startsWith(prefix)); prefix = raw;
+  }
+  assert.deepEqual(answersOf(task.dir).map(a => a.text), texts);
+  const expected = texts.map(text => "本人答复：" + text).join("\n\n");
+  // 下一次 hook 前不模拟开发，不手工消费待送；走真实 hook CLI 的 block/context 输出。
+  const received = JSON.parse((await hook(f, task.dir, eventName, {...event, session_pid: process.pid})).stdout);
+  const reason = eventName === "Stop" ? received.reason : received.hookSpecificOutput.additionalContext;
+  if (eventName === "Stop") assert.equal(received.decision, "block");
+  if (eventName === "SessionStart") assert.ok(reason.endsWith(expected)); else assert.equal(reason, expected);
+  for (const text of texts) assert.equal(reason.split("本人答复：" + text).length - 1, 1);
+  assert.equal(statusOf(task.dir).loop.pendingReturn, null); assert.equal(statusOf(task.dir).state, "working");
+  assert.equal((await hook(f, task.dir, "PostToolUse", event)).stdout, "", "后续 hook 不重复交接");
+  assert.equal(readFileSync(path, "utf8"), prefix);
+});
+
 test("续跑/答复 A10：空话及空白文件拒收，状态和答复记录不变；旧状态公开计数为零", async t => {
   const f = fixture(t), task = await f.prepare(); waitFor(task.dir, "停下没交付", "等你");
   const path = join(task.dir, "status.json"), old = getJson(path); delete old.loop.answerCount; write(path, JSON.stringify(old));
