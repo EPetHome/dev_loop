@@ -89,9 +89,10 @@ function waitForSession(dir: string, id: string, timeoutMs: number): Promise<voi
 export async function launchSession(dir: string, resuming = false, options: LaunchOptions = {}): Promise<void> {
   const t = taskOf(dir);
   if (statusOf(dir).state === "cancelled") return;
-  const prompt = join(dir, "developer-prompt.md");
-  writeFileSync(prompt, convention(t) + "\n交付只提交并登记。\n\n" + inputs(t).prompt);
-  const session = statusOf(dir).loop.session;
+  const prompt = join(dir, "developer-prompt.md"), s = statusOf(dir);
+  const opening = resuming && s.loop.pendingOpening ? s.loop.pendingReturn : null;
+  writeFileSync(prompt, convention(t) + "\n交付只提交并登记。\n\n" + inputs(t).prompt + (opening ? "\n\n## 续跑带话\n" + opening : ""));
+  const session = s.loop.session;
   const args = ["--cwd", t.worktree, "--name", t.executionId,
     ...(resuming && session?.id ? ["--session", session.file || session.id] : ["--session-id", t.executionId]), prompt];
   const env = options.env || process.env;
@@ -101,7 +102,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
     return;
   }
   if (t.host !== "pi") {
-    waitFor(dir,"需手动接入会话","工作区已就绪。本步 Claude/Codex 仅提供 hook 接入（插件未安装）；请手动在 worktree 开会话并连接 hosts/hook.ts，再续跑；或改用 pi。");
+    waitFor(dir,"需手动接入会话","工作区已就绪。本步 Claude/Codex 仅提供 hook 接入（插件未安装）；请手动在 worktree 开会话并连接 hosts/hook.ts，再续跑；或改用 pi。" + (s.loop.pendingReturn ? "\n未送达，需在窗口里说；下一次 hook 交接。" : ""));
     return;
   }
   const id = randomUUID(), files = launchFiles(dir, id), timeoutMs = options.startupTimeoutMs ?? 60000;

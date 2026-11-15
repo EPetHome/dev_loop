@@ -27,8 +27,9 @@ export function registerPi(pi: PiAPI, options: {
     try {
       const s = statusOf(dir), phase = s.loop.phase, pending = s.loop.pendingReturn;
       if (pending && s.state === "working" && phase === "开发中" && !alive(s.loop.finisher)) {
-        pi.sendMessage({customType:"dev-loop-return",content:pending,display:true},{triggerTurn:true});
-        update(dir,s=>{if(s.loop.pendingReturn===pending)s.loop.pendingReturn=null;});
+        // 重开的会话已在开场承载原话；这里只确认消费，不能再触发一次。
+        if (!s.loop.pendingOpening) pi.sendMessage({customType:"dev-loop-return",content:pending,display:true},{triggerTurn:true});
+        update(dir,s=>{if(s.loop.pendingReturn===pending){s.loop.pendingReturn=null;s.loop.pendingOpening=false;}});
       }
       if (!context?.ui || context.hasUI === false) return;
       const extra = phase === "评审中" ? "第 " + s.loop.reviewRounds + " 轮" : phase === "等你" ? s.loop.wait || s.message.split("\n")[0].slice(0, 30)
@@ -59,7 +60,7 @@ export function registerPi(pi: PiAPI, options: {
     if (!dir) return;
     const messages = event.context?.contextMessages || ctx.sessionManager.getBranch().map((e) => e.message).filter(Boolean);
     const last = [...messages].reverse().find((m) => m.role === "assistant");
-    const result = await settle(dir, contentText(last?.content), ctx.signal);
+    const result = await settle(dir, contentText(last?.content), ctx.signal, false, last);
     refresh();
     if (!result.continue) await startFinish(dir,options.env || process.env);
     if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};

@@ -15,7 +15,7 @@ import { queued } from "./queue.ts";
 import { background } from "./background.ts";
 import { companion } from "./companion.ts";
 import { comparison, releaseWorktree } from "./inspect.ts";
-interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; commit?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
+interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; words?: string; commit?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
 function options(args: string[]): Options {
   const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false, automatic: false };
   while (args.length) {
@@ -25,10 +25,10 @@ function options(args: string[]): Options {
     if (arg === "--推送" && out.command === "合入") { out.push = true; continue; }
     if (arg === "--auto" && out.command === "收尾") { out.automatic = true; continue; }
     if (arg === "--commit" && !["合入", "部署"].includes(out.command)) throw new InputError("未知选项：" + arg);
-    const field = {"--commit":"commit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--text-file":"file"}[arg];
+    const field = {"--commit":"commit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--话":"words","--text-file":"file"}[arg];
     if (field) {
-      const value = args.shift(); if (!value || value.startsWith("--")) throw new InputError(arg + " 缺值");
-      if (field === "file") out.note = readFileSync(resolve(value),"utf8"); else (out as any)[field] = value;
+      const value = args.shift(); if (value === undefined || (field !== "words" && (!value || value.startsWith("--")))) throw new InputError(arg + " 缺值");
+      if (field === "file") out[["续跑", "答复"].includes(out.command) ? "words" : "note"] = readFileSync(resolve(value),"utf8"); else (out as any)[field] = value;
     } else if (arg.startsWith("-")) throw new InputError("未知选项：" + arg);
     else if (out.target) { if(out.command==="对比" && !out.other)out.other=arg; else throw new InputError("只能指定一个卡或执行编号（对比最多两个）"); }
     else out.target = arg;
@@ -51,7 +51,9 @@ function select(o: Options): string {
 const help = `bin/loop 启动 <version:1 单任务卡> [--派单编号 X] [--指令编号 Y] --json
 bin/loop 交付 [--说明 文本 | --text-file 文件] [--json]
 bin/loop 查询 [<卡或执行编号> | --all] [--brief] [--json]
-bin/loop 续跑|停止|放弃 <卡或执行编号> [--task 名] [--json]
+bin/loop 续跑 <卡或执行编号> [--话 文本 | --text-file 文件] [--task 名] [--json]
+bin/loop 答复 <卡或执行编号> (--话 文本 | --text-file 文件) [--task 名] [--json]
+bin/loop 停止|放弃 <卡或执行编号> [--task 名] [--json]
 bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] [--推送] [--json]
 bin/loop 部署 <执行编号或卡路径> [--commit <sha>] [--json]
 bin/loop 收尾|退回|陪跑|释放 <执行编号或卡路径> [--json]
@@ -61,7 +63,8 @@ flow 按 开发评审, 测试, 合入, 部署, 推送 的子序列；next 相对
 自动部署还须 check/rollback；deploy.env 为当前配置的大写字符串环境变量（禁止 LOOP_）。
 收尾走卡并脱离开发会话；退回只动线上不动 dev；陪跑/snapshot 失败不阻断；验收后可释放工作区。
 LOOP_TASKS_ROOT：执行根目录；开发方优先通过 LOOP_TASK_DIR 定位任务。
-多任务/整合/验收（第3步）、答复（第4步）尚不支持。`;
+答复仅等你时接收，原文追加 answers.jsonl 并带话续跑；Claude/Codex 未送达，需在窗口里说。
+多任务/整合/验收（第3步）尚不支持。`;
 export async function main(args = process.argv.slice(2)): Promise<unknown> {
   const o=options([...args]), root=tasksRoot();
   if (["帮助","help","--help","-h"].includes(o.command)) return help;
@@ -91,8 +94,8 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
     const dir=locate(process.cwd()); if(!dir)throw new InputError("当前目录没有任务；请在登记的 worktree 内交付或设置 LOOP_TASK_DIR");
     return deliver(dir,o.note);
   }
-  if(o.command==="续跑") {
-    const dir=select(o), result=resume(dir);
+  if(o.command==="续跑" || o.command==="答复") {
+    const dir=select(o), result=resume(dir,o.words,o.command==="答复");
     if(result.reviewOnly)await background(taskOf(dir),"review");
     else if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
     else if(!result.reused && !result.running)await background(taskOf(dir),true);
@@ -112,7 +115,7 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   }
   if(o.command==="退回") { const dir=select(o); return queued(dir,()=>rollback(dir)); }
   if(o.command==="部署") { const dir=select(o); return queued(dir,()=>deploy(dir, {commit:o.commit})); }
-  if(["整合","验收","答复","开发"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help);
+  if(["整合","验收","开发"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help);
   throw new InputError("未知命令："+o.command+"\n"+help);
 }
 if(process.argv[1] && resolve(process.argv[1])===join(APP_ROOT,"src/cli/main.ts")) {

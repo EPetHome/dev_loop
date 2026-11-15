@@ -12,7 +12,8 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 # 开发会话在后台创建的 worktree 中工作，完成后执行：
 /Users/Admin/Desktop/dev-loop/bin/loop 交付 --说明 '做了什么、如何自测'
 /Users/Admin/Desktop/dev-loop/bin/loop 查询 --all --brief --json
-/Users/Admin/Desktop/dev-loop/bin/loop 续跑 <执行编号或卡路径> --json
+/Users/Admin/Desktop/dev-loop/bin/loop 续跑 <执行编号或卡路径> [--话 文本 | --text-file 文件] --json
+/Users/Admin/Desktop/dev-loop/bin/loop 答复 <执行编号或卡路径> (--话 文本 | --text-file 文件) --json
 /Users/Admin/Desktop/dev-loop/bin/loop 停止 <执行编号或卡路径> --json
 /Users/Admin/Desktop/dev-loop/bin/loop 放弃 <执行编号或卡路径> --json
 # 没有约定收尾的卡，完成后按需执行：
@@ -31,9 +32,12 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 同一张卡有多个活动执行时，控制命令要求执行编号；可用 `--task 名` 核对任务名。
 - 交付可用 `--text-file 文件` 代替 `--说明`，不在此命令里跑检查。
 - 停止保留 worktree、分支和证据；放弃删除 worktree，保留本地分支和证据，不可原执行续跑。
-- 达到退回上限后，`续跑` 给耗尽的步骤再一轮；原会话仍在时，不另开第二个会话，请在原会话继续输入。
+- 达到退回上限后，`续跑` 给耗尽的步骤再一轮；不带话时行为不变，原会话仍在就请在原会话继续输入。
+- `续跑 --话 文本` / `--text-file 文件` 原文写入 `loop.pendingReturn`，不改字、不设长度上限。Pi 原会话仍在时送进窗口并开新一轮，只送一次后清空；会话已退出时用原 session 文件重开，原话放进开场提示，不重复注入。带话明确回开发，但不删除或作废已有检查结论。Claude/Codex 交给下一次现有 hook，状态和回执明确写「未送达，需在窗口里说」，不冒充主动唤起。空话或全空白拒收，不续跑。
+- `答复` 只在「等你」时接收非空原话，追加带时间的答复记录后按带话续跑，送进开发会话的是 `本人答复：<原话>`。其他状态（含已停止、已放弃）拒收，不写答复记录。之后的评审输入按时间带全部「本人答复」，它们是本人开发途中的决定，和提示词冲突时按答复判；不改提示词、验收标准或它们的哈希，也不作废已有结论。
+- Pi 最后一条助手回复 `stopReason: "error"` 且本该记停下没交付时，改记等待原因「模型出错」，消息保留 `errorMessage` 原话；`stop`、缺结束原因和其他宿主照旧。「有改动且没催过就催一次尚未交付」不变。何时再续跑、试几次归调用方，dev-loop 不加自动重试。
 - 评审调用「临时故障」失败后，若最后一次核心检查是「评审 / 失败」、HEAD 仍是最后交付 commit、工作区干净、提示词/验收标准哈希未变，且同 commit、同哈希下有复测「通过」或「没验证」，`续跑` 立即返回回执，在后台只补评审：不开开发会话、不重跑复测或留痕。失败调用不计一次退回；补评审通过后照常完成/收尾，必修照常返修。Claude/Codex 的后台必修先保留 `pendingReturn`，用已有「需手动接入会话」明确等待交接，不因原进程存活就假报 working；下一次已接入的 Stop hook 用 `decision:block` 返回必修，SessionStart/PostToolUse 则用 `additionalContext` 交接，之后才转开发中。宿主已空闲时需在原会话继续或重新接入，不冒充已主动唤起。任一条件不满足仍走原续跑逻辑；检查原文丢失不影响复用。
-- `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、第 4 步的答复/能力声明尚未实现。
+- `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、能力声明尚未实现；答复已支持上述命令，但不支持指令编号去重。
 
 ## 自动收尾与接力
 
@@ -194,6 +198,7 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 
 - `task.json`：启动时只写一次；`status.json`：原子重写、seq 每次递增、generation=1（不重建同一执行目录）。
 - `checks.jsonl`：追加写检查结果与耗时；`instructions.jsonl`：已处理的启动指令。
+- `answers.jsonl`：仅接收答复时创建、只追加；每行 `{at: ISO时间, text: 本人原话}`，换行按 JSON 转义，读取后原文不变。`loop.answerCount` 在所有公开状态（含 `--brief`）给出答复条数，旧执行没有记录时为 0；查询不回写。
 - `summary.md`：结论与开发/复测/评审/等你/dev-loop 自身耗时；做过的合入/推送/部署按首次出现顺序插在 dev-loop 自身之前，结果取最近一次，耗时累计。
 - 合入/推送/部署每次结果追加到 `checks.jsonl`，含 commit、tree、输入哈希、开始/结束时间、毫秒数、证据与详情。
 - 测试、评审原文在同目录；证据缺失不作废通过。
@@ -205,7 +210,7 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 - `name`：卡上 `tasks[].name`，等于 task.json 的 `name`；`startedAt`：执行开始时间，等于 task.json 的 `createdAt`（ISO）。
 - `resumes`：成功续跑次数，初始为 0；收尾、合入不计入。
 - `stops`：最近 50 条停下记录。进入 `input_required/failed/cancelled` 时追加，每条包含 `at`（ISO）、`step`（停下前的 PHASES 阶段）、`state`、`reason`、`message`（当时原话，最多 200 字）、`resumedAt`、`resolvedBy`。
-- `reason`：等你取 `loop.wait` 的五种原因；失败取 `error.category`；停止写「已停止」，放弃写「已放弃」。原因不随 `loop.wait` 清空而丢失。
+- `reason`：等你取 `loop.wait` 的六种原因；失败取 `error.category`；停止写「已停止」，放弃写「已放弃」。原因不随 `loop.wait` 清空而丢失。
 - 未解开时 `resumedAt/resolvedBy` 为 null；成功续跑、收尾、`合入 --接受未验证` 离开停下状态时补上时间和去向。去向为「续跑 / 收尾 / 合入（接受未验证） / 停止 / 放弃 / 沿用通过记录」；若已有未解开的停下记录，进入新停下状态前先关闭旧记录，例如等你后停止，旧条目写「停止」。
 
 没有 `facts` 的旧状态仍可读取、查询和续跑；查询不回写，下一次状态更新起补齐基本事实并开始记录，不倒推、编造旧的停下历史。
@@ -226,7 +231,7 @@ macOS 只在执行 `working` 时持有防睡：Pi、准备/复测/评审/收尾�
 
 - pi：`bin/pi-dev` 默认 sol/max，显式加载权限扩展和 `src/hosts/pi.ts`，不加载旧 loop/Ponytail/其他扩展；`--session` 精确恢复。
 - pi 会话启动后每 60 秒心跳，仅 working 时更新；最终停下边界可注入 custom_message 并请求继续。
-- pi 每秒读到 `pendingReturn` 时发送 custom message 并 `triggerTurn:true`，清除待送原因，无 UI 也生效。独立收尾进程每 60 秒心跳，`loop.finisher` 是其身份，`loop.afterCommit` 防止同 commit 重复自动发起。
+- pi 每秒读到 `pendingReturn` 时发送 custom message 并 `triggerTurn:true`，清除待送原因，无 UI 也生效。退出后重开的续跑原话用 `pendingOpening` 标记已放入开场，插件只清空待送，不再注入第二次。独立收尾进程每 60 秒心跳，`loop.finisher` 是其身份，`loop.afterCommit` 防止同 commit 重复自动发起。
 - pi 另外每秒读状态，有变化刷新底部 `dev-loop【<阶段>】<任务名> · <附加信息>` 和标题 `【<阶段>】<任务名>`；无附加信息时不带分隔符。评审显示「第 N 轮」，等你显示原因，失败显示错误类别，附加步骤显示短 sha / 结果原因。无 UI 时不调用界面接口，关闭时清理定时器和状态栏。Claude/Codex 不做阶段显示。
 - Claude/Codex：薄入口 `hosts/hook.ts`，处理 SessionStart、PostToolUse（至少间隔 60 秒）、Stop；不处理 UserPromptSubmit。插件 Stop 外层时限为 4900 秒，保留 100 秒开销余量；两项 timeoutMin 合计超过 80 分钟的卡会在启动前明确拒绝，可降低时限或改用 pi。pi 不受这个外层上限约束。
 - 插件清单在 `plugins/dev-loop/`，**没有安装**。本步自动开终端只针对 pi；Claude/Codex 的真实插件加载没有验证，需手动接入 hook，其卡准备后转等你，不冒充已开会话。连续长时间不调工具的 hook 宿主没有定时心跳，防睡按上一节绑定宿主进程，不以租约过期冒充任务停下。
@@ -240,7 +245,7 @@ macOS 只在执行 `working` 时持有防睡：Pi、准备/复测/评审/收尾�
 
 启动或工作区未就绪的续跑为「准备中」；交付成功且未沿用为「已交付」；交付后又改代码/自行提交则回「开发中」；放弃并删除工作区为「已放弃」，不能续跑。
 
-`loop.wait` 只取五种原因：复测退回到上限、评审必修到上限、停下没交付、需手动接入会话、收尾没走完。离开等你时清空；旧状态文件没有 wait 仍可读取，pi 用 message 第一行前 30 字补显原因。到上限后可运行 `bin/loop 续跑 <执行编号>` 再给一轮、停止，或 `bin/loop 合入 <执行编号> --接受未验证`。
+`loop.wait` 只取六种原因：复测退回到上限、评审必修到上限、停下没交付、模型出错、需手动接入会话、收尾没走完。离开等你时清空；旧状态文件没有 wait 仍可读取，pi 用 message 第一行前 30 字补显原因。到上限后可运行 `bin/loop 续跑 <执行编号>` 再给一轮、停止，或 `bin/loop 合入 <执行编号> --接受未验证`。
 
 ## 自检
 
@@ -251,6 +256,8 @@ bash -n bin/loop bin/pi-dev
 ```
 
 测试只在系统临时目录里创建仓库/提交；origin 是本地裸仓库，部署、评审用脚本替身，宿主用模拟事件和假的 pi API，不调用真实模型、GitHub、服务或真实终端。文件事件和模拟时钟替代固定 sleep；超时注入毫秒数。技术测试不等于真实宿主/业务验收。
+
+续跑带话、模型出错和答复 A1–A10 的替身验证在 `test/resume-answer.test.ts`：活会话只送一次、退出后精确恢复且开场不重复、无话兼容、构造 Pi 结束原因与催交付规则、答复原文追加/计数/评审输入及哈希不变、非等你/空话拒收、Claude/Codex 未送达回执和真实 hook CLI 交接。未开真实模型或窗口，不代替飞书/PA 的业务验收。
 
 停下事实与防睡批次 A1–A9 的替身验证在 `test/facts.test.ts`、`test/retry-review.test.ts`、`test/idle-sleep.test.ts`、`test/review-material.test.ts`，包括旧状态兼容、只补评审的条件回退、后台回执/返修/收尾、心跳租约与删除材料。A10 真实 `pmset -g assertions` **未验证**，由协调方在合入后执行；技术测试不替代本机验收。`test/idle-sleep.test.ts` 补 Claude/Codex 真实 hook 入口登记后超过 120 秒无事件仍防睡、等你和宿主退出释放；`test/hook-return.test.ts` 经真实 hook CLI 验证后台必修交接的 block/context 输出、只消费一次及后续修复交付，而非只断言状态字段。
 
