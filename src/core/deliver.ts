@@ -33,7 +33,7 @@ export function deliver(dir: string, note = "") {
         s.state = reused && !pending ? "completed" : "working"; s.loop.phase = reused && !pending ? "完成" : "已交付";
         s.message = reused ? "已交付，沿用已有检查" : "已交付，等待会话停下后复测和评审";
       }
-      s.loop.wait = null; s.loop.pendingReturn = null; s.loop.bucket = s.state === "completed" ? null : "developmentMs";
+      s.loop.wait = null; s.loop.pendingReturn = null; s.loop.pendingOpening = false; s.loop.bucket = s.state === "completed" ? null : "developmentMs";
     });
     appendCheck(dir, { commit, tree: deliveredTree, step: "dev-loop 自身", result: "交付登记", startedAt: new Date(begin).toISOString(), endedAt: now,
       durationMs: Math.max(0, Date.now() - begin), evidence: [], promptHash: h.promptHash, acceptanceHash: h.acceptanceHash });

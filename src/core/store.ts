@@ -11,7 +11,7 @@ import type { Identity } from "../infra/exec.ts";
 import { idleSleep } from "../infra/idle-sleep.ts";
 export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败", "收尾中", "已退回"] as const;
 export type Phase = typeof PHASES[number];
-export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "需手动接入会话" | "收尾没走完";
+export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "模型出错" | "需手动接入会话" | "收尾没走完";
 export class LoopError extends Error {
   category: string; result?: unknown;
   constructor(category: string, message: string, result?: unknown) { super(message); this.category = category; this.result = result; }
@@ -42,7 +42,7 @@ export interface Status {
     phase: Phase; wait?: WaitReason | null; facts?: Facts; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
     startingSession: (Identity & {launchId: string}) | null;
-    finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; next?: string; released?: boolean;
+    finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string; released?: boolean;
     activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
@@ -51,7 +51,8 @@ export interface Status {
   };
 }
 export const taskOf = (dir: string) => readJson<Task>(join(dir, "task.json"));
-export const statusOf = (dir: string) => readJson<Status>(join(dir, "status.json"));
+export const answersOf = (dir: string) => jsonLines<{at: string; text: string}>(join(dir, "answers.jsonl"));
+export const statusOf = (dir: string) => { const s = readJson<Status>(join(dir, "status.json")); s.loop.answerCount = answersOf(dir).length; return s; };
 export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.jsonl"));
 export const appendCheck = (dir: string, check: Check) => appendJson(join(dir, "checks.jsonl"), check);
 export function summary(dir: string, s = statusOf(dir)): void {
@@ -132,8 +133,8 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
   const s: Status = { protocol: "loop-status/1", source: {worker: "loop", instance: hostname()}, executionId, dispatchId, batchId: null,
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
-    evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","停止","放弃"],
-    loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null,
+    evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","答复","停止","放弃"],
+    loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null, answerCount: 0,
       ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };

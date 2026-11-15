@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { lock, BusyError } from "../infra/files.ts";
 import { alive } from "../infra/exec.ts";
 import { git, head, tree, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, summary, fail, PHASES, type Check, type Task } from "./store.ts";
+import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, answersOf, summary, fail, PHASES, type Check, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
 import { heartbeat, retryReview } from "./lifecycle.ts";
 import { executeStaticReview } from "./review-call.ts";
@@ -23,7 +23,7 @@ function returnToDeveloper(dir: string, kind: "test" | "review", reason: string)
   return retry(reason);
 }
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
-export async function settle(dir: string, lastReply = "", signal?: AbortSignal, reviewOnly = false): Promise<SettleResult> {
+export async function settle(dir: string, lastReply = "", signal?: AbortSignal, reviewOnly = false, ending?: {stopReason?: string; errorMessage?: string}): Promise<SettleResult> {
   let release: (() => void) | undefined, pulse: ReturnType<typeof setInterval> | undefined, task: Task | undefined, ownStart = 0, selfBefore = 0;
   let hashes = { promptHash: "", acceptanceHash: "" };
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
@@ -43,6 +43,10 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal, 
       if (dirty.length && !initial.loop.warned) {
         update(dir, (s) => { s.loop.warned = true; s.loop.bucket = "developmentMs"; });
         return retry("尚未交付；做完后请运行 bin/loop 交付。");
+      }
+      if (ending?.stopReason === "error") {
+        const reason = "模型出错；可续跑开发或停止。\n" + (ending.errorMessage || lastReply || "（无出错详情）");
+        waitFor(dir, "模型出错", reason); return quiet(reason);
       }
       waitFor(dir, "停下没交付", lastReply || "开发方未交付；可续跑开发或停止。");
       return quiet(lastReply);
@@ -129,7 +133,7 @@ export async function settle(dir: string, lastReply = "", signal?: AbortSignal, 
     const material = ["## 提示词原文", h.prompt, ...(h.acceptance ? ["## 验收标准", h.acceptance] : []),
       "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff || "（无改动）", "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", added.join("\n") || "无",
       "## 运行差异", git(t.worktree,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
-      "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 复测结果", "命令：" + t.test, "结果：" + testResult, output,
+      "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 本人答复", answersOf(dir).map(a => a.at + "\n" + a.text).join("\n\n") || "无", "## 复测结果", "命令：" + t.test, "结果：" + testResult, output,
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
     transition(dir, "working", "评审中", "正在评审第 " + round + " 轮", "reviewMs", t.limits.开发评审.timeoutMin * 60);
     const reviewStart = Date.now(), outcome = await executeStaticReview(t, round, material, t.limits.开发评审.timeoutMin * 60000, signal);
