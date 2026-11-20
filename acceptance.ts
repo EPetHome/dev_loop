@@ -16,7 +16,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import {
   buildAcceptanceInput, buildCorrectionInput, buildCriteriaDraftInput, buildRecoveryInput, classifySystemExit, dataStateNote, extractCriteria, hasEvidence,
   authorizationHint, authorizationStatus, findObjections, mergeAcceptanceReports, forUser, judgeAcceptance, parseAcceptanceReport, parseCriteriaDraft,
-  scanLogs, type AcceptanceRecord, type Criteria, type Grants, type ParsedAcceptance,
+  scanLogs, type AcceptanceRecord, type AcceptanceItemResult, type Criteria, type Grants, type ParsedAcceptance,
 } from "./acceptance-core.ts";
 import { EXT_DIR, HERMES_BIN, MARKER_FILE, PERMISSION_EXT, PI_BIN, resolveTestCmd, type AcceptanceConfig } from "./config.ts";
 import { deriveSessionId } from "./core.ts";
@@ -77,18 +77,27 @@ export interface AcceptanceDeps {
   /** 本轮验收的截止时间（毫秒时间戳）。 */
   deadline: number;
   now: () => number;
-  /** 上一轮没通过的条目，提醒验收方全部重测。 */
+  /** 上一轮没通过的条目，供本次实测核对。 */
   previousFailed: string[];
+  /** 同一段/整批的上一轮记录；标准身份不同时自动完整验收。 */
+  previous?: AcceptanceRecord;
+  /** 显式完整范围不沿用条目；首次/移出任务等由内核计划决定，不暗加一轮 full。 */
+  fullCheck?: boolean;
+  /** 新卡只执行内核冻结的本次集合；不会在末尾追加完整验收。 */
+  explicitScope?: { ids: string[]; retained: AcceptanceItemResult[] };
+  boundedDeadline?: boolean;
+  registerResource?: (resource: RunResource) => void;
   signal?: AbortSignal;
   checkLive?: () => void;
   onProgress?: (text: string) => void;
   saveState: () => Promise<void> | void;
 }
 
-export type AcceptanceStage =
+export type AcceptanceStage = (
   | { kind: "judged"; record: AcceptanceRecord }
   /** hint：给你看的下一步（怎么处理、处理完怎么继续）。 */
-  | { kind: "paused"; reason: string; notes?: string; hint: string; failureKind?: import("./failure.ts").FailureKind };
+  | { kind: "paused"; reason: string; notes?: string; hint: string; failureKind?: import("./failure.ts").FailureKind }
+) & { attempts?: AcceptanceRecord[] };
 
 const shellQuote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`;
 const errorText = (error: unknown): string => error instanceof Error ? error.message : String(error);
@@ -565,7 +574,9 @@ async function runReset(deps: AcceptanceDeps, label: string, cleanup = false): P
   const command = cleanup ? config.cleanup : config.reset;
   if (!command) return "";
   if (!cleanup) deps.onProgress?.(`自动验收：重置数据（第 ${deps.round} 轮${label}）`);
-  const timeout = Math.max(1000, Math.min(config.resetTimeoutSec * 1000, cleanup ? Infinity : deps.deadline - deps.now()));
+  const remaining = deps.deadline - deps.now();
+  if (deps.boundedDeadline && remaining <= 0) return "本轮 deadline 已耗尽，资源收尾未确认";
+  const timeout = Math.max(deps.boundedDeadline ? 1 : 1000, Math.min(config.resetTimeoutSec * 1000, cleanup && !deps.boundedDeadline ? Infinity : remaining));
   const env = [
     `PATH=${HERMES_BIN}:${process.env.PATH ?? ""}`,
     ...Object.entries(config.env).map(([key, value]) => `${key}=${value}`),
@@ -586,6 +597,7 @@ async function runReset(deps: AcceptanceDeps, label: string, cleanup = false): P
     return `重置命令无法执行：${tailText(errorText(error), 300)}`;
   }
   log([`退出码：${result.code}${result.killed ? "（超时或被终止）" : ""}`, "--- 标准输出", result.stdout.trimEnd(), "--- 标准错误", result.stderr.trimEnd()].join("\n"));
+  if (deps.boundedDeadline && result.processesReleased !== true) return "重置/收尾消费者释放未确认";
   if (result.killed) return `重置命令超时或被终止（时限 ${config.resetTimeoutSec} 秒）`;
   if (result.code !== 0) return `重置命令退出码 ${result.code}：${tailText(result.stderr || result.stdout, 300)}`;
   return "";
@@ -636,7 +648,7 @@ async function runTester(deps: AcceptanceDeps, criteria: Criteria, inputPath: st
       && preview.items.find((entry) => entry.id === item.id)?.verdict === "无法验证").map(({ id }) => id);
     if (!ids.length) { recovery.error = "没有待补判的有效证据；已提交结果仍按证据核对"; return; }
     const remaining = deps.deadline - deps.now();
-    if (remaining < 60_000) { recovery.error = "剩余验收预算不足 1 分钟，未补写报告；已有报告和检查点照常按证据判定"; return; }
+    if (remaining < (deps.boundedDeadline ? 1 : 60_000)) { recovery.error = deps.boundedDeadline ? "本轮剩余预算耗尽，未补写报告；已有证据保留" : "剩余验收预算不足 1 分钟，未补写报告；已有报告和检查点照常按证据判定"; return; }
     if (systemDown() || deps.signal?.aborted) return;
     const recoveryPath = join(deps.runDir, "recovery.md");
     writeFileSync(recoveryPath, buildRecoveryInput(criteria, deps.runDir, ids));
@@ -669,7 +681,7 @@ async function runTester(deps: AcceptanceDeps, criteria: Criteria, inputPath: st
       input = join(deps.runDir, "strong.md");
       writeFileSync(input, `${readFileSync(inputPath, "utf8")}\n## 说明\n上一位验收方没按要求留证据或输出格式不对，请你从头逐条实测；evidence/ 里已有的证据可以参考，但每条都要自己用工具再验一次。${dataStateNote(resetConfigured)}\n`);
     }
-    if (deps.deadline - deps.now() < 60_000) {
+    if (deps.deadline - deps.now() < (deps.boundedDeadline ? 1 : 60_000)) {
       error ||= "验收时间用完";
       break;
     }
@@ -690,7 +702,7 @@ async function runTester(deps: AcceptanceDeps, criteria: Criteria, inputPath: st
     if (resetFailure) return { report, error, escalated, resetFailure };
     if (systemDown()) break;
     const remaining = deps.deadline - deps.now();
-    if (remaining < 60_000) {
+    if (remaining < (deps.boundedDeadline ? 1 : 60_000)) {
       error ||= "验收时间用完";
       break;
     }
@@ -742,11 +754,30 @@ async function runTester(deps: AcceptanceDeps, criteria: Criteria, inputPath: st
   return { report, error: report ? "" : error, escalated, executionFailure, recovery, evidence: savedEvidence, processesReleased };
 }
 
-/**
- * 跑一轮验收。返回 judged 时由 review.ts 决定返修、暂停或继续评审；
- * paused 只用于不是开发方造成的情况（异议、标准缺失、端口被占用）。
- */
-export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<AcceptanceStage> {
+/** 判定报告可以是部分验证，但自动条目未通过不能发布完成；人工/不授权项仍单列。 */
+function requireAutomaticPass(stage: AcceptanceStage): AcceptanceStage {
+  if (stage.kind !== "judged" || !["通过", "部分验证"].includes(stage.record.verdict)) return stage;
+  const pending = stage.record.items.filter((item) => item.verdict !== "通过" && item.verdict !== "需人工");
+  if (pending.length === 0) return stage;
+  const notes = pending.map((item) => `${item.id}：${item.detail}`).join("；");
+  return {
+    kind: "paused", reason: `无法验收：${stage.record.scope?.kind === "retry" ? "定向复验" : "完整验收"}仍有自动条目未通过（${pending.map((item) => item.id).join("、")}）`,
+    notes, hint: `${notes}。请按具体阻塞原因处理后继续；只有用户能修改验收标准；程序不能将这些自动条目转成人工放行。材料：${stage.record.runDir}`,
+    attempts: stage.attempts ?? [stage.record],
+  };
+}
+
+/** 单轮验收执行接缝：只执行本轮冻结范围，不追加第二轮完整验收。 */
+export async function runAcceptanceOnce(deps: AcceptanceDeps): Promise<AcceptanceStage> { return requireAutomaticPass(await runAcceptanceAttempt(deps)); }
+
+async function runAcceptanceAttempt(deps: AcceptanceDeps): Promise<AcceptanceStage> {
+  const { acquireProjectExecution } = await import("./project-execution.ts");
+  const { consumerProblem } = await import("./local-node-queue.ts");
+  const release = await acquireProjectExecution(deps.workDir, "check", deps.procsFile ?? "", deps.signal, deps.checkLive);
+  try { return await runAcceptanceAttemptOwned(deps); }
+  finally { release(!consumerProblem(deps.procsFile ?? "") && !consumerProblem(`${deps.procsFile}.cleanup`)); }
+}
+async function runAcceptanceAttemptOwned(deps: AcceptanceDeps): Promise<AcceptanceStage> {
   const groups = findObjections(deps.deliveryNote);
   // 同一条旧回复只处理一次：记下回复指纹，用户回复后重复验收不再因它暂停。
   const replyKey = createHash("sha256").update(deps.deliveryNote).digest("hex");
@@ -766,8 +797,30 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
     const hint = authorizationHint(frozen, auth.pending);
     return { kind: "paused", reason: `等你授权（${auth.pending.join("、")}）`, notes: hint, hint };
   }
-  const criteria: Criteria = auth.denied.length === 0 ? frozen
+  const allCriteria: Criteria = auth.denied.length === 0 ? frozen
     : { ...frozen, items: frozen.items.map((item) => auth.denied.includes(item.id) ? { ...item, declined: true } : item) };
+  const signature = createHash("sha256").update(JSON.stringify([frozen, auth, deps.state.requirement, deps.config])).digest("hex");
+  const previous = deps.previous?.scope?.signature === signature ? deps.previous : undefined;
+  // 只有已确认通过的条目可暂时沿用；缺项、无法验证和历史无身份记录都要实测。
+  const passed = deps.explicitScope?.retained ?? previous?.items.filter((item) => item.verdict === "通过" && !forUser(item)
+    && allCriteria.items.some((criterion) => criterion.id === item.id && criterion.text === item.text)) ?? [];
+  const unresolved = allCriteria.items.filter((item) => !forUser(item) && !passed.some((entry) => entry.id === item.id));
+  const retry = deps.explicitScope ? deps.explicitScope.retained.length > 0 : !deps.fullCheck && passed.length > 0 && unresolved.length > 0
+    && previous?.blocker !== "系统被关掉" && !previous?.failureKind;
+  const retained = deps.explicitScope ? deps.explicitScope.retained : retry ? passed : [];
+  if (deps.explicitScope && allCriteria.items.some((item) => !forUser(item) && !deps.explicitScope!.ids.includes(item.id) && !retained.some((r) => r.id === item.id && r.text === item.text && r.verdict === "通过"))) throw new Error("本轮范围之外缺少可证明沿用的条目，未缩小验收标准");
+  const criteria: Criteria = deps.explicitScope ? { ...allCriteria, items: allCriteria.items.filter((item) => forUser(item) || deps.explicitScope!.ids.includes(item.id)) }
+    : retry ? { ...allCriteria, items: allCriteria.items.filter((item) => forUser(item) || unresolved.includes(item)) } : allCriteria;
+  const stamp = (record: AcceptanceRecord): AcceptanceRecord => {
+    record.scope = { kind: retry ? "retry" : "full", round: deps.round, signature,
+      tested: criteria.items.filter((item) => !forUser(item)).map((item) => item.id), reused: retained.map((item) => item.id) };
+    for (const item of record.items) {
+      if (retained.some((entry) => entry.id === item.id)) continue;
+      item.source = { round: deps.round, full: !retry, runDir: record.runDir };
+      if (!retry && item.verdict === "不通过" && passed.some((entry) => entry.id === item.id)) item.previouslyPassed = true;
+    }
+    return record;
+  };
 
   // 恢复或重复调用不能覆盖旧轮证据；新轮有独立目录，报告记录实际位置。
   if (existsSync(deps.runDir)) deps = { ...deps, runDir: `${deps.runDir}-${randomUUID().slice(0, 8)}` };
@@ -778,11 +831,11 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
     mkdirSync(runDir, { recursive: true });
     registerAcceptanceMaterials(deps.devSessionId, deps.workDir, runDir, deps.procsFile);
     if (deps.upstreamEpochs) writeFileSync(join(runDir, "upstream.json"), JSON.stringify(deps.upstreamEpochs, null, 2));
-    const record: AcceptanceRecord = {
-      ...judgeAcceptance({ criteria: criteria.items, evidence: () => undefined, logErrors: [], runDir, hasService: Boolean(config.start) }),
+    const record = stamp({
+      ...judgeAcceptance({ criteria: allCriteria.items, evidence: () => undefined, logErrors: [], runDir, hasService: Boolean(config.start) }),
       durationMs: 0,
       ...(methodDoubts.length ? { methodDoubts } : {}),
-    };
+    });
     writeFileSync(join(runDir, "result.json"), JSON.stringify(record, null, 2));
     return { kind: "judged", record };
   }
@@ -812,6 +865,7 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
   let resource: RunResource;
   try { resource = createRunResource(`acceptance:${deps.devSessionId}:r${deps.round}`, undefined, deps.procsFile); }
   catch (error) { return { kind: "paused", reason: `验收环境阻塞：${errorText(error)}`, hint: "释放已授权的资源或恢复容量后继续，业务返修次数保持不变。", failureKind: "environment" }; }
+  deps.registerResource?.(resource);
   deps = { ...deps, resource };
   let cleanupDone = (): void => {};
   const cleanupPath = join(runDir, "cleanup-task.json");
@@ -852,7 +906,7 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
         guide: config.guide ? readIfExists(config.guide) ?? `（操作说明文件读不到：${config.guide}）` : undefined,
         deliveryNote: deps.deliveryNote, previousFailed: deps.previousFailed, resetConfigured: Boolean(config.reset),
         authorized: auth.approved, methodDoubts,
-      }) + (config.actions ? "\n## 复用项目动作\n当前目录 actions/ 是项目提供的固定操作脚本，只按指南调用并通过 ./ev 留证据；不要重写已有步骤，不沿用旧验收结论。\n" : ""));
+      }) + (config.actions ? "\n## 复用项目动作\n当前目录 actions/ 是项目提供的固定操作脚本，只按指南调用并通过 ./ev 留证据；不要重写已有步骤；本次列出的条目必须留下新证据，结论沿用由程序负责记录。\n" : ""));
       // 系统一退出就停掉验收方和重置命令；外层取消也一并传下去。
       const testerAbort = new AbortController();
       const stopTester = (): void => testerAbort.abort();
@@ -870,7 +924,7 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
   } finally {
     try {
       try { await system?.stop(); } catch (error) { cleanup.push(`资源释放未确认：${errorText(error)}`); }
-      cleanup.push(...(system ? await cleanupPort(config, wallStart, exitDuringTest ? WATCH_PORT_MS : 0, resource.id) : []));
+      cleanup.push(...(system ? await cleanupPort(config, wallStart, exitDuringTest ? deps.boundedDeadline ? Math.max(0, Math.min(WATCH_PORT_MS, deps.deadline - deps.now())) : WATCH_PORT_MS : 0, resource.id) : []));
     } finally {
       try {
         if (config.cleanup) {
@@ -922,15 +976,15 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
     }
   }
   const judged = judgeAcceptance({
-    criteria: criteria.items, report: tester.report, reportError: tester.error,
+    criteria: allCriteria.items, retained, report: tester.report, reportError: tester.error,
     evidence: (id) => tester.evidence ? tester.evidence.get(id) : readIfExists(join(runDir, "evidence", `${id}.txt`)),
     testerDisconnected: tester.recovery ? [tester.recovery.reason, tester.recovery.error].filter(Boolean).join("；") : undefined,
     writtenScripts: scriptFiles(runDir).filter((path) => !initialScripts.has(path)),
     systemFailure, systemStopped, logErrors, runDir, hasService: Boolean(config.start),
   });
-  const record: AcceptanceRecord = { ...judged, durationMs: deps.now() - startedAt, ...(methodDoubts.length ? { methodDoubts } : {}) };
+  const record = stamp({ ...judged, durationMs: deps.now() - startedAt, ...(methodDoubts.length ? { methodDoubts } : {}) });
   const g1 = record.items.find((item) => item.id === "G1");
-  if (g1 && config.start) g1.execution = { commands: [config.start.length > 240 ? `${config.start.slice(0, 239)}…` : config.start], scripts: [] };
+  if (g1 && config.start) g1.execution = { commands: [config.start], scripts: [] };
   if (tester.recovery) record.recovery = tester.recovery;
   if (tester.executionFailure && !exitDuringTest) {
     record.verdict = "无法验收"; record.failureKind = tester.executionFailure.kind;
@@ -955,9 +1009,4 @@ export async function runAcceptanceStage(deps: AcceptanceDeps): Promise<Acceptan
   if (cleanup.length > 0) record.cleanup = cleanup;
   writeFileSync(join(runDir, "result.json"), JSON.stringify(record, null, 2));
   return { kind: "judged", record };
-}
-
-/** 运行目录：~/.pi-autoreview/<项目>/acceptance/<会话>/r<轮次>。 */
-export function acceptanceRunDir(baseDir: string, round: number): string {
-  return join(baseDir, `r${round}`);
 }

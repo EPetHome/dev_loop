@@ -6,14 +6,14 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export interface Touched { paths: string[]; command?: string }
-type Kind = "batch" | "config" | "guide";
+type Kind = "card" | "batch" | "config" | "guide" | "issue";
 export interface ProductionAction { files: { path: string; kind: Kind; root: string }[]; roots: string[] }
 const LOOP_ROOT = dirname(fileURLToPath(import.meta.url));
 
 /** 标题用真实完整标题，测试逐一核对；指路卡正文只维护这一份。 */
 export const PRODUCTION_RULES = [
   { file: "README-验收标准.md", sections: ["起草需求时写验收标准（自动验收 v7）", "起草任务提示词（自动评审 v2）"], description: "任务提示词与验收标准" },
-  { file: "README.md", sections: ["流水线与批次（几段并行 / 串行 + 整批验收）", "开工、启动、状态与合入（bin/loop）"], description: "批次配置与开工、启动、合入" },
+  { file: "README.md", sections: ["开发卡（第4步）"], description: "新卡、测试、重跑/改卡/放弃与统一合入（旧引擎已删除）" },
   { file: "项目文档/运行与维护.md", sections: ["项目配置示例", "迁移与检查"], description: "项目配置、方法与迁移" },
 ] as const;
 const ruleLine = (index: number): string => {
@@ -22,7 +22,9 @@ const ruleLine = (index: number): string => {
 };
 
 function pathKind(path: string): Kind | undefined {
+  if (/(?:^|\/)issues\/【(?:bug|req)】[^/]+\.md$/.test(path)) return "issue";
   if (/(?:^|\/)\.autoreview\.json$/.test(path)) return "config";
+  if (/(?:^|\/)开发卡\.json$/.test(path)) return "card";
   if (/(?:^|\/)docs\/batches\/.+\/批次\.json$/.test(path)) return "batch";
   if (/(?:^|\/)\.autoreview\/methods\/.+/.test(path) || /(?:^|\/)prompt\/提示词-[^/]+\.md$/.test(path)) return "guide";
   return undefined;
@@ -107,16 +109,23 @@ function pathCandidates(words: string[]): string[] {
 
 export function productionAction(touched: Touched, cwd = process.cwd()): ProductionAction | undefined {
   const files = new Map<string, ProductionAction["files"][number]>(), roots = new Set<string>();
-  const add = (value: string, base: string): void => {
+  const add = (value: string, base: string, explicitFile = false): void => {
     const path = resolve(base, value), kind = pathKind(path); // 范围外连文件系统都不访问。
     if (!kind) return;
-    const root = kind === "config" ? dirname(path) : projectRoot(dirname(path));
+    // 命令里的字符串只能用于只读校验，不能据此推断脚本实际写了哪个文件并移动它。
+    if (kind === "issue" && !explicitFile) return;
+    const issueRoot = dirname(dirname(path));
+    const root = kind === "issue" ? issueRoot : kind === "config" ? dirname(path) : projectRoot(dirname(path));
     if (!root) return;
+    if (kind === "issue" && !existsSync(join(root, ".autoreview.json"))) {
+      try { if (!readFileSync(join(root, "AGENTS.md"), "utf8").includes("README-验收标准.md#问题单")) return; }
+      catch { return; }
+    }
     // methods 必须属于标记根；嵌套目录中的同名业务路径不是项目方法。
     if (kind === "guide" && path.includes("/.autoreview/methods/") && !relative(root, path).startsWith(".autoreview/methods/")) return;
     files.set(path, { path, kind, root }); roots.add(root);
   };
-  for (const path of touched.paths) add(path, cwd);
+  for (const path of touched.paths) add(path, cwd, true);
   if (touched.command) {
     let base = resolve(cwd), segment: ShellWord[] = [];
     const visit = (): void => {
@@ -169,20 +178,20 @@ export function productionAction(touched: Touched, cwd = process.cwd()): Product
 function hasBatch(root: string): boolean {
   // 状态口径是仓库内 docs/batches/*/批次.json，不看解析默认值。
   const batches = join(root, "docs", "batches");
-  try { return readdirSync(batches, { withFileTypes: true }).some((entry) => entry.isDirectory() && existsSync(join(batches, entry.name, "批次.json"))); }
+  try { return readdirSync(batches, { withFileTypes: true }).some((entry) => entry.isDirectory() && (existsSync(join(batches, entry.name, "开发卡.json")) || existsSync(join(batches, entry.name, "批次.json")))); }
   catch { return false; }
 }
 
 export function productionCard(roots: string[]): string {
   const lines = ["Loop 规则按需读：", ...PRODUCTION_RULES.map((rule, index) => `- ${rule.description} → ${ruleLine(index)}`),
-    "完成后由程序提交并记录，推不推由用户决定；合入只由用户执行 bin/loop 合入（合入队列），不要在会话里手动 git 合并。"];
+    "新卡由程序提交并记账；前置结论有效后合入 dev 并推送 origin/dev；接受未验证须真实用户决定，也走 bin/loop 合入。不要手动 git 合并。旧开工、共用预算和 accept-cmd 已停用；原标准文只取写法，执行以新卡 flow/独立 limits 为准。"];
   const unmigrated = roots.filter((root) => {
     try {
       const raw = JSON.parse(readFileSync(join(root, ".autoreview.json"), "utf8"));
-      return raw && typeof raw === "object" && !["release", "workspaces", "methods"].some((key) => Object.hasOwn(raw, key)) && !hasBatch(root);
+      return raw && typeof raw === "object" && !["release", "methods"].some((key) => Object.hasOwn(raw, key)) && !hasBatch(root);
     } catch { return false; } // 配置错误由程序校验报告，不猜项目状态。
   });
-  if (unmigrated.length) lines.push(`本项目未接入批次流程，迁移见「迁移与检查」（${unmigrated.join("、")}）。`);
+  if (unmigrated.length) lines.push(`本项目尚无新卡/方法接入记录，迁移见「迁移与检查」（${unmigrated.join("、")}）。`);
   return lines.join("\n");
 }
 
@@ -198,6 +207,13 @@ export function resetProductionCard(host: string, session: string | undefined): 
 }
 
 export async function productionContext(action: ProductionAction, host: string, session: string | undefined): Promise<string | undefined> {
+  const issueRoots = [...new Set(action.files.filter((file) => file.kind === "issue").map((file) => file.root))];
+  const archiveOutput: string[] = [];
+  if (issueRoots.length) {
+    const { archiveResolvedIssues } = await import("./issue-archive.ts");
+    for (const root of issueRoots) archiveOutput.push(...archiveResolvedIssues(root, false, action.files.filter((file) => file.kind === "issue" && file.root === root).map((file) => file.path)).lines);
+    if (action.files.every((file) => file.kind === "issue")) return archiveOutput.join("\n") || undefined;
+  }
   const path = statePath(host, session);
   if (path) mkdirSync(path, { recursive: true, mode: 0o700 });
   // wx 原子占位，宿主并行工具也不会重复注入；各标记独立，无需长锁或清理猜测进程。
@@ -206,9 +222,9 @@ export async function productionContext(action: ProductionAction, host: string, 
     try { writeFileSync(join(path, name), "", { flag: "wx", mode: 0o600 }); return true; }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "EEXIST") return false; throw error; }
   };
-  const output: string[] = [];
+  const output: string[] = [...archiveOutput];
   if (claim("card")) output.push(productionCard(action.roots));
-  const configFiles = action.files.filter((file) => file.kind !== "guide");
+  const configFiles = action.files.filter((file) => file.kind === "card" || file.kind === "batch" || file.kind === "config");
   if (configFiles.length) {
     const { validateProductionFile } = await import("./production-loop-validation.ts");
     for (const file of configFiles) {
@@ -216,7 +232,7 @@ export async function productionContext(action: ProductionAction, host: string, 
       for (const report of await validateProductionFile(file)) {
         const key = createHash("sha256").update(JSON.stringify([file.path, report])).digest("hex");
         if (!claim(key)) continue;
-        output.push(`${file.path}：\n${report}\n规则见 ${ruleLine(file.kind === "batch" ? 1 : 2)}。`);
+        output.push(`${file.path}：\n${report}\n规则见 ${ruleLine(file.kind === "batch" || file.kind === "card" ? 1 : 2)}。`);
       }
     }
   }

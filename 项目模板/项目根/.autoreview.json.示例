@@ -1,8 +1,5 @@
 {
-  "release": "main",
-  "workspaces": {
-    "dev分支": "../<仓库目录名>-dev分支"
-  },
+  "release": "dev",
   "localFiles": [
     "deploy/acceptance/start.sh",
     "deploy/acceptance/reset-data.sh",
@@ -17,10 +14,6 @@
     "probe": "node -v"
   },
   "reviewTimeoutMin": 90,
-  "gate": {
-    "cmd": "sh .autoreview/methods/gate.sh check",
-    "timeoutMin": 35
-  },
   "acceptance": {
     "start": "sh deploy/acceptance/start.sh",
     "readyUrl": "http://127.0.0.1:38081/actuator/health",

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { classifyFailure, classifyTesterFailure, testerDiagnostics } from "../failure.ts";
+import { classifyFailure, classifyTesterFailure, recoveryDecision, testerDiagnostics } from "../failure.ts";
 import { classifySystemExit, judgeAcceptance } from "../acceptance-core.ts";
 
 const history = JSON.parse(readFileSync(new URL("./fixtures/failure-history.json", import.meta.url), "utf8"));
@@ -44,6 +44,76 @@ for (const sample of history.samples) test(`历史归因：${sample.category}`, 
     assert.equal(record.items[0].cause, "系统被关掉");
     assert.ok(record.items.every((item) => item.verdict === "无法验证"));
   }
+});
+
+test("准备/测试共用补装规则：只有明确 method 声明跳过，引用和推断不授予跳过资格", () => {
+  const config = { recover: "install", maxRecoveries: 2 };
+  for (const output of ["Error: Cannot find module 'core'", "opaque failure", "AssertionError: product failed", "AUTOREVIEW_FAILURE=product broken", "```text\nAUTOREVIEW_FAILURE=method example\n```\nopaque failure", "> AUTOREVIEW_FAILURE=method quote\nopaque failure"]) {
+    assert.equal(recoveryDecision(1, output, config, 1).allowed, true, output);
+  }
+  for (const [code, output] of [[78, "opaque failure"], [1, "AUTOREVIEW_FAILURE=method broken"], [75, "AUTOREVIEW_FAILURE=method broken\nError: ENOSPC"]] as const) {
+    assert.deepEqual(recoveryDecision(code, output, config, 1), { allowed: false, reason: "项目声明方法错误，未补装", remaining: 1 });
+  }
+  assert.equal(recoveryDecision(1, "opaque", undefined, 0).reason, "未配置 recover，未补装");
+  assert.deepEqual(recoveryDecision(1, "opaque", config, 2), { allowed: false, reason: "补装次数用完，未补装", remaining: 0 });
+});
+
+test("ENOSPC 只在通过名/标题里出现：真实产品断言与显式 product 不被吞掉", () => {
+  for (const passed of [
+    "ok 1 - ENOSPC 故障时保留证据", "# Subtest: ENOSPC 故障时保留证据\nok 1 - ENOSPC",
+    "test_ENOSPC_retains_evidence (StorageTests) ... ok", "PASS ENOSPC 故障时保留证据", "✓ ENOSPC fixture",
+    "ok 1 - mc: Storage backend has reached its minimum free drive threshold",
+  ]) {
+    const assertion = classifyFailure(1, `${passed}\nAssertionError: expected 2, got 1`);
+    assert.equal(assertion.kind, "product", passed); assert.doesNotMatch(assertion.reason, /存储空间不足/);
+    assert.equal(classifyFailure(1, `${passed}\nAUTOREVIEW_FAILURE=product 真实业务断言失败`).kind, "product", passed);
+    assert.equal(classifyFailure(1, `${passed}\nopaque failure`).kind, "unknown", "通过名及模糊失败不是当前故障证据");
+  }
+});
+
+test("真实 ENOSPC/存储错误优先于衍生断言，错误行及冲突声明保留", () => {
+  for (const error of [
+    "Error: ENOSPC: no space left on device, write '/tmp/report.json'", "Error: ENOSPC",
+    "Error [ENOSPC]: write failed", "# Error: ENOSPC: no space left on device, write",
+    "OSError: [Errno 28] No space left on device: '/tmp/report.json'",
+    "npm ERR! code ENOSPC", "write failed: ENOSPC", "sh: 1: cannot create /tmp/report: No space left on device",
+    "mc: Storage backend has reached its minimum free drive threshold",
+  ]) {
+    const output = `${error}\nAssertionError: evidence file is missing\nAUTOREVIEW_FAILURE=product 衍生断言失败`;
+    const failure = classifyFailure(1, output);
+    assert.equal(failure.kind, "environment", error); assert.match(failure.reason, /有效故障行/); assert.match(failure.reason, /冲突声明.*AUTOREVIEW_FAILURE=product/);
+    assert.ok(failure.reason.includes(error.replace(/^# /, "")), failure.reason);
+  }
+});
+
+test("声明/有效证据相矛盾时未知，不以任一文本猜产品责任", () => {
+  const cases = [
+    [1, "AUTOREVIEW_FAILURE=product 业务失败\nModuleNotFoundError: No module named runner", ["AUTOREVIEW_FAILURE=product", "ModuleNotFoundError"]],
+    [1, "AUTOREVIEW_FAILURE=method 检查入口坏了\nAssertionError: business result incorrect", ["AUTOREVIEW_FAILURE=method", "AssertionError"]],
+    [1, "AUTOREVIEW_FAILURE=environment 环境失败\nAssertionError: business result incorrect", ["AUTOREVIEW_FAILURE=environment", "AssertionError"]],
+    [1, "AUTOREVIEW_FAILURE=product 业务失败\nAUTOREVIEW_FAILURE=method 方法失败", ["AUTOREVIEW_FAILURE=product", "AUTOREVIEW_FAILURE=method"]],
+    [75, "AUTOREVIEW_FAILURE=product 业务失败", ["AUTOREVIEW_FAILURE=product", "退出码 75"]],
+  ] as const;
+  for (const [code, output, evidence] of cases) {
+    const failure = classifyFailure(code, output); assert.equal(failure.kind, "unknown", output); assert.match(failure.reason, /冲突/);
+    for (const text of evidence) assert.ok(failure.reason.includes(text), failure.reason);
+  }
+  assert.equal(classifyFailure(78, "AUTOREVIEW_FAILURE=method 检查方法不可用").kind, "method");
+  assert.equal(classifyFailure(1, "AUTOREVIEW_FAILURE=unknown 尚无归因\nAssertionError: business result incorrect").kind, "unknown");
+});
+
+test("孤立 ENOSPC、样本/引用/expected 与模糊非零输出不足归因", () => {
+  for (const output of [
+    "ENOSPC", "code: 'ENOSPC'", "opaque failure", "expected: Error: ENOSPC\nopaque failure",
+    '> Error: ENOSPC: no space left on device\nopaque failure',
+    '"Error: ENOSPC: no space left on device"\nopaque failure',
+    "```text\nError: ENOSPC: no space left on device\nAUTOREVIEW_FAILURE=product 样本\n```\nopaque failure",
+    "example: Error: ENOSPC\nopaque failure", "Error: expected ENOSPC but got opaque response",
+    "ok 1 - No space left on device / disk full failure example\nopaque failure",
+    "> mc: Storage backend has reached its minimum free drive threshold\nopaque failure",
+    "```text\nmc: Storage backend has reached its minimum free drive threshold\n```\nopaque failure",
+  ]) assert.equal(classifyFailure(1, output).kind, "unknown", output);
+  assert.equal(classifyFailure(1, "expected: ENOSPC\nAssertionError: actual product bug").kind, "product");
 });
 
 test("验收方故障不混入产品：限流、无活动、退出信号；资源释放故障优先且保留具体原因", () => {

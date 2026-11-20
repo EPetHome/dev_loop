@@ -2,6 +2,7 @@
  * PostToolUse 使用 tool_input.command（不是 Codex 调用工具时的 cmd）；真实抓样本留给 A9。
  * 全部仓库、HOME、采样和加载探针都在本测试创建的系统临时目录，结束释放。
  */
+import "./helpers/git-runtime.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -16,9 +17,9 @@ import { touchedBy } from "../hosts/hook.ts";
 const ROOT = fileURLToPath(new URL("..", import.meta.url)), HOOK = join(ROOT, "hosts", "hook.ts");
 type Host = "claude" | "codex";
 const hosts: Host[] = ["claude", "codex"];
-const batchFile = "docs/batches/x/批次.json", promptFile = "docs/prompt/提示词-x.md";
+const batchFile = "docs/batches/x/开发卡.json", promptFile = "docs/prompt/提示词-x.md";
 
-function fixture(marker: Record<string, unknown> | null = {}) {
+function fixture(marker: Record<string, unknown> | null = { acceptance: {} }) {
   const temp = mkdtempSync(join(tmpdir(), "loop-production-")), repo = join(temp, "repo"), home = join(temp, "home");
   mkdirSync(repo); mkdirSync(home);
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", AUTOREVIEW_DEV_ROOT: "" };
@@ -27,7 +28,7 @@ function fixture(marker: Record<string, unknown> | null = {}) {
     const result = spawnSync("git", args, { cwd: repo, env, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
   };
-  git("init", "-q", "-b", "main"); git("config", "user.email", "production@example.test"); git("config", "user.name", "production");
+  git("init", "-q", "-b", "dev"); git("config", "user.email", "production@example.test"); git("config", "user.name", "production");
   const write = (path: string, text: string): void => { const file = join(repo, path); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, text); };
   write("business.ts", "export const value = 1;\n");
   if (marker) write(".autoreview.json", JSON.stringify(marker));
@@ -44,13 +45,14 @@ registerHooks({resolve(specifier,context,next){const result=next(specifier,conte
   const editEvent = (host: Host, path: string, session = "one", tool = "Edit") => host === "claude"
     ? event(host, tool, { file_path: join(repo, path), old_string: "old", new_string: "new" }, session)
     : event(host, "apply_patch", { command: tool === "Write" ? `*** Begin Patch\n*** Add File: ${path}\n+new\n*** End Patch` : `*** Begin Patch\n*** Update File: ${path}\n@@\n-old\n+new\n*** End Patch` }, session);
-  const run = (input: object | string, extra: NodeJS.ProcessEnv = {}, probe = false) => {
+  const run = (input: object | string, extra: NodeJS.ProcessEnv = {}, probe = false, warning?: RegExp) => {
     const start = performance.now();
     const result = spawnSync(process.execPath, ["--disable-warning=MODULE_TYPELESS_PACKAGE_JSON", ...(probe ? ["--import", guard] : []), HOOK], {
       cwd: repo, env: { ...env, ...extra }, input: typeof input === "string" ? input : JSON.stringify(input), encoding: "utf8", timeout: 15_000,
     });
     assert.equal(result.status, 0, result.stderr || String(result.error));
-    assert.equal(result.stderr, "", result.stderr);
+    if (warning) assert.match(result.stderr, warning);
+    else assert.equal(result.stderr, "", result.stderr);
     return { stdout: result.stdout, ms: performance.now() - start };
   };
   const context = (stdout: string): string => {
@@ -60,15 +62,16 @@ registerHooks({resolve(specifier,context,next){const result=next(specifier,conte
     assert.equal(parsed.hookSpecificOutput.hookEventName, "PostToolUse");
     return parsed.hookSpecificOutput.additionalContext;
   };
-  const valid = () => JSON.stringify({ name: "x", branch: "feat/x", stages: { 甲: { prompt: "../../prompt/提示词-x.md" } } });
+  const valid = () => JSON.stringify({ version: 1, name: "x", nature: "开发", target: "dev", flow: ["开发评审"], tasks: [{ name: "甲", prompt: "../../prompt/提示词-x.md", scope: ["business.ts"] }] });
   return { temp, repo, home, env, git, write, event, editEvent, run, context, valid, forbidden, close: () => rmSync(temp, { recursive: true, force: true }) };
 }
 
 function assertCard(text: string): void {
   assert.ok(text.split("\n").length <= 6, text);
   for (const rule of PRODUCTION_RULES) assert.ok(text.includes(join(ROOT, rule.file)), rule.file);
-  assert.match(text, /完成后由程序提交并记录，推不推由用户决定/);
-  assert.match(text, /合入只由用户执行 bin\/loop 合入（合入队列），不要在会话里手动 git 合并/);
+  assert.match(text, /前置结论有效后合入 dev 并推送 origin\/dev/);
+  assert.match(text, /旧开工、共用预算和 accept-cmd 已停用[\s\S]*新卡 flow\/独立 limits/);
+  assert.match(text, /接受未验证须真实用户决定，也走 bin\/loop 合入。不要手动 git 合并/);
   assert.doesNotMatch(text, /merge\.auto|由程序自动合入|复制到项目|\.autoreview\/CONVENTIONS\.md|收尾回写/);
 }
 
@@ -109,7 +112,7 @@ test("A2/A7 首次写提示词才给卡，正确批次无输出；开发会话�
   }
 });
 
-test("A3/A7 编辑与 Bash 重定向都复用开工报错、同会话去重，改对后静默", () => {
+test("A3/A7 编辑与 Bash 重定向复用新卡解析，旧开工迁移拒绝；同会话去重、改正静默", () => {
   for (const host of hosts) for (const dev of [false, true]) for (const bash of [false, true]) {
     const h = fixture();
     try {
@@ -117,11 +120,11 @@ test("A3/A7 编辑与 Bash 重定向都复用开工报错、同会话去重，�
       const cli = spawnSync(process.execPath, [join(ROOT, "loop.ts"), "开工", join(h.repo, batchFile), "--dry-run", "--json"], { cwd: h.repo, env: h.env, encoding: "utf8" });
       assert.equal(cli.status, 1, cli.stdout + cli.stderr);
       const error = JSON.parse(cli.stdout).error;
-      assert.equal(error, "批次文件的 stages 必须是对象");
+      assert.match(error, /旧批次.*已停用/);
       const event = bash ? h.event(host, "Bash", { command: `printf '%s' '{"name":"x"}' > '${batchFile}'` }) : h.editEvent(host, batchFile);
       const env = dev ? { AUTOREVIEW_DEV_ROOT: h.repo } : {};
       const text = h.context(h.run(event, env).stdout);
-      assert.ok(text.includes(error), text); assert.ok(text.includes(join(ROOT, "README.md"))); assert.match(text, /「流水线与批次/);
+      assert.match(text, /开发卡 version 必须是 1/); assert.ok(text.includes(join(ROOT, "README.md"))); assert.match(text, /「开发卡（第4步）/);
       assert.equal((text.match(/Loop 规则按需读/g) ?? []).length, 1);
       assert.equal(h.run(event, env).stdout, "");
       h.write(promptFile, "# 提示词\n"); h.write(batchFile, h.valid());
@@ -131,7 +134,7 @@ test("A3/A7 编辑与 Bash 重定向都复用开工报错、同会话去重，�
   }
 });
 
-test("返修 1：两宿主 heredoc 写入即时校验；只读脚本静默、报错去重、改正后静默", () => {
+test("生产指路／两宿主 heredoc 写入即时校验；只读脚本静默、报错去重、改正后静默", () => {
   for (const host of hosts) {
     const h = fixture();
     try {
@@ -147,7 +150,7 @@ test("返修 1：两宿主 heredoc 写入即时校验；只读脚本静默、报
       assert.equal(result.status, 0, result.stderr);
       const text = h.context(h.run(event(write)).stdout);
       assertCard(text.split("\n\n")[0]);
-      assert.match(text, /批次文件的 stages 必须是对象/); assert.ok(text.includes(join(ROOT, "README.md")));
+      assert.match(text, /开发卡 version 必须是 1/); assert.ok(text.includes(join(ROOT, "README.md")));
       assert.equal(h.run(event(write)).stdout, "", "同文件同报错去重");
       const correct = script(`Path("${batchFile}").write_text(${JSON.stringify(h.valid())})`);
       const corrected = spawnSync("/bin/sh", ["-c", correct], { cwd: h.repo, env: h.env, encoding: "utf8" });
@@ -160,7 +163,7 @@ test("返修 1：两宿主 heredoc 写入即时校验；只读脚本静默、报
   }
 });
 
-test("返修 1：heredoc 保留引号和命令归属，支持分隔符变体、cd、多文档及 shell 只读正文", () => {
+test("生产指路／heredoc 保留引号和命令归属，支持分隔符变体、cd、多文档及 shell 只读正文", () => {
   const h = fixture();
   try {
     const body = `from pathlib import Path\nPath("${batchFile}").write_text('{"name":"x"}')`;
@@ -173,7 +176,7 @@ test("返修 1：heredoc 保留引号和命令归属，支持分隔符变体、c
       `bash <<'SH' > '${batchFile}'\nprintf '%s' '{"name":"x"}'\nSH\n`,
       `python3 - <<-PY\n${body.split("\n").map((line) => `\t${line}`).join("\n")}\n\tPY\n`,
       `python3 - <<'PY'; printf done\n${body}\nPY\n`,
-      `cd docs/batches/x && python3 - <<'PY'\nfrom pathlib import Path\nPath("批次.json").write_text('{}')\nPY\n`,
+      `cd docs/batches/x && python3 - <<'PY'\nfrom pathlib import Path\nPath("开发卡.json").write_text('{}')\nPY\n`,
       `cat <<'TEXT'; python3 - <<'PY'\nPath("docs/batches/not-written/批次.json").write_text('{}')\nTEXT\n${body}\nPY\n`,
       `node <<'JS'\nrequire('node:fs').writeFileSync("${batchFile}", '{"name":"x"}');\nJS\n`,
     ];
@@ -200,14 +203,10 @@ test("A4 提示词/验收标准尚未写出只提示尚未找到，不当错误"
       const missing = h.context(h.run(h.editEvent(host, batchFile)).stdout);
       assert.match(missing, /尚未找到：.*提示词-x\.md/); assert.doesNotMatch(missing, /错误|不存在/);
       h.write(promptFile, "# 已写出\n"); assert.equal(h.run(h.editEvent(host, batchFile)).stdout, "");
-      for (const key of ["acceptance", "e2e"]) { // 兼容旧批次字段的缺文件提示。
-        const raw = JSON.parse(h.valid()); raw[key] = { workDir: ".", criteria: "验收标准.md" };
-        h.write(batchFile, JSON.stringify(raw));
-        const context = h.context(h.run(h.editEvent(host, batchFile, key)).stdout);
-        assert.match(context, /尚未找到：.*验收标准\.md/);
-        if (key === "acceptance") assert.doesNotMatch(context, /旧写法|建议改成/);
-        else assert.match(context, /旧写法，建议改成 acceptance/);
-      }
+      const raw = JSON.parse(h.valid()); raw.flow.push("验收"); raw.acceptance = "验收标准.md"; h.write(batchFile, JSON.stringify(raw));
+      assert.match(h.context(h.run(h.editEvent(host, batchFile, "acceptance")).stdout), /尚未找到：.*验收标准\.md/);
+      h.write(batchFile, JSON.stringify({ stages: { 甲: {} }, e2e: { criteria: "旧标准.md" } }));
+      assert.match(h.context(h.run(h.editEvent(host, batchFile, "e2e")).stdout), /旧批次格式已停用/);
     } finally { h.close(); }
   }
 });
@@ -219,7 +218,7 @@ test("A5 项目状态只看原始字段或批次文件；启动只指路，不�
       if (["release", "workspaces", "methods"].includes(state)) h.write(".autoreview.json", JSON.stringify({ [state]: state === "release" ? "main" : {} }));
       if (state === "batch") h.write(batchFile, "{}");
       const card = h.context(h.run(h.event(host, "Bash", { command: "/opt/loop/bin/pi-dev --cwd . docs/prompt/提示词-x.md" })).stdout);
-      assertCard(card); assert.equal(card.includes("本项目未接入批次流程"), state === "old");
+      assertCard(card); assert.equal(card.includes("本项目尚无新卡/方法接入记录"), ["old", "workspaces"].includes(state));
       if (state === "old") assert.match(card, /迁移见「迁移与检查」/);
     } finally { h.close(); }
   }
@@ -234,7 +233,7 @@ test("A6 compact 后重给卡，保留报错去重；宿主/session_id 隔离", 
       const session = { ...h.event(host, "", {}), hook_event_name: "SessionStart", source: "compact" };
       assert.equal(h.run(session).stdout, "");
       const card = h.context(h.run(h.editEvent(host, batchFile)).stdout);
-      assertCard(card); assert.doesNotMatch(card, /stages 必须/);
+      assertCard(card); assert.doesNotMatch(card, /开发卡 version 必须/);
       assert.equal(h.run(h.editEvent(host, promptFile)).stdout, "");
       assertCard(h.context(h.run(h.editEvent(host, promptFile, "two")).stdout));
     }
@@ -244,7 +243,6 @@ test("A6 compact 后重给卡，保留报错去重；宿主/session_id 隔离", 
 test("项目配置复用布局/acceptance/gate/评审解析；程序报错原文并指向运行维护", () => {
   const cases = [
     ['{"methods":{"paths":[]}}', ".autoreview.json 的 methods.paths 必须是非空字符串数组"],
-    ['{"gate":{}}', ".autoreview.json 的 gate.cmd 必须写（门禁命令）"],
     ['{"acceptance":{"readyUrl":"bad"}}', ".autoreview.json 的 acceptance.readyUrl 不是合法网址"],
     ['{"maxRepairs":-1}', ".autoreview.json 的 maxRepairs 必须是非负整数"],
     ["[]", ".autoreview.json 必须是 JSON 对象"],
@@ -258,6 +256,9 @@ test("项目配置复用布局/acceptance/gate/评审解析；程序报错原文
         assert.ok(text.includes(expected), text); assert.ok(text.includes(join(ROOT, "项目文档/运行与维护.md")));
         assert.equal(h.run(h.editEvent(host, ".autoreview.json")).stdout, "");
       }
+      h.write(".autoreview.json", '{"gate":{}}');
+      const ignored = h.run(h.editEvent(host, ".autoreview.json"));
+      assert.equal(ignored.stdout, "");
       h.write(".autoreview.json", "{}"); assert.equal(h.run(h.editEvent(host, ".autoreview.json")).stdout, "");
     } finally { h.close(); }
   }

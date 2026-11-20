@@ -3,15 +3,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { EXT_DIR, findProjectRoot, PERMISSION_EXT, PI_BIN } from "../config.ts";
-import { endHostExperienceSessions, hookPaths, loadConfig } from "./review-hook.ts";
-import { launchHookHost } from "./inbox-bridge.ts";
-import { registeredQueueBatch } from "../merge-queue.ts";
-import { readJson } from "../pipeline-core.ts";
+import { endHostExperienceSessions, loadConfig } from "./review-hook.ts";
 import { processStartTime } from "../procs.ts";
+import { nativeLaunch } from "./native-inbox.ts";
+import { readTaskRun, updateTaskRun } from "../node-ledger.ts";
 
 const HELP = `用法：bin/loop-dev <claude|codex> [任务文件] [选项] [-- 宿主参数…]
   --cwd <目录>       开发目录，默认当前目录
@@ -25,10 +24,10 @@ CLAUDE_BIN / CODEX_BIN 可指定程序；不安装、升级或修改全局配置
 type Host = "claude" | "codex";
 const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 
-export function launchArgs(host: Host, prompt?: string, session?: string, extra: string[] = []): string[] {
+export function launchArgs(host: Host, prompt?: string, session?: string, extra: string[] = [], parallel = false): string[] {
   const args = host === "claude"
     ? ["--permission-mode", "auto", ...(session ? ["--resume", session] : [])]
-    : [...(session ? ["resume", session] : []), "--approve-for-me"];
+    : parallel ? ["exec", "--approve-for-me", ...(session ? ["resume", session] : [])] : [...(session ? ["resume", session] : []), "--approve-for-me"];
   args.push(...extra);
   // 保留 @引用：文件里的“同意授权”不能变成亲手输入的授权。
   if (prompt) {
@@ -113,18 +112,20 @@ export function main(argv = process.argv.slice(2)): void {
   if (prompt && (!statSync(prompt).isFile() || statSync(prompt).size > 200 * 1024 || readFileSync(prompt).includes(0))) {
     throw new Error("任务文件须为不超过 200KB 的文本文件（与 Hook 读取上限一致）");
   }
-  const args = launchArgs(host, prompt, values.session, extra);
+  const parallel = Boolean(process.env.AUTOREVIEW_KERNEL_TASK);
+  const args = launchArgs(host, prompt, values.session, extra, parallel);
   const root = findProjectRoot(cwd);
   if (root) loadConfig(root);
-  else if (!values.init) throw new Error("项目没有 .autoreview.json；首次接入加 --init，或先配置已有的门禁和验收方法");
+  else if (!values.init) throw new Error("项目没有 .autoreview.json；首次接入加 --init，或先配置已有的验收方法");
   run("git", ["rev-parse", "--verify", "HEAD"], cwd);
   for (const path of [PI_BIN, PERMISSION_EXT]) if (!existsSync(path)) throw new Error(`现有评审引擎缺少：${path}`);
   const command = resolveHost(host);
   const help = run(command, ["--help"], cwd);
   if (!help.includes(host === "claude" ? '"auto"' : "--approve-for-me")) throw new Error(`${host} 当前版本不支持所需自动审批入口`);
+  if (parallel && host === "codex" && (!run(command, ["exec", "--help"], cwd).includes("--approve-for-me") || !run(command, ["exec", "resume", "--help"], cwd).includes("SESSION_ID"))) throw new Error("多任务 Codex 需要支持 exec --approve-for-me 与精确 exec resume；未启动，不使用共享终端或猜最近会话");
   checkPlugin(host, JSON.parse(run(command, ["plugin", "list", ...(host === "codex" ? ["--marketplace", "autoreview-local"] : []), "--json"], cwd)));
   if (values["dry-run"]) {
-    if (!root) console.log(`启动时将新建 ${join(cwd, ".autoreview.json")}（仅开启评审，门禁和验收未配置）`);
+    if (!root) console.log(`启动时将新建 ${join(cwd, ".autoreview.json")}（仅开启评审，自动验收未配置；Loop 未运行测试）`);
     const devRoot = root ?? cwd;
     // 无空格时打印成可直接核对的 KEY=值；有空格再按 shell 规则加引号。
     console.log(`cd ${quote(cwd)}\nAUTOREVIEW_DEV_ROOT=${/\s/.test(devRoot) ? quote(devRoot) : devRoot}\n${[command, ...args].map(quote).join(" ")}`);
@@ -132,7 +133,7 @@ export function main(argv = process.argv.slice(2)): void {
     return;
   }
   if (!root) writeFileSync(join(cwd, ".autoreview.json"), "{}\n", { flag: "wx" });
-  console.error(`[Loop] ${host} 开发宿主；评审与验收沿用 Pi 引擎。${host === "codex" ? "若提示 Hook 未信任，先在 /hooks 审阅并信任。" : ""}`);
+  console.error(`[Loop] ${host} 开发宿主；仅静态评审沿用共享引擎，不自动验收或提交。${host === "codex" ? "若提示 Hook 未信任，先在 /hooks 审阅并信任。" : ""}`);
   const runId = randomUUID();
   const env = { ...hostEnv(cwd, root), AUTOREVIEW_DEV_RUN_ID: runId, AUTOREVIEW_DEV_PID: String(process.pid), AUTOREVIEW_DEV_STARTED: processStartTime(process.pid) };
   const finished = (code: number | null, signal: NodeJS.Signals | null) => {
@@ -140,16 +141,15 @@ export function main(argv = process.argv.slice(2)): void {
     catch (error) { console.error(`[Loop] 宿主退出后的经验活动登记未确认，批准保持阻挡：${(error as Error).message}`); }
     process.exitCode = code ?? (signal === "SIGINT" ? 130 : 1);
   };
-  const batch = process.env.AUTOREVIEW_BATCH_FILE && process.env.AUTOREVIEW_STAGE
-    ? registeredQueueBatch(cwd, process.env.AUTOREVIEW_BATCH_FILE) : undefined;
-  const stage = batch?.stages.find((item) => item.name === process.env.AUTOREVIEW_STAGE && realpathSync(item.cwd) === cwd);
-  if (batch && stage) {
-    launchHookHost({ command, args, cwd, env, dir: batch.dir, stage: stage.name, host, token: runId, onExit: finished,
-      isIdle: (status) => {
-        const paths = hookPaths(root ?? cwd, host, status.sessionId);
-        const state = readJson<{ phase: string; awaitingRepair?: boolean; resumeAfterInputChange?: boolean }>(paths.state);
-        return state?.phase === "done" && !state.awaitingRepair && !state.resumeAfterInputChange && !existsSync(paths.lock);
-      } });
+  if (process.env.AUTOREVIEW_KERNEL_LEDGER) {
+    const path = process.env.AUTOREVIEW_KERNEL_LEDGER, task = process.env.AUTOREVIEW_KERNEL_TASK, run = readTaskRun(path, task), launch = process.env.AUTOREVIEW_KERNEL_LAUNCH;
+    if (run.id !== process.env.AUTOREVIEW_KERNEL_RUN || cwd !== run.worktree || !launch) throw new Error("新卡原生宿主启动身份不符");
+    const native = nativeLaunch(command, args, host, cwd, env);
+    const binding = native.socket ? join(dirname(native.socket), "kernel-binding.json") : join(run.dir, `native-${launch}.json`);
+    const child = spawn(command, native.args, { cwd, stdio: "inherit", env: { ...native.env, AUTOREVIEW_KERNEL_NATIVE_BINDING: binding } });
+    if (child.pid) updateTaskRun(path, task, (r) => { r.native = { launch, command, childPid: child.pid!, childStarted: processStartTime(child.pid!), binding }; });
+    child.on("error", (error) => { native.cleanup(); console.error(error.message); process.exitCode = 1; });
+    child.on("exit", (code, signal) => { native.cleanup(); finished(code, signal); });
   } else {
     const child = spawn(command, args, { cwd, stdio: "inherit", env });
     child.on("error", (error) => { console.error(error.message); process.exitCode = 1; });

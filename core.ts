@@ -1,13 +1,14 @@
 /**
  * core.ts — 纯函数集合，不导入 pi。
  *
- * 负责：交付标记判断、评审输出解析、下一步决策、返修消息拼接（评审、门禁）、
+ * 负责：交付标记判断、评审输出解析、下一步决策、返修消息拼接（评审）、
  * 评审输入拼接、总结渲染、注入给开发方的约定。所有函数可被 Node 直接单测。
  */
 import { createHash } from "node:crypto";
+import { LOOP_TEST_STATUS } from "./config.ts";
 import { relaySourceLines } from "./pa-records.ts";
 import {
-  ACCEPTANCE_CONVENTION, authorizationLine, formatCriteria, renderAcceptanceLines, type AcceptanceRecord, type Criteria, type Grants,
+  authorizationLine, formatCriteria, renderAcceptanceLines, type AcceptanceRecord, type Criteria, type Grants,
 } from "./acceptance-core.ts";
 
 export const MARKER_DELIVERED = "【交付完成】";
@@ -19,26 +20,14 @@ export const CONVENTION = [
   "- 需要用户决定时，最后一行写【需要你决定】。",
   "- 收到「自动评审」消息后，逐条写「第 N 条：已修」或「第 N 条：异议：理由」。",
   "- 需求可能只写了目标、已拍板、边界和验收标准：现状自己读代码了解，没写到的细节按现有代码习惯做，拿不准的写进交付说明。",
+  "- 开发方自行做改动相关的定向自检；Loop 不运行、不判定项目测试，交付记录统一写「Loop 未运行测试」。",
 ].join("\n");
 
-/** 配了门禁（.autoreview.json 的 gate）时追加在开发约定后面注入。 */
-export function gateConvention(command: string): string {
-  return [
-    "【门禁约定】",
-    `- 开发时做改动相关的定向自测；交付后由程序统一执行完整门禁：${command}。不要求你在交付前重复执行同一份完整门禁。`,
-    "- 产品检查失败会带证据返回原会话；明确环境和检查方法故障不计业务返修。原因不明时先诊断，不修改产品绕过检查。",
-  ].join("\n");
-}
-
-/** 注入给开发方的约定全文：开发约定，配了验收再追加验收约定，配了门禁再追加门禁约定。 */
-export function conventionText(options: { acceptance?: boolean; gate?: string; experience?: string } = {}): string {
-  return [CONVENTION, options.acceptance ? ACCEPTANCE_CONVENTION : "", options.gate ? gateConvention(options.gate) : "", options.experience ?? ""]
+/** 正常单会话的开发约定；不根据旧 acceptance 配置追加隐含流程。 */
+export function conventionText(options: { singleNode?: boolean; experience?: string } = {}): string {
+  return [CONVENTION, options.singleNode ? "本次只有开发评审节点；测试、验收：没验证（本次未安排）。不运行旧后置验收命令。" : "", options.experience ?? ""]
     .filter(Boolean).join("\n");
 }
-
-/** 返修消息和总结里保留的门禁输出：最后 40 行，最多 4000 字。 */
-export const GATE_TAIL_LINES = 40;
-const GATE_TAIL_CHARS = 4000;
 /** 超过这个字节数的 diff 不再原文附给评审。 */
 export const MAX_DIFF_BYTES = 200 * 1024;
 
@@ -67,59 +56,25 @@ export type RoundRecord = ParsedReview & {
   durationMs: number;
   /** 本轮实际输入与完整工作区字节的本机保留类快照。 */
   snapshot?: string;
+  /** 实际静态调用的释放事实；false 不得凭空登记/空缓存核销。 */
+  consumersReleased?: boolean;
   /** 本轮评审失败时的错误摘要。 */
   failed?: string;
+  /** 各次失败调用的完整原文；文件唯一，不被重试或下一轮覆盖。 */
+  reviewLogs?: string[];
   /** 本轮的验收结果（配了 acceptance 时）。 */
   acceptance?: AcceptanceRecord;
-  /** 本轮的门禁结果（配了 gate 时）。 */
-  gate?: GateRecord;
+  /** 只读历史：旧组合轮次按当时实际执行顺序展示，不触发重放。 */
+  acceptanceAttempts?: AcceptanceRecord[];
+  /** 评审前的越界检查失败，不冒充测试或静态评审。 */
+  scope?: { files: string[]; logPath?: string };
   /** 验收后置时，整体轮次可能未通过；单独保留已取得的静态评审结论。 */
   reviewConclusion?: string;
 };
 
-/**
- * 门禁的一次执行。只有命令跑完并且退出码非 0 才算「不通过」打回开发方；
- * 超时、命令找不到（126/127）、起不来都暂停，不冤枉开发方。
- */
-export interface GateRecord {
-  command: string;
-  result: "通过" | "不通过" | "超时" | "无法执行" | "环境阻塞" | "检查方法故障" | "原因待诊断";
-  failureKind?: import("./failure.ts").FailureKind;
-  durationMs: number;
-  exitCode?: number;
-  /** 输出最后几行（stdout 与 stderr 按出现顺序合在一起）。 */
-  outputTail?: string;
-  /** 完整输出所在的日志文件。 */
-  logPath?: string;
-  detail?: string;
-  cleanup?: string;
-}
-
-/** 验收命令（--autoreview-accept-cmd）的一次执行；与自动验收无关，只有 pi 扩展配置了验收命令时才有。 */
-export interface AcceptRunRecord {
-  command: string;
-  trigger: "auto" | "command";
-  /** 触发时已完成的评审轮数。 */
-  round: number;
-  startedAt: string;
-  result: "进行中" | "通过" | "不通过" | "超时" | "中断" | "无法执行";
-  durationMs?: number;
-  exitCode?: number;
-  /** 完整输出所在的日志文件。 */
-  logPath?: string;
-  /** 输出最后几行，写进总结。 */
-  outputTail?: string;
-  detail?: string;
-  /** required 必须通过才允许段接力；advisory 只记录附加检查。 */
-  mode?: "required" | "advisory";
-  candidate?: string;
-  readyEpoch?: string;
-  inputsFingerprint?: string;
-  failureKind?: import("./failure.ts").FailureKind;
-  cleanup?: string;
-}
-
 export interface SummaryInput {
+  singleNode?: boolean;
+  acceptanceConfigured?: boolean;
   cwd: string;
   devSessionId: string;
   reviewerSessionId: string;
@@ -141,14 +96,15 @@ export interface SummaryInput {
   unresolvedAcceptance?: string;
   /** 需要你做的事（暂停时怎么继续、人工验收的条目、接入提醒），放在总结开头。 */
   todos?: string[];
-  /** 最近一次验收命令的执行结果。 */
-  acceptRun?: AcceptRunRecord;
   /** 开发基线之后开发方新增的提交数（只记录，不评判）。 */
   newCommits?: number;
   /** 开发期间发现变化的来源文件与时间。 */
   sourceChanges?: { path: string; at: string }[];
   /** 拿不到文件列表时的说明（如「来源有变化（第 3 版）」）。 */
   sourceChangeNote?: string;
+  loopConfigChanges?: import("./config-audit.ts").ConfigChange[];
+  pauseDetail?: import("./blockers.ts").PauseDetail;
+  blockerHistory?: string[];
   /** 本次完成已登记的交付总表；只在状态为完成时写进总结开头。 */
   ledger?: { path: string; pending: { id: string; kind: "部分验证" | "人工" }[]; failed?: boolean };
   /** 完成后的运行材料瘦身结果；删除失败仅提示。 */
@@ -172,8 +128,6 @@ export interface ReviewInputOptions {
   untracked: string[];
   /** 此前验收记录，仅供静态评审复查，不能作为当前候选已验收的依据。 */
   acceptance?: string;
-  /** 本轮通过的门禁命令（门禁通过后才会评审）。 */
-  gate?: string;
 }
 
 /** 判断开发方最后一条回复的标记：只看最后一个非空行。 */
@@ -271,43 +225,6 @@ export function buildRepairMessage(repairRound: number, mustFixRaw: string): str
   ].join("\n");
 }
 
-/** 门禁输出的尾巴：最后 GATE_TAIL_LINES 行，再按字数截一次（单行很长时也不撑爆返修消息）。 */
-export function gateOutputTail(output: string): string {
-  const lines = output.trimEnd().split(/\r?\n/).slice(-GATE_TAIL_LINES).join("\n");
-  return lines.length <= GATE_TAIL_CHARS ? lines : `…${lines.slice(-GATE_TAIL_CHARS)}`;
-}
-
-/** 门禁结果的一句话写法，返修消息、总结共用。 */
-export function gateLabel(record: GateRecord): string {
-  return record.result === "不通过" ? `不通过（退出码 ${record.exitCode ?? "未知"}）` : record.result;
-}
-
-/** 发回开发方的门禁返修消息：命令、退出码、输出尾巴和完整日志位置。 */
-export function buildGateRepairMessage(repairRound: number, record: GateRecord): string {
-  return [
-    `【门禁 · 第 ${repairRound} 次返修】`,
-    `门禁命令${gateLabel(record)}，这一轮没有验收、没有评审。`,
-    "",
-    `$ ${record.command}`,
-    `输出最后 ${GATE_TAIL_LINES} 行：`,
-    "```text",
-    record.outputTail?.trim() || "（没有输出）",
-    "```",
-    ...(record.logPath ? [`完整输出：${record.logPath}`] : []),
-    "",
-    "根据失败证据定位根因及相关调用方，修复后做必要的定向自测；完整门禁由程序重跑，不必再次自跑整套。修好了最后一行写【交付完成】。无法归因时如实说明，不更改产品或检查标准凑通过。",
-  ].join("\n");
-}
-
-/** 总结里一轮门禁的几行；没通过时带输出尾巴。 */
-export function renderGateLines(record: GateRecord): string[] {
-  const lines = [`门禁：${gateLabel(record)}（耗时 ${Math.round(record.durationMs / 1000)} 秒${record.logPath ? `；完整输出：${record.logPath}` : ""}）`];
-  if (record.detail) lines.push(`门禁说明：${record.detail}`);
-  if (record.cleanup) lines.push(`资源：${record.cleanup}`);
-  if (record.result !== "通过" && record.outputTail?.trim()) lines.push("门禁输出最后几行：", "```text", record.outputTail.trimEnd(), "```");
-  return lines;
-}
-
 /** 拼评审输入：尚无成功评审时带需求原文，否则带成功检查点的必修。 */
 export function buildReviewInput(options: ReviewInputOptions): string {
   const parts: string[] = [];
@@ -331,9 +248,7 @@ export function buildReviewInput(options: ReviewInputOptions): string {
   change.push("", "新增未跟踪文件：");
   change.push(...(options.untracked.length > 0 ? options.untracked.map((path) => `- ${path}`) : ["- 无"]));
   parts.push(change.join("\n"));
-  if (options.gate) {
-    parts.push(`## 门禁\n程序已在项目目录执行门禁命令 ${options.gate}，退出码 0（通过）。你不需要再跑它。`);
-  }
+  parts.push(`## 测试\n${LOOP_TEST_STATUS}。评审只做静态检查，不运行测试。`);
   if (options.acceptance) parts.push(options.acceptance);
   return `${parts.join("\n\n")}\n`;
 }
@@ -355,15 +270,46 @@ export function deriveReviewerSessionId(devSessionId: string): string {
   return deriveSessionId("rev", devSessionId);
 }
 
-/** 验收命令结果的一句话写法，总结、通知和状态命令共用。 */
-export function acceptRunLabel(record: AcceptRunRecord): string {
-  return record.result === "不通过" ? `不通过（退出码 ${record.exitCode ?? "未知"}）` : record.result;
+/** 用户首先看到本轮证据，不能把上一轮通过结果或缺失字段当成本轮结论。 */
+export function renderDeliveryReport(input: SummaryInput): string {
+  const round = input.rounds.at(-1), acceptance = round?.acceptance;
+  const lines = ["# 交付报告", `- 项目：${input.cwd}`];
+  const skipped = input.singleNode ? "本次未安排" : round?.mustFix.length ? "评审有必修，本轮直接返修"
+    : round?.failed ? "评审未成功，本轮暂停"
+    : input.acceptanceConfigured === false ? "未配置自动验收" : "本轮没有验收记录";
+  lines.push("## 逐条验收");
+  const criteria = input.criteria?.items ?? acceptance?.items.filter((item) => /^A\d+$/.test(item.id)) ?? [];
+  if (!criteria.length) lines.push(`没跑（${skipped}；没有可逐条核对的验收标准）。`);
+  for (const criterion of criteria) {
+    const item = acceptance?.items.find((entry) => entry.id === criterion.id);
+    lines.push(`### ${criterion.id}`, criterion.text);
+    const execution = item?.execution;
+    for (const command of execution?.commands ?? []) lines.push(`- 实际命令：$ ${command}`);
+    for (const script of execution?.scripts ?? []) lines.push(`- 实际脚本：${script}`);
+    const executed = Boolean(execution?.commands.length || execution?.scripts.length);
+    if (!executed) lines.push(`- 实际执行：没跑（${item?.verdict === "需人工" ? item.detail : item ? "没有可核对的命令或脚本记录" : skipped}）`);
+    lines.push(`- 看到的结果：${item?.detail || "没有记录"}`);
+    lines.push(`- 结论：${!item ? `没跑（${skipped}）` : item.verdict === "需人工" ? `没跑（${item.detail}）` : !executed && item.verdict === "通过" ? "无法核实（缺少实际执行记录）" : item.verdict}`);
+    if (acceptance && item) {
+      const source = item.source, evidenceDir = source?.runDir ?? acceptance.runDir;
+      lines.push(`- 最终结论来源：${source ? `第 ${source.round} 轮${source.full ? "完整验收" : "定向复验"}${item.verdict === "需人工" ? "（该条未实测，留给用户）" : ""}` : "没有记录实测轮次"}`);
+      lines.push(`- ${executed ? `证据：${evidenceDir}/evidence/${item.id}.txt；` : ""}完整判定：${evidenceDir}/result.json`);
+    }
+  }
+  if (input.singleNode) lines.push("## 验收", "- 没验证（本次未安排）");
+  lines.push("## 测试", `- ${input.singleNode ? "没验证（本次未安排）" : LOOP_TEST_STATUS}`);
+  lines.push("## 评审");
+  const reviewed = round && !round.failed && !/^(未评审|不再评审)/.test(round.conclusion);
+  lines.push(`- 结论：${round?.failed ? `未完成：${round.failed}` : reviewed ? round.reviewConclusion || round.conclusion || "没有记录" : "没跑（本轮没有静态评审记录，见各轮说明）"}`,
+    `- 必修条数：${reviewed ? round.mustFix.length : "没有记录"}；返修次数：${input.repairs}`);
+  return `${lines.join("\n")}\n`;
 }
 
-/** 渲染总结（6.13 格式），每轮评审后覆盖写。 */
+/** 渲染总结，每轮评审后覆盖写；完成时交付报告固定在开头。 */
 export function renderSummary(input: SummaryInput): string {
   const lines: string[] = [];
   const status = input.status === "暂停" ? `暂停（${input.pauseReason ?? "未知原因"}）` : input.status;
+  if (input.status === "完成") lines.push(renderDeliveryReport(input), "<!-- loop-summary-metadata -->");
   lines.push("# 自动评审总结");
   if (input.status === "完成" && input.ponytailMissing) lines.push("未加载 Ponytail（开发角色要求加载）");
   if (input.status === "完成" && input.ledger) {
@@ -377,14 +323,14 @@ export function renderSummary(input: SummaryInput): string {
   lines.push(`- 项目：${input.cwd}`);
   lines.push(`- 开发会话：${input.devSessionId}　评审会话：${input.reviewerSessionId}`);
   lines.push(`- 状态：${status}`);
+  lines.push(`- 测试：${input.singleNode ? "没验证（本次未安排）" : LOOP_TEST_STATUS}`);
+  if (input.singleNode) lines.push("- 验收：没验证（本次未安排）");
   lines.push(`- 评审 ${input.rounds.length} 次，返修 ${input.repairs} 次`);
   if (input.status === "完成" && input.materialCleanup) lines.push(`- ${input.materialCleanup}`);
-  if (input.acceptRun) {
-    lines.push(`- 验收命令：${acceptRunLabel(input.acceptRun)}`);
-    lines.push(`- 验收命令用途：${input.acceptRun.mode === "required" ? "本段必需验收" : "附加检查"}`);
-  }
   if (input.newCommits) lines.push(`- 开发方新增提交：${input.newCommits} 个（基线之后，只记录不评判）`);
   if (input.notes) lines.push(`- 说明：${input.notes}`);
+  if (input.status === "暂停" && input.pauseDetail?.question) lines.push("## 开发方的问题原文", input.pauseDetail.question);
+  if (input.blockerHistory?.length) lines.push("## 历次暂停原始现场（保留）", ...input.blockerHistory.map((path) => `- ${path}`));
   if (input.paRelays?.length) lines.push("## PA 转达来源", ...relaySourceLines(input.paRelays));
   const sourceChanges = input.sourceChanges ?? [];
   if (sourceChanges.length > 0 || input.sourceChangeNote) {
@@ -392,6 +338,7 @@ export function renderSummary(input: SummaryInput): string {
     if (sourceChanges.length > 0) lines.push(...sourceChanges.map((change) => `- ${change.path}（${change.at}）`));
     else lines.push(input.sourceChangeNote!);
   }
+  for (const change of input.loopConfigChanges ?? []) lines.push(`- Loop 配置被修改：${change.path}；字段：${change.fields.join("、")}（${change.at}）`);
   if (input.todos && input.todos.length > 0) {
     lines.push("## 需要你做的事");
     lines.push(...input.todos.map((todo, index) => `${index + 1}. ${todo}`));
@@ -406,18 +353,6 @@ export function renderSummary(input: SummaryInput): string {
   const bullets = (items: string[], prefix = ""): void => {
     lines.push(...(items.length > 0 ? items.map((item) => `- ${prefix}${item}`) : ["- 无"]));
   };
-  const accept = input.acceptRun;
-  if (accept) {
-    lines.push("## 验收命令");
-    lines.push(`- 命令：${accept.command}`);
-    lines.push(`- 触发：${accept.trigger === "auto" ? `第 ${accept.round} 轮评审完成后自动执行` : "手动 /accept"}`);
-    lines.push(`- 开始：${accept.startedAt}${accept.durationMs === undefined ? "" : `，耗时 ${Math.round(accept.durationMs / 1000)} 秒`}`);
-    lines.push(`- 结果：${acceptRunLabel(accept)}`);
-    if (accept.detail) lines.push(`- 说明：${accept.detail}`);
-    if (accept.cleanup) lines.push(`- 资源：${accept.cleanup}`);
-    if (accept.logPath) lines.push(`- 完整输出：${accept.logPath}`);
-    if (accept.outputTail?.trim()) lines.push("输出最后几行：", "```text", accept.outputTail.trimEnd(), "```");
-  }
   lines.push("## 各轮");
   for (const round of input.rounds) {
     lines.push(`### 第 ${round.round} 轮（${round.startedAt}，耗时 ${Math.round(round.durationMs / 1000)} 秒）`);
@@ -432,8 +367,11 @@ export function renderSummary(input: SummaryInput): string {
     bullets(round.recheck);
     if (round.note) lines.push(`提示：${round.note}`);
     if (round.failed) lines.push(`错误：${round.failed}`);
-    if (round.gate) lines.push(...renderGateLines(round.gate));
-    if (round.acceptance) lines.push(...renderAcceptanceLines(round.acceptance));
+    if (round.reviewLogs?.length) lines.push("评审错误原文：", ...round.reviewLogs.map((path) => `- ${path}`));
+    if (round.scope) lines.push(`越界检查：不通过；文件：${round.scope.files.join("、")}${round.scope.logPath ? `；日志：${round.scope.logPath}` : ""}`);
+    for (const acceptance of round.acceptanceAttempts ?? (round.acceptance ? [round.acceptance] : [])) {
+      lines.push(...renderAcceptanceLines(acceptance));
+    }
   }
   if (input.status === "暂停" && input.unresolvedMustFix?.trim()) {
     lines.push("## 未解决的必修");
@@ -444,7 +382,7 @@ export function renderSummary(input: SummaryInput): string {
     lines.push(input.unresolvedAcceptance.trim());
   }
   if (input.changedFiles && input.changedFiles.length > 0) {
-    const stage = /^(验收|门禁)期间工作区变了$/.exec(input.pauseReason ?? "")?.[1] ?? "评审";
+    const stage = /^(验收)期间工作区变了$/.exec(input.pauseReason ?? "")?.[1] ?? "评审";
     lines.push(`## ${stage}期间变化的工作区文件`);
     lines.push(...input.changedFiles.map((file) => `- ${file}`));
   }

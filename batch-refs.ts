@@ -47,6 +47,7 @@ export function remapBatchReferences(
     if (config.extension !== undefined) config.extension = remapDependency(config.extension);
   };
   const copy = structuredClone(raw);
+  if (Array.isArray(copy.issues)) copy.issues = copy.issues.map(remap);
   if (copy.dir !== undefined) copy.dir = originalPath(copy.dir);
   remapPonytail(copy.pi);
   if (copy.stages && typeof copy.stages === "object" && !Array.isArray(copy.stages)) {
@@ -55,6 +56,11 @@ export function remapBatchReferences(
       const stage = value as Record<string, unknown>;
       if (stage.cwd !== undefined) stage.cwd = originalPath(stage.cwd);
       if (stage.prompt !== undefined) stage.prompt = remap(stage.prompt);
+      if (stage.acceptance && typeof stage.acceptance === "object" && !Array.isArray(stage.acceptance)) {
+        const acceptance = stage.acceptance as Record<string, unknown>;
+        if (acceptance.guide !== undefined) acceptance.guide = remap(acceptance.guide);
+        if (Array.isArray(acceptance.logs)) acceptance.logs = acceptance.logs.map(originalPath);
+      }
       remapPonytail(stage);
     }
   }

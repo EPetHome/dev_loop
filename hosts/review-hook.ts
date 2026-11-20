@@ -18,7 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { authorizationLine, criteriaFromUser, grantsFromUser, isLoopMessage, typedByUser } from "../acceptance-core.ts";
 import {
-  findProjectRoot, HERMES_BIN, MARKER_FILE, resolveProjectConfig,
+  LOOP_TEST_STATUS, findProjectRoot, HERMES_BIN, MARKER_FILE, resolveProjectConfig,
 } from "../config.ts";
 import { classifyMarker, conventionText, deriveReviewerSessionId, renderSummary } from "../core.ts";
 import { batchInfo, observeStage } from "../events.ts";
@@ -29,11 +29,12 @@ import type { FailureKind } from "../failure.ts";
 import { createGitEvidence, type Exec, type ExecResult } from "../git.ts";
 import { appendLedgerRecord, appendPARelayRecord, deliveryLedgerPath, pendingItems, projectRootOf, resultLine, taskTitle } from "../ledger.ts";
 import { acceptanceTodos } from "../onboarding.ts";
+import { auditLoopConfig, loopConfigMark } from "../config-audit.ts";
+import { developerQuestion, pauseAction, pauseText, preservePause } from "../blockers.ts";
 import { experienceInjection, experienceSession, experienceTodos, hookExperienceDir, hookExperienceStates, type HookExperienceActivity } from "../experience.ts";
 import { finishExperience } from "../experience-draft.ts";
-import { queueCommitNotice, queueCommittedResult, queueStageEvent } from "../merge-queue.ts";
-import { bindHookInputBridge, bridgeRepairSequence } from "./inbox-bridge.ts";
-import { completionChecks, inboxPath, queueAcceptance, readJson, statusPath, type InboxMessage, type StageStatus } from "../pipeline-core.ts";
+import { bindHookInputBridge } from "./inbox-bridge.ts";
+import { completionChecks, writeStageStatus } from "../pipeline-core.ts";
 import { processStartTime, reapProcs, registerProc, releaseProc, releaseProcessTree } from "../procs.ts";
 import { reapRunResources } from "../resources.ts";
 import { materialSession, recordMaterialSession, slimCompletedSession } from "../materials.ts";
@@ -50,7 +51,6 @@ import { detectHost, type HookEvent } from "./hook.ts";
 
 export interface HookState extends ReviewState {
   userInputVersion?: string; resumeAfterInputChange?: boolean;
-  queueReadyEpoch?: string; queueInboxHandled?: number; queuePreparedSeq?: number;
   experienceActivity?: HookExperienceActivity;
   /** 本进程最近一次往交付总表写的段：同一完成态不重复追加，总结里的总表路径与它一致。 */
   ledger?: { session: string; path: string; pending: { id: string; kind: "部分验证" | "人工" }[]; failed?: boolean };
@@ -80,6 +80,7 @@ interface HookContext {
   configError?: string;
   permissionMode?: string;
   transcript?: string;
+  lastReply?: string;
 }
 
 /**
@@ -118,7 +119,7 @@ export const createChildExec = (procsFile?: string): Exec => (command, args, opt
     if (reapTimer) clearTimeout(reapTimer);
     // 同一个 signal 会给很多次调用用：结束后摘掉监听，免得堆积，也免得事后误杀复用的进程组号。
     if (onAbort) options.signal?.removeEventListener("abort", onAbort);
-    let processesReleased: boolean | undefined;
+    let processesReleased: boolean | undefined = child?.pid ? undefined : true;
     if (options.role && child?.pid) {
       let released = false;
       try {
@@ -135,7 +136,7 @@ export const createChildExec = (procsFile?: string): Exec => (command, args, opt
     resolvePromise({
       stdout: Buffer.concat(stdout).toString("utf8"),
       stderr: Buffer.concat(stderr).toString("utf8"),
-      code, killed: killedFlag,
+      code, killed: killedFlag, processStarted: Boolean(child?.pid),
       ...(processesReleased !== undefined ? { processesReleased } : {}),
     });
   };
@@ -144,10 +145,11 @@ export const createChildExec = (procsFile?: string): Exec => (command, args, opt
     // detached 让子进程成为进程组组长，超时或取消时可以连同后代一起杀掉。
     // 取消不交给 spawn 的 signal：它只杀组长，还会抢先结束，让下面的整组清理来不及跑。
     child = spawn(command, args, {
-      cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true,
+      cwd: options.cwd, env, stdio: options.onControl ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"], detached: true,
     });
   } catch (error) {
-    process.stderr.write(`autoreview hook: 无法启动 ${command}：${errorText(error)}\n`);
+    const detail = `autoreview hook: 无法启动 ${command}：${errorText(error)}\n`;
+    process.stderr.write(detail); stderr.push(Buffer.from(detail));
     finish(1, false);
     return;
   }
@@ -169,7 +171,9 @@ export const createChildExec = (procsFile?: string): Exec => (command, args, opt
   };
   child.stdout?.on("data", collect(stdout));
   child.stderr?.on("data", collect(stderr));
+  if (options.onControl) (child.stdio[3] as NodeJS.ReadableStream | null)?.on("data", (chunk: Buffer) => options.onControl?.(chunk.toString("utf8")));
   child.on("error", (error) => {
+    stderr.push(Buffer.from(`无法启动/执行 ${command}：${errorText(error)}\n`));
     const aborted = (error as NodeJS.ErrnoException).name === "AbortError";
     finish(1, killed || aborted);
   });
@@ -215,9 +219,9 @@ export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): 
   return config;
 }
 
-/** 注入给开发方的约定：配了验收再追加验收约定，配了门禁再追加门禁约定。 */
+/** 注入给开发方的约定：配了验收再追加验收约定。 */
 function conventionFor(ctx: HookContext): string {
-  return conventionText({ acceptance: Boolean(ctx.config.acceptance), gate: ctx.config.gate?.cmd, experience: experienceInjection(ctx.configRoot) });
+  return conventionText({ singleNode: true, experience: experienceInjection(ctx.configRoot) });
 }
 
 /** 状态和总结都放在 ~/.pi-autoreview/<项目目录名>/<宿主>-<会话id>.*。 */
@@ -438,7 +442,7 @@ export function lastAssistantMessage(event: HookEvent): string {
 
 /** SessionStart 只有 10 秒时限，那里发通知要传更短的 timeoutMs。 */
 async function notify(body: string, exec: Exec, timeoutMs = 15_000): Promise<void> {
-  await systemNotify("自动评审", body, { exec, timeoutMs });
+  await systemNotify("自动评审", `${body}\n测试：${LOOP_TEST_STATUS}`, { exec, timeoutMs });
 }
 
 async function writeSummary(
@@ -457,13 +461,14 @@ async function writeSummary(
   let newCommits: number | undefined;
   try { if (state.baseline) newCommits = await createGitEvidence(ctx.exec, ctx.workDir).commitsSince(state.baseline); } catch { /* 不影响总结 */ }
   const todos = acceptanceTodos({
-    acceptance: ctx.config.acceptance, host: ctx.host, phase: state.phase, pauseHint: state.pauseHint,
+    acceptance: undefined, host: ctx.host, phase: state.phase, pauseHint: state.pauseHint,
     criteria: state.criteria, lastAcceptance: lastAcceptance(state),
   });
   if (status === "完成") todos.push(...experienceTodos(ctx.configRoot, state.experienceDraft?.error));
   recordMaterialSession(materialSession(`${ctx.host}-${ctx.sessionId}`, ctx.workDir, ctx.paths.summary, state.phase,
     state.rounds.flatMap((round) => round.acceptance ? [round.acceptance.runDir] : [])));
   const text = renderSummary({
+    singleNode: true, acceptanceConfigured: false,
     materialCleanup: state.materialCleanup,
     cwd: ctx.workDir, devSessionId: `${ctx.host}-${ctx.sessionId}`, todos,
     reviewerSessionId: state.reviewerSessionId ?? deriveReviewerSessionId(`${ctx.host}-${ctx.sessionId}`),
@@ -471,6 +476,7 @@ async function writeSummary(
     status, pauseReason, rounds: state.rounds, repairs: state.repairs,
     unresolvedMustFix: state.unresolvedMustFix, changedFiles, gitStatusShort, notes, newCommits,
     sourceChanges: state.sourceChanges, sourceChangeNote: state.sourceChangeNote,
+    loopConfigChanges: state.loopConfigChanges, pauseDetail: state.pauseDetail, blockerHistory: state.blockerHistory,
     ledger: state.phase === "done" && state.ledger
       ? { path: state.ledger.path, pending: state.ledger.pending, failed: state.ledger.failed } : undefined,
   });
@@ -487,12 +493,13 @@ async function recordLedger(ctx: HookContext, state: HookState): Promise<string 
   if (state.ledger?.session === session) return undefined;
   // 只认本轮（最后一段）的验收结果，避免配置去掉后把旧记录当成当前欠项。
   const record = state.rounds[state.rounds.length - 1]?.acceptance;
-  const pending = pendingItems(record, state.queueReviewedAcceptance);
+  const pending = pendingItems(record);
   let problem: string | undefined;
   try {
     const path = appendLedgerRecord({
       project: projectRootOf(ctx.workDir), session, task: taskTitle(state.requirement),
-      result: resultLine(record, state.rounds.length, state.repairs, state.queueReviewedAcceptance), summary: ctx.paths.summary, pending, paRelays: state.paRelays,
+      result: resultLine(record, state.rounds.length, state.repairs), summary: ctx.paths.summary,
+      checks: { ...completionChecks(state.rounds.at(-1)), test: "没验证（本次未安排）", acceptance: "没验证（本次未安排）" }, pending, paRelays: state.paRelays,
     });
     state.ledger = { session, path, pending };
   } catch (error) {
@@ -522,7 +529,14 @@ async function pause(
   state.phase = "paused";
   state.pauseReason = reason;
   state.pauseFailureKind = failureKind;
-  state.pauseHint = hint;
+  state.pauseHint = hint ?? pauseAction(reason);
+  state.pauseDetail = { reason, ...(notes ? { error: notes } : {}), question: developerQuestion(question ?? ctx.lastReply), action: state.pauseHint };
+  try {
+    auditLoopConfig(state, ctx.workDir);
+    const path = preservePause(ctx.paths.dir, state.pauseDetail);
+    state.pauseDetail.evidence = path;
+    (state.blockerHistory ??= []).push(path);
+  } catch (error) { process.stderr.write(`暂停原文保存失败：${errorText(error)}\n`); }
   state.awaitingRepair = false;
   try { saveStateFile(ctx.paths.state, state); } catch (error) {
     process.stderr.write(`autoreview hook: 状态保存失败：${errorText(error)}\n`);
@@ -531,8 +545,7 @@ async function pause(
     process.stderr.write(`autoreview hook: 总结写入失败：${errorText(error)}\n`);
   }
   observe(ctx, state, "paused", { question });
-  // Claude Code 里下一步走 systemMessage；其他宿主只有系统通知，就把下一步带上。
-  await notify(`${basename(ctx.workDir)}：暂停（${reason}）${hint && ctx.host !== "claude" ? `。${hint}` : ""}${question ? `\n${question}` : ""}`, ctx.exec);
+  await notify(`${basename(ctx.workDir)}：暂停（${reason}）\n${pauseText(state.pauseDetail)}`, ctx.exec);
 }
 
 /** 没有活进程持锁时，清掉上一个 Hook 被杀后留下的子进程。 */
@@ -593,8 +606,8 @@ const MAX_REF_BYTES = 200 * 1024;
  * 宿主交给 Hook 的 prompt 不展开「@文件」（pi 会展开）：把能读到的引用文件原文附在后面，
  * 需求原文和验收标准都按展开后的算，两个宿主与 pi 一致。读不到的 @ 当普通文字。
  */
-export function expandFileRefs(prompt: string, cwd: string): string {
-  const blocks: string[] = [];
+export function expandFileRefsWithSources(prompt: string, cwd: string): { text: string; files: { path: string; text: string }[] } {
+  const blocks: string[] = [], files: { path: string; text: string }[] = [];
   const seen = new Set<string>();
   for (const match of prompt.matchAll(/(?:^|\s)@("[^"]+"|\S+)/g)) {
     const ref = match[1].replace(/^"|"$/g, "").replace(/[，。,.;；:：)）]+$/, "");
@@ -605,10 +618,14 @@ export function expandFileRefs(prompt: string, cwd: string): string {
       const stat = statSync(path);
       if (!stat.isFile() || stat.size > MAX_REF_BYTES) continue;
       const text = readFileSync(path, "utf8");
-      if (!text.includes("\0")) blocks.push(`\n\n--- @${ref} ---\n${text}`);
+      if (!text.includes("\0")) { blocks.push(`\n\n--- @${ref} ---\n${text}`); files.push({ path, text }); }
     } catch { /* 不是文件 */ }
   }
-  return `${prompt}${blocks.join("")}`;
+  return { text: `${prompt}${blocks.join("")}`, files };
+}
+/** 旧宿主展示格式保持不变；机器输入身份使用结构化 files，不反解析展示文本。 */
+export function expandFileRefs(prompt: string, cwd: string): string {
+  return expandFileRefsWithSources(prompt, cwd).text;
 }
 
 type ActivityContext = Pick<HookContext, "configRoot" | "host" | "sessionId" | "paths">;
@@ -654,68 +671,15 @@ function reportQueueStage(ctx: HookContext, state: HookState, event: "started" |
   const pid = Number(process.env.AUTOREVIEW_DEV_PID) || process.ppid;
   const status = { sessionId: ctx.sessionId, host: ctx.host, pid, processStarted: process.env.AUTOREVIEW_DEV_STARTED || processStartTime(pid),
     inputBridge: process.env.AUTOREVIEW_DEV_INPUT_BRIDGE, summary: ctx.paths.summary,
-    event, readyEpoch: event === "done" ? state.queueReadyEpoch : undefined,
-    ...(event === "done" ? { candidate: state.lastSnapshotDetails, checks: completionChecks(state.rounds.at(-1), state.queueReviewedAcceptance) } : {}),
-    sourceInputs: state.inputsFingerprint, inbox: state.queueInboxHandled ?? 0,
-    ...(event === "done" ? { acceptance: state.queueReviewedAcceptance === undefined ? queueAcceptance(state.rounds.at(-1)?.acceptance) : state.queueReviewedAcceptance ?? undefined } : {}) };
+    event,
+    ...(event === "done" ? { candidate: state.lastSnapshotDetails, checks: completionChecks(state.rounds.at(-1)) } : {}),
+    sourceInputs: state.inputsFingerprint, inbox: 0,
+  };
   const dir = process.env.AUTOREVIEW_PIPELINE_DIR, stage = process.env.AUTOREVIEW_STAGE;
   if (dir && stage) bindHookInputBridge(dir, stage, status, { socket: process.env.CLAUDE_CODE_MESSAGING_SOCKET,
     token: process.env.CLAUDE_CODE_MESSAGING_TOKEN, mode: ctx.permissionMode });
-  queueStageEvent({ cwd: ctx.workDir, file: process.env.AUTOREVIEW_BATCH_FILE, stage, status });
+  if (dir && stage) writeStageStatus({ dir, stage }, status);
 }
-async function consumeQueueInbox(ctx: HookContext, state: HookState, expectedSeq?: number, stillIdle?: () => boolean, prepareOnly = false): Promise<string | undefined> {
-  const dir = process.env.AUTOREVIEW_PIPELINE_DIR, stage = process.env.AUTOREVIEW_STAGE;
-  if (!dir || !stage) return undefined;
-  const inbox = readJson<InboxMessage>(inboxPath(dir, stage));
-  if (!inbox || !inbox.message.startsWith("【合入队列返修】") || inbox.seq <= (state.queueInboxHandled ?? 0)
-    || (expectedSeq !== undefined && inbox.seq !== expectedSeq)) return undefined;
-  if (lockAlive(ctx.paths.lock)) return undefined;
-  if (state.queuePreparedSeq === inbox.seq) {
-    if (!prepareOnly) {
-      state.queueInboxHandled = inbox.seq; state.queuePreparedSeq = undefined;
-      saveStateFile(ctx.paths.state, state); reportQueueStage(ctx, state, "started");
-    }
-    return inbox.message;
-  }
-  const snap = await createGitEvidence(ctx.exec, ctx.workDir).snapshot();
-  if (stillIdle && !stillIdle()) return undefined;
-  state.lastSnapshot = snap.ref; state.lastUntracked = snap.untracked.map(({ path }) => path);
-  state.lastFingerprint = snap.fingerprint; state.lastCheckedFingerprint = snap.fingerprint;
-  state.scopeBaseline = snap.ref; state.scopeBaselineUntrackedDetails = snap.untracked;
-  state.unresolvedMustFix = inbox.mustFix;
-  if (!prepareOnly) state.queueInboxHandled = inbox.seq;
-  state.queuePreparedSeq = prepareOnly ? inbox.seq : undefined; state.queueReadyEpoch = undefined;
-  state.phase = "idle"; state.awaitingRepair = false; state.pauseReason = undefined; state.pauseHint = undefined;
-  state.ledger = undefined; state.resumeAfterInputChange = true;
-  saveStateFile(ctx.paths.state, state);
-  observe(ctx, state, "running", { via: "auto" });
-  reportQueueStage(ctx, state, "started");
-  return inbox.message;
-}
-/** 原生收件通道发送前先固定返修基线；这不是用户输入，不改授权/标准，也不调用模型。 */
-async function prepareNativeQueueRepair(ctx: HookContext, event: HookEvent): Promise<string> {
-  const dir = process.env.AUTOREVIEW_PIPELINE_DIR, stage = process.env.AUTOREVIEW_STAGE;
-  const token = process.env.AUTOREVIEW_DEV_INPUT_BRIDGE, pid = Number(process.env.AUTOREVIEW_DEV_PID) || process.ppid;
-  const seq = dir && stage && token && typeof event.prompt === "string" ? bridgeRepairSequence(dir, stage,
-    { sessionId: ctx.sessionId, host: ctx.host, pid, processStarted: process.env.AUTOREVIEW_DEV_STARTED || processStartTime(pid), inputBridge: token }, event.prompt) : undefined;
-  const refused = () => JSON.stringify({ ok: false });
-  if (seq === undefined || !dir || !stage || ctx.configError) return refused();
-  const state = loadStateFile(ctx.paths.state), inbox = readJson<InboxMessage>(inboxPath(dir, stage));
-  if (state.enabled === false || !inbox || inbox.seq !== seq || lockAlive(ctx.paths.lock)) return refused();
-  if ((state.queueInboxHandled ?? 0) >= seq || state.queuePreparedSeq === seq) return JSON.stringify({ ok: true, seq }); // 已准备的重试不能重置基线。
-  const expected = readJson<StageStatus>(statusPath(dir, stage));
-  const inputVersion = state.userInputVersion;
-  const stillIdle = () => {
-    const current = readJson<StageStatus>(statusPath(dir, stage));
-    return state.phase === "done" && expected?.event === "done" && current?.event === "done" && current.sessionId === ctx.sessionId
-      && current.inputBridge === token && current.readyEpoch === expected.readyEpoch && !lockAlive(ctx.paths.lock)
-      && loadStateFile(ctx.paths.state).userInputVersion === inputVersion;
-  };
-  if (!stillIdle() || !await consumeQueueInbox(ctx, state, seq, stillIdle, true)) return refused();
-  await writeSummary(ctx, state, "进行中", undefined, undefined, "合入队列返修已准备，等待原生收件通道处理；修复前基线和业务计数保留。");
-  return JSON.stringify({ ok: true, seq });
-}
-
 async function userPromptSubmit(ctx: HookContext, event: HookEvent): Promise<string | undefined> {
   const incoming = typeof event.prompt === "string" ? event.prompt : "";
   const dir = process.env.AUTOREVIEW_PIPELINE_DIR, stage = process.env.AUTOREVIEW_STAGE;
@@ -724,14 +688,8 @@ async function userPromptSubmit(ctx: HookContext, event: HookEvent): Promise<str
       session: { host: ctx.host, id: ctx.sessionId }, summary: ctx.paths.summary }) : undefined;
   const raw = relay?.text ?? incoming, provenance = { verifiedRelay: Boolean(relay) };
   const expanded = expandFileRefs(raw, ctx.promptDir);
-  const pid = Number(process.env.AUTOREVIEW_DEV_PID) || process.ppid;
-  const dispatched = dir && stage && process.env.AUTOREVIEW_DEV_INPUT_BRIDGE ? bridgeRepairSequence(dir, stage,
-    { sessionId: ctx.sessionId, host: ctx.host, pid, processStarted: process.env.AUTOREVIEW_DEV_STARTED || processStartTime(pid), inputBridge: process.env.AUTOREVIEW_DEV_INPUT_BRIDGE }, raw) : undefined;
-  const machine = dispatched !== undefined || isLoopMessage(raw, provenance) || /--- @[^\n]+ ---\n【合入队列返修】/.test(expanded);
-  if (machine) {
-    const state = loadStateFile(ctx.paths.state), repair = await consumeQueueInbox(ctx, state, dispatched);
-    return contextOutput(ctx, "UserPromptSubmit", [conventionFor(ctx), repair].filter(Boolean).join("\n\n"));
-  }
+  const machine = isLoopMessage(raw, provenance) || /--- @[^\n]+ ---\n【合入队列返修】/.test(expanded);
+  if (machine) return contextOutput(ctx, "UserPromptSubmit", conventionFor(ctx));
   // 相对引用保持宿主当前目录语义；固定项目根只用于配置、Git 取证、状态和评审。
   const prompt = expanded;
   const typed = typedByUser(raw, provenance);
@@ -752,7 +710,7 @@ async function userPromptSubmit(ctx: HookContext, event: HookEvent): Promise<str
     if (relay || before !== JSON.stringify(inputKeys.slice(0, 4).map((key) => state[key]))) {
       state.userInputVersion = randomUUID();
       if (wasRunning || state.rounds.length > 0) state.resumeAfterInputChange = true;
-      if (wasDone) { state.phase = "idle"; state.pauseReason = undefined; state.queueReadyEpoch = undefined; state.ledger = undefined; invalidatedDone = true; }
+      if (wasDone) { state.phase = "idle"; state.pauseReason = undefined; state.ledger = undefined; invalidatedDone = true; }
     }
     state.experienceActivity = newHookActivity(ctx);
     writeStateFile(ctx.paths.state, state);
@@ -777,6 +735,7 @@ async function userPromptSubmit(ctx: HookContext, event: HookEvent): Promise<str
   if (state.baseline === undefined && state.requirement?.trim() && !lockAlive(ctx.paths.lock)) {
     const snap = await createGitEvidence(ctx.exec, ctx.workDir).snapshot();
     state.baseline = snap.ref; state.baselineUntracked = snap.untracked.map(({ path }) => path); state.baselineFingerprint = snap.fingerprint;
+    state.loopConfigMark = loopConfigMark(ctx.workDir);
     saveStateFile(ctx.paths.state, state);
   }
   const contextConfig = loadContext(ctx.workDir);
@@ -814,7 +773,7 @@ async function userPromptSubmit(ctx: HookContext, event: HookEvent): Promise<str
  * Stop 持锁期间宿主发来 SIGTERM/SIGINT/SIGHUP：杀掉本进程登记的子进程组，
  * 状态记暂停「评审被中断」，释放锁再退出。SIGKILL 拦不住，交给下一次事件清理。
  */
-function guardSignals(ctx: HookContext, controller: AbortController, finished: () => Promise<void>, cleanupRecord: () => string | undefined): () => void {
+function guardSignals(ctx: HookContext, controller: AbortController, finished: () => Promise<void>): () => void {
   const signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT", "SIGHUP"];
   let stopping = false;
   const handler = (signal: NodeJS.Signals): void => {
@@ -830,10 +789,7 @@ function guardSignals(ctx: HookContext, controller: AbortController, finished: (
         state.phase = "paused"; state.pauseReason = INTERRUPTED; state.pauseFailureKind = undefined; state.awaitingRepair = false;
         saveStateFile(ctx.paths.state, state);
         observe(ctx, state, "paused");
-        const path = cleanupRecord();
-        let detail = path ? `外部资源释放记录：${path}` : undefined;
-        if (path) { try { const record = JSON.parse(readFileSync(path, "utf8")); detail = `外部资源释放：${record.status}；记录：${path}；${record.reason ?? ""}`; } catch { /* 未确认 */ } }
-        await writeSummary(ctx, state, "暂停", INTERRUPTED, undefined, detail);
+        await writeSummary(ctx, state, "暂停", INTERRUPTED);
       } catch (error) { process.stderr.write(`[autoreview] 中断收尾未确认：${errorText(error)}\n`); }
       finally {
         releaseLock(ctx.paths.lock);
@@ -850,24 +806,16 @@ function guardSignals(ctx: HookContext, controller: AbortController, finished: (
 async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefined> {
   let state = loadStateFile(ctx.paths.state);
   if (state.enabled === false) return undefined;
-  const prepared = state.queuePreparedSeq;
-  const queuedRepair = await consumeQueueInbox(ctx, state);
-  if (queuedRepair && prepared === undefined) return JSON.stringify({ decision: "block", reason: queuedRepair });
-  // 原生通道可能不触发 UserPromptSubmit；首次 Stop 仅确认收件，按发送前的基线评审修复。
   const text = lastAssistantMessage(event);
+  ctx.lastReply = text;
   const marker = classifyMarker(text);
   if (marker === "decision") {
     if (state.phase === "paused") return undefined;
     await pause(ctx, state, "开发方需要你决定", undefined, undefined, undefined, undefined, text);
-    return undefined;
+    return userOutput(ctx, `自动评审暂停（${state.pauseReason}）。\n${pauseText(state.pauseDetail!)}`);
   }
   // 暂停状态不自动评审，等你再提交消息（UserPromptSubmit 解除，与 pi 扩展一致）。
   if (state.phase === "paused" && !state.resumeAfterInputChange) return undefined;
-  if (state.phase === "done" && !state.resumeAfterInputChange && queueCommittedResult(ctx.workDir,
-    await createGitEvidence(ctx.exec, ctx.workDir).snapshot(), process.env, state.queueReadyEpoch)) {
-    releaseHookExperience(ctx, state.experienceActivity?.turn);
-    return undefined;
-  }
   if (marker === "none" && !state.resumeAfterInputChange) {
     const baseline = checkedFingerprint(state);
     if (!baseline) return undefined;
@@ -912,8 +860,7 @@ async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefi
   const inputWatch = setInterval(() => { try { checkUserInputs(false); } catch { /* 主任务处理取消 */ } }, 250);
   inputWatch.unref();
   let running: Promise<void> = Promise.resolve();
-  let cleanupRecord: string | undefined;
-  const unguard = guardSignals(ctx, controller, () => running, () => cleanupRecord);
+  const unguard = guardSignals(ctx, controller, () => running);
   try {
     // 上一轮已完成后再次交付：按 pi 规则开新一轮，返修计数清零。
     if (state.phase === "done" && !state.resumeAfterInputChange) state.repairs = 0;
@@ -932,7 +879,6 @@ async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefi
       cwd: ctx.workDir, devSessionId: `${ctx.host}-${ctx.sessionId}`, round,
       deliveryNote: text, state, config: ctx.config, getConfig: () => loadConfig(ctx.configRoot), exec: ctx.exec,
       signal: controller.signal, checkLive: checkUserInputs,
-      cleanupExec: createChildExec(`${ctx.paths.procs}.cleanup`), onCleanup: (_work, path) => { cleanupRecord = path; },
       writeInput: (name, content) => {
         mkdirSync(ctx.paths.dir, { recursive: true });
         const file = join(ctx.paths.dir, name);
@@ -943,7 +889,6 @@ async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefi
       writeSummary: (status) => writeSummary(ctx, state, status === "完成" ? "进行中" : status),
       saveState: () => saveStateFile(ctx.paths.state, state),
       snapshotDir: join(ctx.paths.dir, "review-snapshots"),
-      acceptanceDir: join(ctx.paths.dir, "acceptance", basename(ctx.paths.state, ".state.json")),
       procsFile: ctx.paths.procs,
     });
     running = work.then(() => {}, () => {});
@@ -987,10 +932,9 @@ async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefi
       saveStateFile(ctx.paths.state, state);
       // 状态和总表都落盘后再发布完成总结。
       await writeSummary(ctx, state, "完成");
-      state.queueReadyEpoch = randomUUID(); saveStateFile(ctx.paths.state, state);
       reportQueueStage(ctx, state, "done");
-      const done = `完成（评审 ${state.rounds.length} 次，返修 ${state.repairs} 次）`, submission = queueCommitNotice(ctx.workDir);
-      await notify(`${basename(ctx.workDir)}：${done}${outcome.hint ? `；${outcome.hint}` : ""}${submission ? `\n${submission}` : ""}`, ctx.exec);
+      const done = `完成（评审 ${state.rounds.length} 次，返修 ${state.repairs} 次）`;
+      await notify(`${basename(ctx.workDir)}：${done}${outcome.hint ? `；${outcome.hint}` : ""}\n交付报告：${ctx.paths.summary}`, ctx.exec);
       checkUserInputs();
       releaseHookExperience(ctx, state.experienceActivity?.turn, true);
       return userOutput(ctx, outcome.hint && `自动评审${done}。${outcome.hint}`);
@@ -998,7 +942,7 @@ async function stop(ctx: HookContext, event: HookEvent): Promise<string | undefi
     if (outcome.kind === "paused") {
       const reason = outcome.reason ?? "评审失败";
       await pause(ctx, state, reason, outcome.changedFiles, outcome.notes, outcome.hint, outcome.failureKind);
-      return userOutput(ctx, outcome.hint && `自动评审暂停（${reason}）。${outcome.hint}`);
+      return userOutput(ctx, `自动评审暂停（${state.pauseReason}）。\n${pauseText(state.pauseDetail!)}`);
     }
     state.phase = "idle";
     saveStateFile(ctx.paths.state, state);
@@ -1053,14 +997,14 @@ async function dispatch(event: HookEvent): Promise<string | undefined> {
     transcript: typeof event.transcript_path === "string" ? resolve(event.transcript_path) : undefined };
   if (kind === "SessionStart") return configError ? configUnavailable(ctx) : sessionStart(ctx);
   if (kind === "UserPromptSubmit") return userPromptSubmit(ctx, event);
-  if (kind === "LoopQueueRepair") return prepareNativeQueueRepair(ctx, event);
+  if (kind === "LoopQueueRepair") return JSON.stringify({ ok: false, reason: "旧队列返修已停用；请使用新开发卡和原会话返修信封" });
   if (kind === "Stop") return configError ? configUnavailable(ctx) : stop(ctx, event);
   return undefined;
 }
 
 /** 异常收口：开发会话才记暂停、写总结、尽力通知，然后放行（退出 0）。 */
-async function recover(event: HookEvent, error: unknown): Promise<undefined> {
-  const detail = errorText(error);
+async function recover(event: HookEvent, error: unknown): Promise<string | undefined> {
+  const detail = error instanceof Error ? error.stack ?? error.message : String(error);
   process.stderr.write(`autoreview hook 内部错误：${detail}\n`);
   const root = devProjectRoot();
   if (!root) return undefined;
@@ -1068,19 +1012,20 @@ async function recover(event: HookEvent, error: unknown): Promise<undefined> {
   const sessionId = sessionIdOf(event);
   const ctx: HookContext = {
     host, configRoot: root, workDir: root, promptDir: resolve(event.cwd?.trim() || process.cwd()),
-    sessionId, paths: hookPaths(root, host, sessionId), exec: childExec,
+    sessionId, paths: hookPaths(root, host, sessionId), exec: childExec, lastReply: lastAssistantMessage(event),
     config: { maxRepairs: DEFAULT_MAX_REPAIRS, reviewerModel: DEFAULT_MODEL, reviewerThinking: DEFAULT_THINKING, reviewTimeoutMin: DEFAULT_TIMEOUT_MIN, reviewerCmd: "" },
   };
   const state = loadStateFileForRecovery(ctx.paths.state);
   if (!existsSync(join(root, MARKER_FILE))) {
     await pause(ctx, state, "项目配置不可用", undefined, `项目配置不可用（AUTOREVIEW_DEV_ROOT=${root}）：${join(root, MARKER_FILE)} 不存在`);
   } else {
-    await pause(ctx, state, "自动评审内部错误", undefined, `Hook 异常：${tail(detail, 300)}`);
+    await pause(ctx, state, "自动评审内部错误", undefined, `Hook 异常：${detail}`);
   }
-  return undefined;
+  return userOutput(ctx, `自动评审暂停（${state.pauseReason}）。\n${pauseText(state.pauseDetail!)}`);
 }
 
 export async function handleReviewEvent(event: HookEvent): Promise<string | undefined> {
+  if (process.env.AUTOREVIEW_KERNEL_LEDGER) return (await import("./kernel-hook.ts")).handleKernelHook(event);
   try { return await dispatch(event); }
   catch (error) { return recover(event, error); }
 }

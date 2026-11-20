@@ -1,15 +1,12 @@
 /**
- * pipeline-core.ts — 流水线的共用约定：pi 扩展（每一段的会话）和 pipeline.ts（编排）都用。
- *
- * 每一段会话由流水线启动时带两个环境变量：AUTOREVIEW_PIPELINE_DIR（流水线目录）、AUTOREVIEW_STAGE（段名）。
- * 扩展把这一段的状态写到 <目录>/<段>.status.json；编排程序把整批验收返修写到 <目录>/<段>.inbox.json，
- * 扩展读到后发给开发方。没有这两个环境变量的会话完全不受影响。
+ * 通用原子 JSON 与只读历史/单会话 PA 状态结构。
+ * resources/materials/methods/project-context、宿主观测与安全停止仍使用；不再承载旧调度。
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { AcceptanceRecord } from "./acceptance-core.ts";
 import type { Snapshot } from "./git.ts";
-import { captureProjectConfigOverrides, type ProjectConfigOverrides } from "./config.ts";
+import { LOOP_TEST_STATUS, captureProjectConfigOverrides, type ProjectConfigOverrides } from "./config.ts";
 
 export interface QueueAcceptanceItem { id: string; text: string; detail: string }
 /** 明确的空数组表示未配置验收或全部通过；缺字段的历史 done 不授予自动合入资格。 */
@@ -26,24 +23,20 @@ export function queueAcceptance(record?: AcceptanceRecord): QueueAcceptance {
 }
 
 /** 提交说明引用真实检查结论；历史未知不能写成未配置或通过。 */
-export function completionChecks(round?: { gate?: { result: string }; conclusion?: string; reviewConclusion?: string; acceptance?: AcceptanceRecord }, qualified?: QueueAcceptance | null): NonNullable<StageStatus["checks"]> {
-  let acceptance: string = round?.acceptance?.verdict ?? "未配置";
+export function completionChecks(round?: { conclusion?: string; reviewConclusion?: string; acceptance?: AcceptanceRecord }, qualified?: QueueAcceptance | null): NonNullable<StageStatus["checks"]> {
+  let acceptance: string = round?.acceptance?.verdict ?? "没有记录";
   if (qualified === null) acceptance = "历史结论未知，未补做验收";
   else if (qualified) {
     acceptance = "沿用原完成资格（无欠项）";
     if (qualified.failed.length) acceptance = "不通过";
     else if (qualified.partial.length || qualified.manual.length) acceptance = "部分验证（见总表欠项）";
   }
-  return { gate: qualified !== undefined ? "沿用原完成资格（见总结）" : round?.gate?.result ?? "未配置",
-    review: round?.reviewConclusion ?? round?.conclusion ?? "见段总结", acceptance };
+  return { test: LOOP_TEST_STATUS,
+    review: round?.reviewConclusion || round?.conclusion || "没有记录", acceptance };
 }
 
 export const PIPELINE_DIR_ENV = "AUTOREVIEW_PIPELINE_DIR";
 export const STAGE_ENV = "AUTOREVIEW_STAGE";
-/** 只有 pipeline.ts 真正启动段时才设置：段会话据此采用准备前确定的开工依据。 */
-export const PIPELINE_LAUNCH_ENV = "AUTOREVIEW_PIPELINE_LAUNCH";
-/** 一次性启动回报身份：只有真正启动段的 bin/pi-dev 持有，成功后不再传给子进程。 */
-export const PIPELINE_LAUNCH_TOKEN_ENV = "AUTOREVIEW_PIPELINE_LAUNCH_TOKEN";
 /** 仅测试：扩展轮询收件箱、编排程序轮询状态的间隔（毫秒）。 */
 export const POLL_ENV = "AUTOREVIEW_PIPELINE_POLL_MS";
 
@@ -69,7 +62,7 @@ export interface StageStatus {
   acceptance?: QueueAcceptance;
   /** 检查通过时冻结的候选（含未跟踪文件），提交前必须核对。 */
   candidate?: Snapshot | string;
-  checks?: { gate: string; review: string; acceptance: string };
+  checks?: { test: string; review: string; acceptance: string };
   /** 此资格所依据的冻结来源版本；消费者在接力边界核对实际文件。 */
   sourceInputs?: string;
   /** 此段实际使用的显式评审覆盖；消费者复核来源时不能改用自身进程的默认预算。 */
@@ -82,14 +75,6 @@ export interface StageStatus {
   /** no-change 时开发方的回复原文（为什么不改）。 */
   reply?: string;
   updatedAt: string;
-}
-
-export interface InboxMessage {
-  seq: number;
-  /** 发给开发方的返修消息。 */
-  message: string;
-  /** 交给评审当作「上一轮必修」复查的条目原文。 */
-  mustFix: string;
 }
 
 export interface StageLink { dir: string; stage: string }
@@ -109,7 +94,6 @@ export function pollMs(env: NodeJS.ProcessEnv = process.env, fallback = 2000): n
 /** 段名做文件名：去掉路径分隔符等不能进文件名的字符。 */
 const fileSafe = (stage: string): string => stage.replace(/[/\\:*?"<>|\s]+/g, "_");
 export const statusPath = (dir: string, stage: string): string => join(dir, `${fileSafe(stage)}.status.json`);
-export const inboxPath = (dir: string, stage: string): string => join(dir, `${fileSafe(stage)}.inbox.json`);
 
 export function readJson<T>(path: string): T | undefined {
   if (!existsSync(path)) return undefined;

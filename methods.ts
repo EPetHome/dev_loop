@@ -1,8 +1,8 @@
 /**
- * methods.ts — 项目方法自测指纹和基线空跑缓存。
+ * methods.ts — 项目方法自测指纹。
  *
  * 指纹 = loop 版本 + methods.paths 下全部文件的哈希 + 方法相关配置 + methods.probe 输出。
- * 记录在项目数据目录的 methods.json；基线门禁按提交的树哈希缓存最近 50 个。
+ * 记录在项目数据目录的 methods.json；不运行项目测试。
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -11,10 +11,9 @@ import { dirname, join, relative, resolve } from "node:path";
 import { findProjectRoot, resolveProjectConfig, type MethodsConfig, type ProjectConfigOverrides } from "./config.ts";
 import { writeJsonAtomic } from "./pipeline-core.ts";
 import { projectDataDir } from "./project-context.ts";
-import { currentTree, gitResult, isClean } from "./workspace.ts";
+import { gitResult } from "./workspace.ts";
 
 const hash = (value: string | Buffer): string => createHash("sha256").update(value).digest("hex");
-const tail = (value: string, max = 500): string => value.trim().slice(-max);
 
 export interface MethodFile { path: string; hash: string; missing?: boolean }
 export interface ProbeResult { command: string; exitCode: number; hash: string }
@@ -29,13 +28,12 @@ export interface MethodsRecord {
   fingerprint: string;
   components: MethodsComponents;
   updatedAt: string;
-  gateTrees: string[];
   /** 启动入口的权限自动执行检查通过时的指纹；与方法自测分开记录。 */
   permissionFingerprint?: string;
   permissionCheckedAt?: string;
 }
 
-export interface MethodsOptions { recheck?: boolean; dryRun?: boolean; loopRoot: string; env?: NodeJS.ProcessEnv; overrides?: ProjectConfigOverrides }
+export interface MethodsOptions { recheck?: boolean; dryRun?: boolean; loopRoot: string; env?: NodeJS.ProcessEnv; overrides?: ProjectConfigOverrides; procsFile?: string; signal?: AbortSignal }
 
 export const methodsRecordPath = (root: string, env: NodeJS.ProcessEnv = process.env): string =>
   join(projectDataDir(root, env), "methods.json");
@@ -43,9 +41,10 @@ export const methodsRecordPath = (root: string, env: NodeJS.ProcessEnv = process
 export function readMethodsRecord(root: string, env: NodeJS.ProcessEnv = process.env): MethodsRecord | undefined {
   const path = methodsRecordPath(root, env);
   try {
-    const data = JSON.parse(readFileSync(path, "utf8")) as Partial<MethodsRecord>;
+    const data = JSON.parse(readFileSync(path, "utf8")) as Partial<MethodsRecord> & Record<string, unknown>;
     if (!data || data.version !== 1 || typeof data.fingerprint !== "string" || !data.components
-      || !Array.isArray(data.components.files) || !Array.isArray(data.gateTrees)) return undefined;
+      || !Array.isArray(data.components.files)) return undefined;
+    delete data.gateTrees; // 不继续传播旧门禁树缓存；其他方法/权限记录保留。
     return data as MethodsRecord;
   } catch { return undefined; }
 }
@@ -91,7 +90,7 @@ export function methodFiles(root: string, methods: MethodsConfig | undefined): M
 }
 
 function configHash(raw: Record<string, unknown>): string {
-  return hash(JSON.stringify({ methods: raw.methods ?? null, gate: raw.gate ?? null }));
+  return hash(JSON.stringify({ methods: raw.methods ?? null }));
 }
 
 function probe(root: string, command: string, dryRun: boolean): ProbeResult {
@@ -137,24 +136,17 @@ export function changedParts(previous: MethodsRecord | undefined, current: Metho
   return changes;
 }
 
-function runCommand(root: string, command: string, timeoutMs: number): { ok: boolean; output: string; code: number } {
-  const res = spawnSync("/bin/sh", ["-c", command], { cwd: root, encoding: "utf8", timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 });
-  const output = `${res.stdout ?? ""}${res.stderr ?? ""}`;
-  return { ok: (res.status ?? 1) === 0 && !res.error, output, code: res.status ?? 1 };
-}
-
 export interface MethodsRunResult {
   skipped: boolean;
   changed: string[];
   fingerprint: string;
-  selfCheck?: { command: string; passed: boolean; output: string };
-  baseline?: { tree: string; cached: boolean; passed?: boolean; output?: string };
+  selfCheck?: { command: string; passed: boolean; output: string; exitCode: number };
   record: MethodsRecord;
   written: boolean;
 }
 
-/** 指纹不变就跳过；变了（或 --recheck）执行一次 selfCheck 和基线空跑，通过后才更新记录。 */
-export function runMethodsSelfTest(root: string, options: MethodsOptions): MethodsRunResult {
+/** 指纹不变就跳过；变了（或 --recheck）执行方法自检，通过后才更新记录。 */
+export async function runMethodsSelfTest(root: string, options: MethodsOptions): Promise<MethodsRunResult> {
   const env = options.env ?? process.env;
   const previous = readMethodsRecord(root, env);
   const current = methodsComponents(root, options.loopRoot, { dryRun: options.dryRun, env, overrides: options.overrides });
@@ -165,7 +157,7 @@ export function runMethodsSelfTest(root: string, options: MethodsOptions): Metho
   }
   const changes = changedParts(previous, current);
   const record: MethodsRecord = {
-    version: 1, fingerprint, components: current, updatedAt: new Date().toISOString(), gateTrees: previous?.gateTrees ?? [],
+    version: 1, fingerprint, components: current, updatedAt: new Date().toISOString(),
     ...(previous?.permissionFingerprint === fingerprint
       ? { permissionFingerprint: previous.permissionFingerprint, permissionCheckedAt: previous.permissionCheckedAt } : {}),
   };
@@ -174,33 +166,26 @@ export function runMethodsSelfTest(root: string, options: MethodsOptions): Metho
   }
   const methods = resolveProjectConfig(findProjectRoot(root), { env, ...options.overrides }).methods;
   if (methods?.selfCheck) {
-    const result = runCommand(root, methods.selfCheck, 10 * 60_000);
-    if (!result.ok) throw new Error(`方法自测未通过（${methods.selfCheck}，退出码 ${result.code}）：${tail(result.output)}`);
+    const { createChildExec } = await import("./hosts/review-hook.ts");
+    const { createRunResource, managedShell, releaseRunResource } = await import("./resources.ts");
+    const { acquireProjectExecution } = await import("./project-execution.ts");
+    const release = await acquireProjectExecution(root, "check", options.procsFile ?? "", options.signal);
+    let resource: ReturnType<typeof createRunResource> | undefined, result;
+    try {
+      resource = createRunResource(`methods:${fingerprint}`, undefined, options.procsFile);
+      result = await createChildExec(options.procsFile)("/bin/sh", ["-c", managedShell(methods.selfCheck, resource)], { cwd: root, env, timeout: 10 * 60_000, role: "方法自测", signal: options.signal });
+    } finally { if (resource) releaseRunResource(resource); release(resource ? resource.status === "released" : true); }
+    const output = `${result.stdout}${result.stderr}`;
+    if (result.processesReleased !== true || resource!.status !== "released") throw new Error("方法自测消费者/资源释放未确认，保留登记，不启动开发");
+    const check = { command: methods.selfCheck, passed: result.code === 0 && !result.killed, output, exitCode: result.code };
+    // 失败如实返回且不写通过指纹；启动方展示环境未就绪，不把方法失败变成开发门禁。
+    if (!check.passed) return { skipped: false, changed: changes, fingerprint, selfCheck: check, record, written: false };
     record.components = current;
-    const check = { command: methods.selfCheck, passed: true, output: result.output };
-    const baseline = baselineGate(root, env, options.recheck === true, options.overrides);
-    if (baseline?.tree) record.gateTrees = [baseline.tree, ...record.gateTrees.filter((tree) => tree !== baseline.tree)].slice(0, 50);
     writeJsonAtomic(methodsRecordPath(root, env), record);
-    return { skipped: false, changed: changes, fingerprint, selfCheck: check, ...(baseline ? { baseline } : {}), record, written: true };
+    return { skipped: false, changed: changes, fingerprint, selfCheck: check, record, written: true };
   }
-  const baseline = baselineGate(root, env, options.recheck === true, options.overrides);
-  if (baseline?.tree) record.gateTrees = [baseline.tree, ...record.gateTrees.filter((tree) => tree !== baseline.tree)].slice(0, 50);
   writeJsonAtomic(methodsRecordPath(root, env), record);
-  return { skipped: false, changed: changes, fingerprint, ...(baseline ? { baseline } : {}), record, written: true };
-}
-
-/** 基线空跑：开工依据的树已经在缓存里就跳过；否则跑一次门禁，通过后由调用方写进记录。 */
-function baselineGate(root: string, env: NodeJS.ProcessEnv, force = false, overrides: ProjectConfigOverrides = {}): { tree: string; cached: boolean; passed?: boolean; output?: string } | undefined {
-  if (!existsSync(join(root, ".autoreview.json"))) return undefined;
-  const gate = resolveProjectConfig(root, { env, ...overrides }).gate;
-  if (!gate) return undefined;
-  const tree = currentTree(root);
-  const previous = readMethodsRecord(root, env);
-  if (!force && previous?.gateTrees.includes(tree)) return { tree, cached: true };
-  const result = runCommand(root, gate.cmd, gate.timeoutMin * 60_000);
-  if (!result.ok) throw new Error(`基线空跑门禁未通过（${gate.cmd}，退出码 ${result.code}）：${tail(result.output)}`);
-  if (!isClean(root)) throw new Error("基线空跑门禁改动了工作区；请把构建产物写进 .gitignore 或项目外，再重新开工");
-  return { tree, cached: false, passed: true, output: result.output };
+  return { skipped: false, changed: changes, fingerprint, record, written: true };
 }
 
 /** 当前方法指纹；启动入口的权限检查也用它判断是否跳过。 */
@@ -215,24 +200,8 @@ export function recordPermissionCheck(root: string, fingerprint: string, compone
   const previous = readMethodsRecord(root, env);
   const record: MethodsRecord = previous
     ? { ...previous, permissionFingerprint: fingerprint, permissionCheckedAt: new Date().toISOString() }
-    : { version: 1, fingerprint: "", components, updatedAt: new Date().toISOString(), gateTrees: [],
+    : { version: 1, fingerprint: "", components, updatedAt: new Date().toISOString(),
         permissionFingerprint: fingerprint, permissionCheckedAt: new Date().toISOString() };
   mkdirSync(dirname(methodsRecordPath(root, env)), { recursive: true });
   writeJsonAtomic(methodsRecordPath(root, env), record);
-}
-
-/** 任何候选门禁通过时记下树哈希；项目有 .autoreview.json 才记录，写失败不影响门禁结论。 */
-export function recordGateTree(cwd: string, tree: string, env: NodeJS.ProcessEnv = process.env): boolean {
-  try {
-    const root = findProjectRoot(cwd) ?? cwd;
-    if (!existsSync(join(root, ".autoreview.json"))) return false;
-    const path = methodsRecordPath(root, env);
-    const previous = readMethodsRecord(root, env);
-    const record: MethodsRecord = previous && previous.version === 1
-      ? { ...previous, gateTrees: [tree, ...(previous.gateTrees ?? []).filter((item) => item !== tree)].slice(0, 50) }
-      : { version: 1, fingerprint: "", components: { loopVersion: "unknown", files: [], config: "" }, updatedAt: new Date().toISOString(), gateTrees: [tree] };
-    mkdirSync(dirname(path), { recursive: true });
-    writeJsonAtomic(path, record);
-    return true;
-  } catch { return false; }
 }
