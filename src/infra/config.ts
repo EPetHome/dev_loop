@@ -35,6 +35,6 @@ export function loadConfig(repo: string): Config {
     if (raw[key] !== undefined && (typeof raw[key] !== "string" || raw[key].includes("\0"))) throw new Error(key + " 须为字符串");
   const localFiles = raw.localFiles ?? [];
   if (!Array.isArray(localFiles) || localFiles.some((p) => typeof p !== "string" || !safeRelative(p) || p === ".")) throw new Error("localFiles 须为仓库内相对路径数组");
-  return { reviewerModel: raw.reviewerModel || "astra", reviewerThinking: raw.reviewerThinking || "xhigh",
+  return { reviewerModel: raw.reviewerModel || "openai-codex/gpt-6.2-astra", reviewerThinking: raw.reviewerThinking || "xhigh",
     reviewerCmd: raw.reviewerCmd || "", setup: raw.setup || "", localFiles };
 }

@@ -5,7 +5,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_BIN="${PI_BIN:-/Users/Admin/.local/bin/pi}"
 PI_NODE_BIN="${PI_NODE_BIN:-/Users/Admin/.hermes/node/bin}"
 permission="${PERMISSION_EXTENSION:-/Users/Admin/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system/src/index.ts}"
-cwd="$PWD" model="sol" thinking="max" session="" sid="" name="" prompt="" dry="${PI_DEV_DRY_RUN:-0}"
+cwd="$PWD" model="openai-codex/gpt-6.2-sol" thinking="max" session="" sid="" name="" prompt="" dry="${PI_DEV_DRY_RUN:-0}"
 die() { echo "pi-dev: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,7 +15,7 @@ while [[ $# -gt 0 ]]; do
       case "$key" in session_id) sid="$2";; *) printf -v "$key" '%s' "$2";; esac
       shift 2;;
     --dry-run) dry=1; shift;;
-    --help|-h) echo 'bin/pi-dev [--cwd 目录] [--model sol] [--thinking max] [--session 会话 | --session-id 编号] [--name 名称] [--dry-run] [提示词文件]'; exit 0;;
+    --help|-h) echo 'bin/pi-dev [--cwd 目录] [--model openai-codex/gpt-6.2-sol] [--thinking max] [--session 会话 | --session-id 编号] [--name 名称] [--dry-run] [提示词文件]'; exit 0;;
     -*) die "未知选项 $1";;
     *) [[ -z "$prompt" ]] || die "只能给一份提示词"; prompt="$1"; shift;;
   esac

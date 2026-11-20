@@ -94,7 +94,7 @@ test("停止/续跑/放弃：沿用执行号，保留分支证据，删除 workt
 test("bin/pi-dev：sol/max、权限扩展及自己的扩展，精确恢复参数，无真实模型调用",async(t)=>{
   const f=fixture(t);
   const text=execFileSync(join(ROOT,"bin/pi-dev"),["--cwd",f.repo,"--dry-run",join(f.repo,"prompt.md")],{env:f.env,encoding:"utf8"});
-  assert.match(text,/--model sol/);assert.match(text,/--thinking max/);assert.match(text,/pi-permission-system/);
+  assert.match(text,/--model openai-codex\/gpt-6\.2-sol/);assert.match(text,/--thinking max/);assert.match(text,/pi-permission-system/);
   assert.match(text,/src\/hosts\/pi.ts/);assert.match(text,/--no-extensions/);assert.doesNotMatch(text,/ponytail|autoreview.ts/);
   const resumed=execFileSync(join(ROOT,"bin/pi-dev"),["--cwd",f.repo,"--session","exact-id","--dry-run"],{env:f.env,encoding:"utf8"});
   assert.match(resumed,/--session exact-id/);assert.doesNotMatch(resumed,/--continue/);
