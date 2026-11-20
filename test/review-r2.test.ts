@@ -17,11 +17,12 @@ function startHeldTerminal(f: ReturnType<typeof fixture>, task: Task, id: string
   write(permission, "// fixture only\n");
   write(pi, "#!" + NODE + "\n" +
     "const fs=require('fs'),dir=process.env.LOOP_TASK_DIR;let attempted=false;" +
-    "fs.writeFileSync(dir+'/pi-started.json',JSON.stringify({pid:process.pid}));" +
+    "const publish=(name,value)=>{const path=dir+'/'+name;fs.writeFileSync(path+'.tmp',JSON.stringify(value));fs.renameSync(path+'.tmp',path);};" +
+    "publish('pi-started.json',{pid:process.pid});" +
     "const register=async()=>{if(attempted||!fs.existsSync(dir+'/register-go'))return;attempted=true;" +
     "const {registerSession}=await import(" + JSON.stringify(join(ROOT, "src/core/lifecycle.ts")) + ");" +
     "const accepted=registerSession(dir,'pi','controlled-session',process.pid);" +
-    "fs.writeFileSync(dir+'/registration.json',JSON.stringify({accepted}));};" +
+    "publish('registration.json',{accepted});};" +
     "fs.watch(dir,register);register();\n");
   execFileSync("chmod", ["+x", pi]);
   write(join(task.dir, "launch-" + id + ".json"), JSON.stringify({

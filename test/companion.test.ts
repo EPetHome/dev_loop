@@ -53,9 +53,10 @@ test("陪跑未登记/脚本缺失跳过；配置、setup、脚本失败均只�
   }
 });
 test("宿主拉起并行陪跑，不等开发完成；进程完成后工作区清理",async t=>{
-  const f=snapshotFixture(t),task=await f.prepare();await startCompanion(task.dir,f.env);
+  const f=snapshotFixture(t),task=await f.prepare(), trees=f.git("worktree","list","--porcelain");await startCompanion(task.dir,f.env);
   await until(task.dir,()=>checksOf(task.dir),records=>records.some(c=>c.step==="陪跑"));
-  await until(task.dir,()=>existsSync(join(task.dir,"companion")),v=>!v);assert.equal(statusOf(task.dir).loop.phase,"开发中");assert.equal(existsSync(join(task.dir,"snapshot-base.json")),true);
+  await until(task.dir,()=>existsSync(join(task.dir,"companion.lock")),v=>!v);assert.equal(f.git("worktree","list","--porcelain"),trees);
+  assert.equal(statusOf(task.dir).loop.phase,"开发中");assert.equal(existsSync(join(task.dir,"snapshot-base.json")),true);
 });
 test("部署前后 live、静态依赖摘要；对比一个/两个执行、释放保留证据分支且禁续跑",async t=>{
   const f=snapshotFixture(t),task=await f.prepare();write(join(task.worktree,"src/app.txt"),"good version one\n");const c1=deliver(task.dir).commit;await settle(task.dir);

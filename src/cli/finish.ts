@@ -4,7 +4,7 @@ import { lock, BusyError, optionalJson, writeJson } from "../infra/files.ts";
 import { projectFile } from "../infra/project.ts";
 import { alive, identity } from "../infra/exec.ts";
 import { gitText } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, waitFor, recordStep, checksOf, createTask, LoopError } from "../core/store.ts";
+import { taskOf, statusOf, update, move, transition, waitFor, recordStep, checked, checksOf, createTask, launchStarted, LoopError } from "../core/store.ts";
 import { InputError } from "../core/card.ts";
 import { operationPath } from "../core/run.ts";
 import { merge, prepareMerge } from "../steps/merge.ts";
@@ -40,8 +40,7 @@ export async function finish(dir: string, automatic = false) {
         if(s.state==="cancelled" || (s.loop.phase!=="收尾中" && s.loop.wait!=="收尾没走完" && !interrupted))throw new InputError("当前不在待收尾");
         if(automatic && (s.loop.phase!=="收尾中" || s.loop.finisher))throw new InputError("不自动重试已发起的收尾；请显式运行 bin/loop 收尾 手工接手");
         if(!s.loop.commit)throw new InputError("没有交付记录");
-        commit=s.loop.commit; s.loop.finisher=owner; s.loop.afterCommit=commit;
-        s.state="working"; s.loop.phase="收尾中"; s.loop.wait=null; s.loop.bucket="selfMs"; s.timeLimitSec=null; s.error=null; s.message="开始收尾";
+        commit=s.loop.commit; s.loop.finisher=owner; s.loop.afterCommit=commit; move(s,"working","收尾中","开始收尾","selfMs");
       }, "收尾"); claimed=true;
     } finally { operation(); }
     await queued(dir, async () => {
@@ -69,9 +68,13 @@ export async function finish(dir: string, automatic = false) {
       step="推送"; if (after.includes("推送")) await push(dir);
       if (cancelled()) return;
       step="接力";
-      if (t.next && !statusOf(dir).loop.next) {
-        const next = createTask(t.next,dirname(dir),t.dispatchId,commit);
-        update(dir,s=>{s.loop.next=next.executionId;}); await background(next);
+      if (t.next) {
+        const {delivery, next: id} = statusOf(dir).loop, root = dirname(dir);
+        if (delivery?.commit !== commit || !checked(dir, commit)) throw new InputError("接力须有当前交付的正式复测与评审通过记录");
+        const next = id ? taskOf(join(root,id)) : createTask(t.next,root,t.dispatchId,commit);
+        if (!id) update(dir,s=>{s.loop.next=next.executionId;});
+        if (next.baseCommit !== commit) throw new InputError("已分配的下一卡起点不是本次交付：" + next.executionId);
+        if (!launchStarted(statusOf(next.dir))) await background(next,"handoff");
       }
       const reasons = checksOf(dir).filter(c=>c.step==="收尾" && c.result==="退回开发方").map(c=>c.detail).join("；");
       const message = "收尾已走完；验收标准：" + (t.acceptance || "未登记") + "；中途退回 " + (statusOf(dir).loop.deployReturns || 0) + " 次" + (reasons?"："+reasons:"") + "；另有 " + pendingAcceptance(t.card) + " 批待验";
@@ -93,6 +96,6 @@ export async function finish(dir: string, automatic = false) {
     } else waitFor(dir,"收尾没走完",reason + (repairable?"\n自动返修已到上限或此宿主需手动续跑。":"") + "\n可修改后续跑开发，或运行 bin/loop 收尾 " + t.executionId + " 手工重试。");
     facts(reason);
   } finally { try { if(claimed)update(dir,s=>{if(s.loop.finisher?.pid===owner.pid && s.loop.finisher.startedAt===owner.startedAt)s.loop.finisher=null;}); } finally { release(); } }
-  if (restore && statusOf(dir).state === "working") await background(t,true);
+  if (restore && statusOf(dir).state === "working") await background(t,"resume");
   return statusOf(dir);
 }

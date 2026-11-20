@@ -108,8 +108,8 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
     }
     const result=resume(dir,o.words,o.command==="答复");
     if(result.reviewOnly)await background(t,"review");
-    else if(result.status.loop.phase==="收尾中")await background(t,false,true);
-    else if(!result.reused && !result.running)await background(t,true);
+    else if(result.status.loop.phase==="收尾中")await background(t,"finish");
+    else if(!result.reused && !result.running)await background(t,"resume");
     return {executionId:t.executionId,...result};
   }
   if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");

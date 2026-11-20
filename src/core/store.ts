@@ -43,7 +43,7 @@ export interface Status {
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
     startingSession: (Identity & {launchId: string}) | null;
     finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string; released?: boolean;
-    activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
+    activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean; ready: boolean; prepared: boolean; abandoned: boolean;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
     remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
@@ -53,6 +53,7 @@ export interface Status {
 export const taskOf = (dir: string) => readJson<Task>(join(dir, "task.json"));
 export const answersOf = (dir: string) => jsonLines<{at: string; text: string}>(join(dir, "answers.jsonl"));
 export const statusOf = (dir: string) => { const s = readJson<Status>(join(dir, "status.json")); s.loop.answerCount = answersOf(dir).length; return s; };
+export const launchStarted = ({loop}: Status) => Boolean(loop.launchStarted || loop.prepared || loop.launcher || loop.session);
 export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.jsonl"));
 export const appendCheck = (dir: string, check: Check) => appendJson(join(dir, "checks.jsonl"), check);
 export function summary(dir: string, s = statusOf(dir)): void {
@@ -91,27 +92,23 @@ export function update(dir: string, action: (s: Status) => void, resolvedBy: Res
     writeJson(join(dir, "status.json"), s); idleSleep(dir, s.state === "working", now, process.env, owner); summary(dir, s); return s;
   });
 }
-export function transition(dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
-  return update(dir, (s) => {
-    if (s.state === "cancelled" && state !== "cancelled") return;
-    s.state = state; s.loop.phase = phase; s.message = message; s.loop.bucket = bucket; s.timeLimitSec = timeLimitSec;
-    s.error = null; if (phase !== "等你") s.loop.wait = null;
-  });
+export function move(s: Status, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null) {
+  if (s.state === "cancelled" && state !== "cancelled") return false;
+  Object.assign(s, {state, message, error:null, timeLimitSec}); Object.assign(s.loop, {phase, bucket, wait:null});
+  return true;
 }
+export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) =>
+  update(dir, s => { move(s,state,phase,message,bucket,timeout); });
 export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void {
   update(dir, s => {
-    if (s.state === "cancelled") return;
-    s.state = "input_required"; s.loop.phase = "等你"; s.loop.wait = reason; s.message = message;
-    s.loop.bucket = "inputMs"; s.timeLimitSec = null; s.error = null;
-    if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
+    if (!move(s,"input_required","等你",message,"inputMs")) return;
+    s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
   });
 }
 export function fail(dir: string, error: unknown, category?: string): void {
   const raw = error instanceof Error ? error.message : String(error);
-  update(dir, (s) => {
-    if (s.state === "cancelled") return;
-    s.state = "failed"; s.loop.phase = "失败"; s.loop.wait = null; s.message = raw; s.loop.bucket = null; s.timeLimitSec = null;
-    s.error = { category: category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知"), raw };
+  update(dir, s => {
+    if (move(s,"failed","失败",raw,null)) s.error = {category:category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知"), raw};
   });
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
@@ -156,9 +153,8 @@ export function inputs(t: Task) {
 }
 export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))): string[] {
   const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
-  const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash), missing: string[] = [];
-  if (!same.some(c => c.step === "复测" && ["通过", "没验证"].includes(c.result))) missing.push("复测：没有通过记录");
-  if (!same.some(c => c.step === "评审" && c.result === "通过")) missing.push("评审：没有通过记录");
+  const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash);
+  const missing = ["复测", "评审"].filter(step => !same.some(c => c.step === step && (c.result === "通过" || step === "复测" && c.result === "没验证"))).map(step => step + "：没有通过记录");
   if (missing.length && records.length !== same.length) missing.push("提示词或验收标准已变化，原检查不再算数");
   return missing;
 }

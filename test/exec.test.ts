@@ -4,7 +4,7 @@ import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { signalProcess } from "../src/infra/exec.ts";
+import { alive, identity, signalProcess } from "../src/infra/exec.ts";
 import { stop } from "../src/core/lifecycle.ts";
 import { update, statusOf } from "../src/core/store.ts";
 import { fixture, write } from "./helpers.ts";
@@ -36,6 +36,20 @@ for (const stat of ["Z", " Z+\n", "S", "R+", "", new Error("ps failed")]) test("
   else assert.throws(() => signalProcess(p, true), e => e === error);
   assert.equal(kill.mock.callCount(), 1);
   assert.deepEqual(queried, [["-p", String(p.pid), "-o", "lstart="], ["-p", String(p.pid), "-o", "stat="]]);
+});
+test("进程身份只缓存本进程，外部 PID 更换仍重新核对", t => {
+  const self = identity(), original = childProcess.execFileSync;
+  let start = "first", selfReads = 0;
+  t.mock.method(childProcess, "execFileSync", (...args: any[]) => {
+    if (args[0] === "ps" && Number(args[1][1]) === p.pid) return start;
+    if (args[0] === "ps" && Number(args[1][1]) === process.pid) selfReads++;
+    return (original as any)(...args);
+  });
+  syncBuiltinESMExports(); t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  assert.ok(self.startedAt);
+  assert.deepEqual(identity(), self); assert.equal(selfReads, 0);
+  const first = identity(p.pid); assert.equal(alive(first), true);
+  start = "reused PID"; assert.equal(alive(first), false);
 });
 test("signalProcess：ESRCH 仍忽略，不查询 stat", t => {
   const queried = mockPs(t, "S");

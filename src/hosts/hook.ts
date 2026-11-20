@@ -1,4 +1,4 @@
-import { locate, fail, taskOf, statusOf, update } from "../core/store.ts";
+import { locate, fail, taskOf, statusOf, update, move } from "../core/store.ts";
 import { convention } from "./convention.ts";
 import { registerSession, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
@@ -11,8 +11,7 @@ function takeReturn(dir: string): string {
   update(dir, s => {
     if (!(s.state === "working" && s.loop.phase === "开发中") && !(s.state === "input_required" && s.loop.wait === "需手动接入会话")) return;
     reason = s.loop.pendingReturn || ""; if (!reason) return;
-    s.loop.pendingReturn = null; s.state = "working"; s.loop.phase = "开发中"; s.loop.wait = null;
-    s.loop.bucket = "developmentMs"; s.timeLimitSec = null; s.error = null; s.message = "返修要求已通过 hook 交接。\n" + reason;
+    s.loop.pendingReturn = null; move(s,"working","开发中","返修要求已通过 hook 交接。\n" + reason,"developmentMs");
   });
   return reason;
 }

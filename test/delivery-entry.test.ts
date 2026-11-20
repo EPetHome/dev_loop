@@ -2,11 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, write, until } from "./helpers.ts";
+import { fixture, write, until, PASS, sq } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { registerSession, resume, shutdownSession } from "../src/core/lifecycle.ts";
-import { checksOf, statusOf, waitFor, type Task } from "../src/core/store.ts";
+import { checked, checksOf, statusOf, waitFor, type Task } from "../src/core/store.ts";
 import { changes, gitText, head } from "../src/infra/git.ts";
 
 function commit(task: Task, path: string, text: string) {
@@ -67,6 +67,63 @@ test("W1 A15：仅未提交文件，同 SHA 同文件清单只提醒一次；换
   assert.equal(second.wait, "停下没交付");
   assert.equal(view.loop.deliveryConfirmation, undefined);
   assert.equal(existsSync(join(task.dir, "order")), false);
+});
+
+test("W1 r1 必修2 / A15：暂存删除再写回与普通暂存修改属于同一文件清单", async t => {
+  const f = fixture(t), task = await f.prepare(), path = "src/app.txt";
+  const A = deliver(task.dir).commit;
+  gitText(task.worktree, ["rm", "--", path]); write(join(task.worktree, path), "good reconstructed\n");
+  const status = () => gitText(task.worktree, ["status", "--porcelain=v1", "--no-renames", "--untracked-files=all"]);
+  const before = status(), first = await stop(task);
+  gitText(task.worktree, ["add", "--", path]);
+  const after = status(), second = await stop(task);
+  t.diagnostic(JSON.stringify({A, before, after, first, second}));
+  assert.match(before, /^D  src\/app\.txt\n\?\? src\/app\.txt$/);
+  assert.equal(after, "M  src/app.txt");
+  assert.equal(first.continue, true);
+  assert.equal(second.continue, false);
+  assert.equal(second.wait, "停下没交付");
+  assert.deepEqual(changes(task.worktree), [path]);
+  assert.equal(existsSync(join(task.dir, "order")), false);
+});
+
+for (const phase of ["复测", "评审"]) test("W1 r1 必修1 / A16：" + phase + "读取已确认的 B，不读取开发工作区后来写入的 C", async t => {
+  const hold = phase === "复测" ? "test" : "review";
+  const script = 'const fs=require("fs"), dir=process.env.LOOP_TASK_DIR, wait=process.argv[2]===' + JSON.stringify(hold) + ';\n' + `
+const read = () => {
+  const code = fs.readFileSync("src/app.txt", "utf8").trim();
+  fs.appendFileSync(dir+"/contents", process.argv[2]+":"+code+"\\n");
+  if (wait && code === "B") process.exitCode = 1;
+};
+if (!wait) read();
+else {
+  const ready = () => { if (fs.existsSync(dir+"/release")) { w.close(); read(); } };
+  const w = fs.watch(dir,ready);
+  fs.writeFileSync(dir+"/checking-source", ""); ready();
+}
+`;
+  const f = fixture(t, {test: "test -f dist/prepared && test -f local.txt && node read.cjs test",
+    config: {setup: "test -f local.txt && mkdir -p dist && touch dist/prepared"},
+    reviewer: 'node read.cjs review && printf %s ' + sq(PASS), card: {next: "next.json"}});
+  write(join(f.repo, "read.cjs"), script);
+  write(join(f.repo, "next.json"), JSON.stringify({...f.raw, next: undefined}));
+  f.git("add", "read.cjs", "next.json"); f.git("commit", "-m", "isolated check fixture");
+  const task = await f.prepare(), B = commit(task, "src/app.txt", "B\n"), path = join(task.worktree, "src/app.txt");
+  await stop(task); await stop(task);
+  await f.cli(confirmation(task, B));
+  await until(task.dir, () => existsSync(join(task.dir, "checking-source")), Boolean);
+  write(path, "C\n"); write(join(task.dir, "release"), "go");
+  const final = await until(task.dir, () => statusOf(task.dir), s => !s.loop.launcher && !s.loop.finisher && !["已交付", "复测中", "评审中", "收尾中"].includes(s.loop.phase));
+  const read = readFileSync(join(task.dir, "contents"), "utf8"), checks = coreChecks(task);
+  t.diagnostic(JSON.stringify({B, phase, read, checks, end: final.loop.phase, next: final.loop.next ?? null}));
+  assert.equal(read, phase === "复测" ? "test:B\n" : "test:B\nreview:B\nreview:B\n");
+  assert.equal(checked(task.dir, B), false);
+  assert.equal(final.loop.next, undefined);
+  assert.equal(final.loop.delivery?.commit, B);
+  assert.equal(head(task.worktree), B);
+  assert.equal(readFileSync(path, "utf8"), "C\n");
+  assert.deepEqual(changes(task.worktree), ["src/app.txt"]);
+  assert.doesNotMatch(f.git("worktree", "list", "--porcelain"), /dev-loop-(deploy|check)-/);
 });
 
 test("W1 A16：确认查询给出的完整 SHA，只登记现有 B，原会话不重开、后台只派一次", async t => {

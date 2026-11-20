@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, watch, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, chmodSync, rmSync, watch, watchFile, unwatchFile, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { execFileSync, execFile, spawn } from "node:child_process";
@@ -19,7 +19,8 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, "tasks");
   mkdirSync(repo); mkdirSync(root);
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-  git("init", "-b", "dev"); git("config", "user.name", "Loop Test"); git("config", "user.email", "loop-test@example.invalid");
+  git("init", "-b", "dev");
+  appendFileSync(join(repo, ".git", "config"), "\n[user]\n\tname = Loop Test\n\temail = loop-test@example.invalid\n");
   write(join(repo, "src/app.txt"), "good\n"); write(join(repo, "outside.txt"), "protected\n");
   write(join(repo, "prompt.md"), "实现 good；不要改 scope 外文件。\n");
   write(join(repo, "criteria.md"), "A1. 操作：读取 app\n预期：good\n");
@@ -28,7 +29,7 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   write(join(repo, "local.txt"), "local secret fixture\n");
   const reviewer = options.reviewer || "printf '%s' " + sq(PASS);
   write(join(repo, "reviewer.sh"), '#!/bin/sh\nprintf "review\\n" >> "$LOOP_TASK_DIR/order"\n' + reviewer + "\n");
-  execFileSync("chmod", ["+x", join(repo, "reviewer.sh")]);
+  chmodSync(join(repo, "reviewer.sh"), 0o755);
   const command = options.test ?? 'printf "test\\n" >> "$LOOP_TASK_DIR/order"; if grep -q bad src/app.txt; then echo "Error: failed app"; echo "tail marker"; exit 1; fi';
   write(join(repo, ".autoreview.json"), JSON.stringify({ reviewerCmd: "./reviewer.sh", localFiles: ["local.txt"], ...options.config }));
   const raw = {version: 1, name: "one", nature: "开发", base: "dev", target: "dev", host: "pi",
@@ -38,11 +39,11 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   git("add", "."); git("commit", "-m", "fixture");
   const launch = join(base, "fake-launch.cjs");
   write(launch, "#!" + NODE + "\nconst fs=require('fs'); fs.writeFileSync(process.env.LOOP_TASK_DIR+'/opened.json',JSON.stringify({cwd:process.cwd(),args:process.argv.slice(2),task:process.env.LOOP_TASK_DIR}));\n");
-  execFileSync("chmod", ["+x", launch]);
+  chmodSync(launch, 0o755);
   const env: NodeJS.ProcessEnv = {...process.env, LOOP_TASK_DIR: undefined, LOOP_HOST: undefined, LOOP_TASKS_ROOT: root, LOOP_LAUNCH_CMD: launch, PATH: resolve(NODE, "..") + ":" + process.env.PATH};
   let task: Task | undefined;
   t.after(() => {
-    if (existsSync(root)) for (const entry of execFileSync("ls", [root], {encoding:"utf8"}).trim().split("\n").filter(Boolean)) {
+    if (existsSync(root)) for (const entry of readdirSync(root)) {
       try { const s = statusOf(join(root, entry)); signalProcess(s.loop.activeProcess, true); signalProcess(s.loop.launcher, true);
         signalProcess(getJson(join(root, entry, "idle-sleep.json"))); } catch {}
     }
@@ -71,16 +72,18 @@ export async function hostProcess(t: {after: (f: () => any) => any}) {
   return {owner, async exit() { child.send("exit"); await closed; }};
 }
 /** 事件驱动地等文件/状态变化；只有总截止时间，没有固定 sleep。 */
-export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean): Promise<T> {
+export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string): Promise<T> {
   return new Promise((accept, reject) => {
     const signal = AbortSignal.timeout(12000);
-    let watcher: ReturnType<typeof watch>;
-    const close = () => { watcher?.close(); signal.removeEventListener("abort", abort); };
+    let watcher: ReturnType<typeof watch> | undefined;
+    const close = () => { watcher?.close(); if (file) unwatchFile(file,check); signal.removeEventListener("abort", abort); };
     const check = () => {
       try { const value = get(); if (ready(value)) { close(); accept(value); } }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { close(); reject(e); } }
     };
-    const abort = () => { close(); reject(new Error("等待文件事件超时：" + dir)); };
-    watcher = watch(dir, {recursive:true}, check); signal.addEventListener("abort", abort, {once:true}); check();
+    const abort = () => { close(); reject(new Error("等待文件事件超时：" + (file || dir))); };
+    // 长驻替身的普通日志文件用状态变化通知，不依赖 macOS 递归目录事件。
+    if (file) watchFile(file,{interval:50},check); else watcher = watch(dir,{recursive:true},check);
+    signal.addEventListener("abort", abort, {once:true}); check();
   });
 }

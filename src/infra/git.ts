@@ -27,6 +27,6 @@ export const tree = (cwd: string, ref = "HEAD") => gitText(cwd, ["rev-parse", re
 const paths = (s: string) => s.split("\0").filter(Boolean);
 // 状态两列分别检查索引和工作区；不让工作区恢复原样掩盖已暂存的改动。
 export const changes = (cwd: string) =>
-  paths(git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"])).map(line => line.slice(3));
+  [...new Set(paths(git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"])).map(line => line.slice(3)))];
 export const changedSince = (cwd: string, base: string, ref = "HEAD") =>
   paths(git(cwd, ["diff", "--no-renames", "--name-only", "-z", base, ref, "--"]));

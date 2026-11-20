@@ -1,15 +1,11 @@
-import { spawn } from "node:child_process";
-import { openSync, closeSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { APP_ROOT } from "../infra/paths.ts";
+import { detach } from "../infra/exec.ts";
 import { fail, type Task } from "../core/store.ts";
-export async function background(t: Task, resuming: boolean | "review" | {delivery: string} = false, finishing = false): Promise<void> {
-  const fd = openSync(join(t.dir,finishing?"finish.log":"launcher.log"),"a");
-  try {
-    const flags = typeof resuming === "object" ? ["--delivery", resuming.delivery] : resuming === "review" ? ["--review"] : resuming ? ["--resume"] : [];
-    const args=finishing?[join(APP_ROOT,"src/cli/main.ts"),"收尾",t.dir,"--auto","--json"]:[join(APP_ROOT,"src/hosts/launch.ts"),t.dir,...flags];
-    const child = spawn(process.execPath,args,
-      {cwd:t.repo,env:{...process.env,LOOP_TASK_DIR:t.dir,LOOP_TASKS_ROOT:dirname(t.dir)},detached:true,stdio:["ignore",fd,fd]});
-    await new Promise<void>((ok,no)=>{child.once("spawn",ok);child.once("error",no);}); child.unref();
-  } catch(e) { fail(t.dir,e); throw e; } finally { closeSync(fd); }
+export async function background(t: Task, mode: "resume" | "review" | "handoff" | "finish" | {delivery: string} | "" = "") {
+  const finish = mode === "finish", handoff = mode === "handoff";
+  const flags = typeof mode === "object" ? ["--delivery", mode.delivery] : mode ? ["--" + mode] : [];
+  const args = finish ? [join(APP_ROOT,"src/cli/main.ts"),"收尾",t.dir,"--auto","--json"] : [join(APP_ROOT,"src/hosts/launch.ts"),t.dir,...flags];
+  try { await detach(process.execPath,args,join(t.dir,finish?"finish.log":"launcher.log"),t.repo,{...process.env,LOOP_TASK_DIR:t.dir,LOOP_TASKS_ROOT:dirname(t.dir)},handoff); }
+  catch(e) { if (!handoff) fail(t.dir,e); throw e; } // 未领到的接力保留分配，下次收尾可补派。
 }

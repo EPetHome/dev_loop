@@ -1,14 +1,10 @@
-import { spawn } from "node:child_process";
-import { openSync, closeSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { APP_ROOT } from "../infra/paths.ts";
+import { detach } from "../infra/exec.ts";
 import { statusOf, taskOf, checksOf, recordStep } from "../core/store.ts";
-async function worker(dir: string, command: string, log: string, env: NodeJS.ProcessEnv): Promise<void> {
-  const fd = openSync(join(dir,log),"a");
-  try {
-    const child = spawn(join(APP_ROOT,"bin/loop"),[command,dir,...(command==="收尾"?["--auto"]:[]),"--json"],{cwd:taskOf(dir).repo,env:{...process.env,...env,LOOP_TASK_DIR:dir,LOOP_TASKS_ROOT:dirname(dir)},detached:true,stdio:["ignore",fd,fd]});
-    await new Promise<void>((ok,no)=>{child.once("spawn",ok);child.once("error",no);}); child.unref();
-  } finally { closeSync(fd); }
+function worker(dir: string, command: string, log: string, env: NodeJS.ProcessEnv) {
+  return detach(join(APP_ROOT,"bin/loop"),[command,dir,...(command==="收尾"?["--auto"]:[]),"--json"],join(dir,log),taskOf(dir).repo,
+    {...process.env,...env,LOOP_TASK_DIR:dir,LOOP_TASKS_ROOT:dirname(dir)});
 }
 export async function startFinish(dir: string, env = process.env): Promise<void> {
   const s = statusOf(dir);

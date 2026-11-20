@@ -4,9 +4,10 @@ import { lock, BusyError, digest } from "../infra/files.ts";
 import { APP_ROOT } from "../infra/paths.ts";
 import { alive } from "../infra/exec.ts";
 import { git, gitText, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, answersOf, fail, PHASES, type Task } from "./store.ts";
+import { detachedCheckout } from "../infra/checkout.ts";
+import { taskOf, statusOf, update, move, transition, waitFor, inputs, checked, appendCheck, checksOf, answersOf, fail, PHASES, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
-import { heartbeat, retryReview } from "./lifecycle.ts";
+import { copyLocalFiles, heartbeat, retryReview, setup } from "./lifecycle.ts";
 import { executeStaticReview } from "./review-call.ts";
 import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
 import { testLogSummary } from "./test-summary.ts";
@@ -16,8 +17,10 @@ interface SettleOptions {
   signal?: AbortSignal; reviewOnly?: boolean; confirmedCommit?: string;
   ending?: {stopReason?: string; errorMessage?: string};
 }
-const quiet = (reason = ""): SettleResult => ({ continue: false, reason });
-const retry = (reason: string): SettleResult => ({ continue: true, reason });
+const quiet = (reason = ""): SettleResult => ({continue: false, reason});
+function backToDevelopment(dir: string, reason: string): SettleResult {
+  transition(dir,"working","开发中",reason,"developmentMs"); return {continue:true, reason};
+}
 function returnToDeveloper(dir: string, kind: "test" | "review", reason: string): SettleResult {
   const s = update(dir, (s) => { if (kind === "test") s.loop.testReturns++; else s.loop.reviewReturns++; });
   const [count, max, label, cause] = kind === "test" ? [s.loop.testReturns, s.loop.testAllowance, "复测", "复测退回到上限"] as const
@@ -26,12 +29,11 @@ function returnToDeveloper(dir: string, kind: "test" | "review", reason: string)
     waitFor(dir, cause, label + "退回 " + count + " 次，已到上限。可选：再给一轮（bin/loop 续跑）/ 停止 / 接受未验证（bin/loop 合入 " + taskOf(dir).executionId + " --接受未验证）。\n" + reason);
     return quiet(reason);
   }
-  transition(dir, "working", "开发中", reason, "developmentMs");
-  return retry(reason);
+  return backToDevelopment(dir, reason);
 }
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
 export async function settle(dir: string, lastReply = "", {signal, reviewOnly, confirmedCommit, ending}: SettleOptions = {}): Promise<SettleResult> {
-  let release: (() => void) | undefined, pulse: ReturnType<typeof setInterval> | undefined, task: Task | undefined, ownStart = 0, selfBefore = 0;
+  let release: (() => void) | undefined, remove = () => {}, pulse: ReturnType<typeof setInterval> | undefined, task: Task | undefined, ownStart = 0, selfBefore = 0;
   let hashes = { promptHash: "", acceptanceHash: "" };
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
   try {
@@ -55,12 +57,9 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         const reason = (delivery ? "交付后又改了，尚未交付。" : "尚未交付。") + "\n" + scene +
           "\n做完请" + (delivery ? "重新" : "") + "运行 " + APP_ROOT + "/bin/loop 交付。";
         const s = update(dir, s => {
-          if (s.state === "cancelled") return;
-          (s.loop.remindedCandidates ||= []).push(candidate);
-          s.state = "working"; s.loop.phase = "开发中"; s.loop.wait = null;
-          s.loop.bucket = "developmentMs"; s.timeLimitSec = null; s.error = null; s.message = reason;
+          if (move(s,"working","开发中",reason,"developmentMs")) (s.loop.remindedCandidates ||= []).push(candidate);
         });
-        return s.state === "cancelled" ? quiet(s.message) : retry(reason);
+        return s.state === "cancelled" ? quiet(s.message) : {continue:true, reason};
       }
       const error = ending?.stopReason === "error" ? ending.errorMessage || lastReply || "（无出错详情）" : "";
       let reason = lastReply || "开发方未交付；可续跑开发或停止。";
@@ -69,13 +68,12 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
       else if (delivery) reason = "工作区与登记的交付不符；请检查任务分支和 HEAD。\n" + scene;
       waitFor(dir, !candidate && error ? "模型出错" : "停下没交付", reason); return quiet(reason);
     }
-    const h = inputs(t); hashes = { promptHash: h.promptHash, acceptanceHash: h.acceptanceHash };
+    const {prompt, acceptance, ...requirements} = inputs(t); hashes = requirements;
     const complete = (testResult?: string) => {
       const reused = testResult === undefined;
       if (t.after?.length || t.next) {
         if (initial.loop.afterCommit !== commit) {
-          update(dir, s => { s.loop.afterCommit = commit; });
-          transition(dir, "working", "收尾中", "复测、评审通过，等待收尾", "selfMs");
+          update(dir, s => { if (move(s,"working","收尾中","复测、评审通过，等待收尾","selfMs")) s.loop.afterCommit = commit; });
           return quiet("收尾");
         }
         if (reused && !["开发中", "已交付"].includes(initial.loop.phase)) return quiet("沿用");
@@ -84,27 +82,30 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         return quiet(reused ? "等你" : "沿用");
       }
       if (reused && PHASES.indexOf(initial.loop.phase) > PHASES.indexOf("完成")) return quiet("沿用");
-      if (reused) update(dir, s => { s.loop.reused = true; });
       const message = reused ? "沿用此 commit 的复测与评审通过记录" : "此 commit 复测" + (testResult === "没验证" ? "没验证（" + t.test + "）" : "通过") + "，评审通过";
-      transition(dir, "completed", "完成", message, null);
+      update(dir, s => { if (move(s,"completed","完成",message,null) && reused) s.loop.reused = true; });
       return quiet(reused ? "沿用" : "完成");
     };
-    if (checked(dir, commit, h)) return complete();
+    if (checked(dir, commit, hashes)) return complete();
     const reviewTest = reviewOnly ? retryReview(dir) : undefined;
-    if (reviewOnly && !reviewTest) {
-      transition(dir, "working", "开发中", "评审续跑条件已变化，请重新交付。", "developmentMs");
-      return retry("评审续跑条件已变化，请重新交付。");
-    }
+    if (reviewOnly && !reviewTest) return backToDevelopment(dir,"评审续跑条件已变化，请重新交付。");
     const record = (step: string, result: string, start: number, evidence: string[], detail?: string) => appendCheck(dir, {
       commit, tree: delivery.tree, step, result, startedAt: new Date(start).toISOString(), endedAt: new Date().toISOString(),
       durationMs: Date.now() - start, evidence, ...hashes, detail: detail || undefined,
     });
-    const log = join(dir, "test-" + commit + ".log");
+    // 执行锁只协调 dev-loop，不能冻结开发工作区。
+    const {cwd, remove: cleanup} = detachedCheckout(t.repo, commit); remove = cleanup;
+    const pinned = {...t, worktree: cwd}, log = join(dir, "test-" + commit + ".log"), timeout = t.limits.测试.timeoutMin * 60;
+    const verifyPin = () => {
+      const state = git(cwd,["--no-optional-locks","status","--porcelain=v2","--branch","--untracked-files=no"]);
+      if (!state.startsWith("# branch.oid " + commit + "\n") || /^[^#\r\n]/m.test(state)) throw new Error("隔离检出偏离交付 " + commit + "；未登记本步骤通过");
+    };
+    if (!reviewTest) transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", timeout);
+    copyLocalFiles(pinned); if (pinned.config.setup) { verifyPin(); await setup(pinned,"check-setup-"+commit+".log",signal); } verifyPin();
+    if (statusOf(dir).state === "cancelled") return quiet("已停止");
     let testResult = reviewTest?.result || "没验证";
     if (!reviewTest) {
-      const start = Date.now(), timeout = t.limits.测试.timeoutMin * 60;
-      transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", timeout);
-      const result = /^无\s*[:：]/.test(t.test) ? undefined : await run(t, "sh", ["-c", t.test], timeout * 1000, signal);
+      const start = Date.now(), result = /^无\s*[:：]/.test(t.test) ? undefined : await run(pinned, "sh", ["-c", t.test], timeout * 1000, signal);
       selfTime();
       writeFileSync(log, result ? result.output + (result.killed ? "\n复测超时或取消\n" : "") : t.test + "\n");
       if (statusOf(dir).state === "cancelled") { record("复测", "已停止", start, [log]); return quiet("已停止"); }
@@ -115,44 +116,42 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         record("复测", "失败", start, [log], reason);
         return returnToDeveloper(dir, "test", reason);
       }
-      if (result) testResult = "通过";
-      record("复测", testResult, start, [log], "命令：" + t.test);
+      verifyPin();
+      record("复测", testResult = result ? "通过" : "没验证", start, [log], "命令：" + t.test);
     }
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
     const runtime = join(dir,"snapshot-"+commit+".json");
-    if (!reviewTest) await snapshot(t,t.worktree,commit,runtime,"scenario",true,signal);
+    if (!reviewTest) await snapshot(pinned,cwd,commit,runtime,"scenario",true,signal);
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
-    const previous = statusOf(dir).loop, round = previous.reviewRounds + 1;
-    update(dir, (s) => { s.loop.reviewRounds = round; });
-    const lastReview = checksOf(dir).filter((c) => c.step === "评审" && c.commit === previous.previousReviewCommit && ["通过", "必修"].includes(c.result)).at(-1);
-    const sameRequirement = lastReview?.promptHash === h.promptHash && lastReview?.acceptanceHash === h.acceptanceHash;
+    verifyPin();
+    const previous = statusOf(dir).loop, round = previous.reviewRounds + 1, reviewSeconds = t.limits.开发评审.timeoutMin * 60;
+    const lastReview = checksOf(dir).findLast(c => c.step === "评审" && c.commit === previous.previousReviewCommit && ["通过", "必修"].includes(c.result));
+    const sameRequirement = lastReview?.promptHash === hashes.promptHash && lastReview?.acceptanceHash === hashes.acceptanceHash;
     const base = sameRequirement && previous.previousReviewCommit ? previous.previousReviewCommit : t.baseCommit;
-    const diff = git(t.worktree, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--diff-filter=d", base, commit, "--"]);
-    const deleted = git(t.worktree, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--numstat", "--diff-filter=D", "-z", base, commit, "--"]).split("\0").filter(Boolean).map(entry => {
+    const diff = (...flags: string[]) => git(cwd,["diff","--no-ext-diff","--no-textconv",...flags,base,commit,"--"]);
+    const deleted = diff("--no-renames","--numstat","--diff-filter=D","-z").split("\0").filter(Boolean).map(entry => {
       const [, lines, ...path] = entry.split("\t"); return path.join("\t") + "（" + (lines === "-" ? "二进制，行数不适用" : "原 " + lines + " 行") + "）";
     });
-    const added = git(t.worktree, ["diff", "--name-only", "--diff-filter=A", "-z", base, commit, "--"]).split("\0").filter(Boolean);
-    const material = ["## 提示词原文", h.prompt, ...(h.acceptance ? ["## 验收标准", h.acceptance] : []),
-      "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff || "（无改动）", "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", added.join("\n") || "无",
-      "## 运行差异", git(t.worktree,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
+    const material = ["## 提示词原文", prompt, ...(acceptance ? ["## 验收标准", acceptance] : []),
+      "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff("--no-renames","--diff-filter=d") || "（无改动）",
+      "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", diff("--name-only","--diff-filter=A","-z").split("\0").filter(Boolean).join("\n") || "无",
+      "## 运行差异", git(cwd,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
       "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 本人答复", answersOf(dir).map(a => a.at + "\n" + a.text).join("\n\n") || "无", "## 复测结果", testLogSummary(t.test, testResult, log),
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
-    transition(dir, "working", "评审中", "正在评审第 " + round + " 轮", "reviewMs", t.limits.开发评审.timeoutMin * 60);
-    const reviewStart = Date.now(), outcome = await executeStaticReview(t, round, material, t.limits.开发评审.timeoutMin * 60000, signal);
+    update(dir, s => { if (move(s,"working","评审中","正在评审第 " + round + " 轮","reviewMs",reviewSeconds)) s.loop.reviewRounds = round; });
+    const reviewStart = Date.now(), outcome = await executeStaticReview(pinned, round, material, reviewSeconds * 1000, signal);
     selfTime();
     if (statusOf(dir).state === "cancelled") { record("评审", "已停止", reviewStart, outcome.evidence); return quiet("已停止"); }
     if (!outcome.review) {
       record("评审", "失败", reviewStart, outcome.evidence, outcome.error);
       fail(dir, outcome.error || "评审调用失败", outcome.contextOverflow ? "评审上下文超限" : "临时故障"); return quiet(outcome.error);
     }
+    verifyPin();
     const mustFix = outcome.review.mustFix;
     record("评审", mustFix.length ? "必修" : "通过", reviewStart, outcome.evidence, mustFix.join("\n"));
     update(dir, (s) => { s.loop.previousMustFix = mustFix; s.loop.previousReviewCommit = commit; });
     const latest = inputs(t);
-    if (latest.promptHash !== h.promptHash || latest.acceptanceHash !== h.acceptanceHash) {
-      transition(dir, "working", "开发中", "提示词或验收标准在检查期间变化，请重新交付后检查。", "developmentMs");
-      return retry("提示词或验收标准在检查期间变化，请重新交付后检查。");
-    }
+    if (latest.promptHash !== hashes.promptHash || latest.acceptanceHash !== hashes.acceptanceHash) return backToDevelopment(dir,"提示词或验收标准在检查期间变化，请重新交付后检查。");
     if (mustFix.length) return returnToDeveloper(dir, "review", "评审必修：\n" + mustFix.map((s, i) => (i + 1) + ". " + s).join("\n") + "\n修好后重新运行 bin/loop 交付；请逐条回复。");
     return complete(testResult);
   } catch (e) {
@@ -167,6 +166,6 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
           result: s.loop.reused ? "沿用" : s.state === "failed" ? "失败" : "推进", startedAt: new Date(ownStart).toISOString(), endedAt: new Date().toISOString(),
           durationMs: Math.max(0, s.loop.durations.selfMs - selfBefore), evidence: [], ...hashes });
       });
-    } finally { release?.(); }
+    } finally { try { remove(); } finally { release?.(); } }
   }
 }

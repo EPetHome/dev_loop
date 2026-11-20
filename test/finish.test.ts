@@ -187,6 +187,43 @@ test("W1 A18 / 问题单 A4：真实必修退回，返修正式通过才接力�
   assert.deepEqual(checks, [["复测", "通过", B], ["评审", "必修", B], ["复测", "通过", repaired], ["评审", "通过", repaired], ["收尾", "通过", repaired]].map(([step, result, commit]) => ({step, result, commit})));
 });
 
+for (const afterDispatch of [false, true]) test("W1 r1 必修4 / A18：收尾中断后同一下一卡只启动一次 · " + (afterDispatch ? "派发后" : "已分配、派发前"), async t => {
+  const f = fixture(t, {card: {next: "next.json"}});
+  write(join(f.repo, "next.json"), JSON.stringify({...f.raw, next: undefined}));
+  write(f.env.LOOP_LAUNCH_CMD!, "#!" + NODE + '\nrequire("fs").appendFileSync(process.env.LOOP_TASK_DIR+"/opens","open\\n");\n');
+  const first = await f.prepare(), {commit} = deliver(first.dir);
+  await settle(first.dir);
+  const fault = `
+import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const method = ${JSON.stringify(afterDispatch ? "appendFileSync" : "openSync")}, original = fs[method];
+fs[method] = (path, ...args) => {
+  if (String(path).endsWith(${JSON.stringify(afterDispatch ? "/结果.md" : "/launcher.log")})) process.exit(71);
+  return original(path, ...args);
+};
+syncBuiltinESMExports();
+const {finish} = await import(${JSON.stringify(join(ROOT, "src/cli/finish.ts"))});
+await finish(process.argv[1]);
+`;
+  const finisher = spawn(NODE, ["--input-type=module", "-e", fault, first.dir], {env: f.env, stdio: "inherit"});
+  assert.deepEqual(await new Promise(resolve => finisher.once("exit", (...args) => resolve(args))), [71, null]);
+  const interrupted = statusOf(first.dir), next = taskOf(join(f.root, interrupted.loop.next!)), opens = join(next.dir, "opens");
+  assert.equal(interrupted.loop.phase, "收尾中"); assert.equal(interrupted.loop.finisher?.pid, finisher.pid);
+  if (afterDispatch) await until(next.dir, () => existsSync(opens), Boolean);
+  else assert.equal(existsSync(join(next.dir, "launcher.log")), false);
+  const receipt = JSON.parse((await f.cli(["收尾", first.executionId, "--json"])).stdout);
+  const materialized = existsSync(join(next.dir, "launcher.log"));
+  t.diagnostic(JSON.stringify({commit, interrupted: interrupted.loop.phase, allocated: next.executionId, afterDispatch, receipt: receipt.state, materialized, ready: statusOf(next.dir).loop.ready}));
+  assert.equal(receipt.loop.next, next.executionId);
+  assert.equal(receipt.state, "completed");
+  assert.equal(next.baseCommit, commit);
+  assert.equal(materialized, true);
+  await until(next.dir, () => statusOf(next.dir), s => s.loop.ready && !s.loop.launcher);
+  await settle(first.dir); await startFinish(first.dir, f.env);
+  await assert.rejects(f.cli(["收尾", first.executionId, "--json"]), /当前不在待收尾/);
+  assert.equal(readFileSync(opens, "utf8"), "open\n");
+  assert.deepEqual(readdirSync(f.root).sort(), [first.executionId, next.executionId].sort());
+});
+
 for (const after of [false, true]) test("W1 D21：实际开发开场写明登记授权、命令和收尾边界 · " + (after ? "自动收尾" : "无自动收尾"), async t => {
   const f = fixture(t, {card: {flow: after ? flow.slice(0, 3) : flow.slice(0, 2)}}), task = await f.prepare();
   await launchSession(task.dir, false, {env: f.env});

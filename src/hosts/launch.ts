@@ -7,7 +7,7 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, waitFor, update, fail, inputs } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, update, fail, inputs, launchStarted } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startCompanion, startFinish } from "./after-settle.ts";
@@ -17,7 +17,7 @@ interface LaunchOptions {
   startupTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   reviewOnly?: boolean;
-  confirmedCommit?: string;
+  confirmedCommit?: string; handoff?: boolean;
 }
 const launchFiles = (dir: string, id: string) => ({
   request: join(dir, "launch-" + id + ".json"), pid: join(dir, "launch-" + id + "-pid.json"),
@@ -123,7 +123,13 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   update(dir, (s) => { if (s.state === "working") { s.message = "pi 开发会话已登记"; s.loop.bucket = "developmentMs"; s.timeLimitSec = null; } });
 }
 export async function launchMain(dir: string, resuming: boolean, options: LaunchOptions = {}): Promise<void> {
-  update(dir, (s) => { s.loop.launcher = identity(); });
+  let claimed = false;
+  const s = update(dir, s => {
+    if (options.handoff && (s.state !== "working" || launchStarted(s))) return;
+    s.loop.launcher = identity(); s.loop.launchStarted = claimed = true;
+  });
+  if (options.handoff && launchStarted(s)) process.send?.("started", () => {}); // 持久领取之后才应答。
+  if (!claimed) return;
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
     if (options.reviewOnly || options.confirmedCommit) {
@@ -148,6 +154,6 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [target, mode, value] = process.argv.slice(2);
   const main = target === "--terminal" ? terminalSession(resolve(mode), value).then(code => { process.exitCode = code; })
-    : launchMain(resolve(target), mode === "--resume", {reviewOnly: mode === "--review", confirmedCommit: mode === "--delivery" ? value : undefined});
+    : launchMain(resolve(target), mode === "--resume", {reviewOnly: mode === "--review", confirmedCommit: mode === "--delivery" ? value : undefined, handoff: mode === "--handoff"});
   main.catch((e)=>{console.error(e);process.exitCode=1;});
 }

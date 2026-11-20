@@ -1,41 +1,44 @@
-import { cpSync, existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { gitText, head, changes } from "../infra/git.ts";
 import { inside } from "../infra/config.ts";
 import { lock, appendJson } from "../infra/files.ts";
 import { InputError } from "./card.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
-import { taskOf, statusOf, answersOf, update, transition, appendCheck, checksOf, inputs, checked, type Status } from "./store.ts";
+import { taskOf, statusOf, answersOf, update, move, transition, appendCheck, checksOf, inputs, checked, type Status, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
+export function copyLocalFiles(t: Task, cwd = t.worktree) {
+  for (const path of t.config.localFiles) {
+    const source = resolve(t.repo, path), dest = resolve(cwd, path);
+    if (!existsSync(source)) throw new Error("localFiles 不存在：" + source);
+    mkdirSync(dirname(dest), {recursive: true});
+    if (!inside(realpathSync(cwd), realpathSync(dirname(dest)))) throw new Error("localFiles 目标越出 worktree：" + path);
+    cpSync(source, dest, {recursive: true, dereference: false, force: true});
+  }
+}
+export async function setup(t: Task, log: string, signal?: AbortSignal) {
+  if (!t.config.setup) return;
+  const result = await run(t, "sh", ["-c", t.config.setup], t.limits.测试.timeoutMin * 60000, signal);
+  writeFileSync(join(t.dir, log), result.output);
+  if ((result.code || result.killed) && statusOf(t.dir).state !== "cancelled") throw new Error("setup 失败（可修正环境后续跑）\n" + result.output);
+}
 export async function prepare(dir: string): Promise<void> {
   const release = lock(operationPath(dir), 2000), t = taskOf(dir), start = Date.now();
   try {
     if (statusOf(dir).state === "cancelled") return;
     if (!statusOf(dir).loop.prepared) {
       if (!existsSync(join(t.worktree, ".git"))) gitText(t.repo, ["worktree", "add", "-b", t.branch, t.worktree, t.baseCommit]);
-      for (const path of t.config.localFiles) {
-        const source = resolve(t.repo, path), dest = resolve(t.worktree, path);
-        if (!existsSync(source)) throw new Error("localFiles 不存在：" + source);
-        mkdirSync(dirname(dest), { recursive: true });
-        if (!inside(realpathSync(t.worktree), realpathSync(dirname(dest)))) throw new Error("localFiles 目标越出 worktree：" + path);
-        cpSync(source, dest, { recursive: true, dereference: false, force: true });
-      }
-      update(dir, (s) => { s.loop.prepared = true; });
+      copyLocalFiles(t); update(dir, s => { s.loop.prepared = true; });
     }
     if (t.config.setup && !statusOf(dir).loop.ready) {
       update(dir, (s) => { s.timeLimitSec = t.limits.测试.timeoutMin * 60; });
-      const result = await run(t, "sh", ["-c", t.config.setup], t.limits.测试.timeoutMin * 60000);
-      const { writeFileSync } = await import("node:fs");
-      writeFileSync(join(dir, "setup.log"), result.output);
-      if (statusOf(dir).state === "cancelled") return;
-      if (result.code !== 0) throw new Error("setup 失败（可修正环境后续跑）\n" + result.output);
+      await setup(t, "setup.log");
     }
     if (statusOf(dir).state === "cancelled") return;
-    const h = inputs(t);
-    appendCheck(dir, { promptHash: h.promptHash, acceptanceHash: h.acceptanceHash, commit: t.baseCommit, tree: gitText(t.worktree, ["rev-parse", "HEAD^{tree}"]),
+    const {promptHash, acceptanceHash} = inputs(t);
+    appendCheck(dir, {promptHash, acceptanceHash, commit: t.baseCommit, tree: gitText(t.worktree, ["rev-parse", "HEAD^{tree}"]),
       step: "dev-loop 自身", result: "就绪", startedAt: new Date(start).toISOString(), endedAt: new Date().toISOString(), durationMs: Date.now() - start, evidence: t.config.setup ? [join(dir, "setup.log")] : [] });
-    update(dir, (s) => { s.loop.ready = true; });
-    transition(dir, "working", "开发中", "工作区已就绪，等待开发会话", "developmentMs");
+    update(dir, s => { if (move(s,"working","开发中","工作区已就绪，等待开发会话","developmentMs")) s.loop.ready = true; });
   } finally { release(); }
 }
 export function registerSession(dir: string, host: string, id: string, pid = process.pid, file?: string): boolean {
@@ -87,8 +90,7 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
   }
   if (text === undefined && s.state === "failed" && s.error?.category === "临时故障" && retryReview(dir)) {
     const status = update(dir, s => {
-      s.loop.facts!.resumes++; s.state = "working"; s.loop.phase = "评审中"; s.loop.wait = null; s.error = null;
-      s.loop.reused = false; s.loop.bucket = "selfMs"; s.timeLimitSec = null; s.message = "已续跑，后台只重做评审";
+      if (move(s,"working","评审中","已续跑，后台只重做评审","selfMs")) { s.loop.facts!.resumes++; s.loop.reused = false; }
     });
     return {reused: false, running: Boolean(running), reviewOnly: true, status};
   }
