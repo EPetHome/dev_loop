@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkout } from "../infra/checkout.ts";
 import { changes, gitText, head } from "../infra/git.ts";
@@ -12,10 +12,8 @@ export function publicStatus(dir: string) {
   const s = statusOf(dir);
   if (!waitingForDelivery(s)) return s;
   try {
-    const t = taskOf(dir);
-    if (!existsSync(t.worktree) || !onTaskBranch(t) || changes(t.worktree).length) return s;
-    const commit = head(t.worktree);
-    if (!undeliveredCommit(t, s, commit)) return s;
+    const t = taskOf(dir), commit = head(t.worktree);
+    if (!onTaskBranch(t) || !undeliveredCommit(t, s, commit) || changes(t.worktree).length) return s;
     const deliveryConfirmation = {label: "用当前提交交付", commit, command: APP_ROOT + "/bin/loop 续跑 " + t.executionId + " --交付提交 " + commit};
     return {...s, loop: {...s.loop, deliveryConfirmation}};
   } catch { return s; } // Git 现场不可读时仍返回状态，但不声称可确认。

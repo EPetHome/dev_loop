@@ -90,10 +90,14 @@ for (const host of ["claude", "codex"]) test("r1必修1：" + host + "宿主退�
   await worker.exit(); write(driver.clock, JSON.stringify(Date.now())); await driver.event("off", lease.pid);
   assert.equal(statusOf(task.dir).state, "working", "退出释放不依赖新状态更新或人工清理");
 });
-test("防睡命令不可用只记原始错误，不成为新拒绝点", async t => {
-  const f = fixture(t), previous = process.env.LOOP_CAFFEINATE_CMD;
-  process.env.LOOP_CAFFEINATE_CMD = join(f.base, "missing-command"); t.after(() => { process.env.LOOP_CAFFEINATE_CMD = previous; });
-  const task = await f.prepare(); assert.equal(statusOf(task.dir).state, "working");
-  await until(task.dir, () => readFileSync(join(task.dir, "idle-sleep.log"), "utf8"), text => text.includes("ENOENT"));
-  stop(task.dir);
+test("防睡命令不可用只记原始错误，不成为新拒绝点", t => {
+  const f = fixture(t), env = {...f.env, LOOP_CAFFEINATE_CMD: join(f.base, "missing-command")};
+  const script = 'const {createTask}=await import(' + JSON.stringify(join(ROOT, "src/core/store.ts")) + ');' +
+    'const {prepare}=await import(' + JSON.stringify(join(ROOT, "src/core/lifecycle.ts")) + ');' +
+    'const {dir}=createTask(process.argv[1],process.argv[2]);await prepare(dir);console.log(dir);';
+  // 等进程退出，spawn 的 error 事件已处理；不依赖新建日志的 FS watch 通知。
+  const dir = execFileSync(NODE, ["--input-type=module", "-e", script, f.card, f.root], {env, encoding: "utf8", timeout: 12000}).trim();
+  assert.equal(statusOf(dir).state, "working");
+  assert.match(readFileSync(join(dir, "idle-sleep.log"), "utf8"), /ENOENT/);
+  stop(dir);
 });

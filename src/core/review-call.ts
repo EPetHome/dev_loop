@@ -1,34 +1,23 @@
 /** 从旧 staticReviewer/executeStaticReview 精简：新上下文、只读工具、限时、重试一次、保留原文。 */
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { join, isAbsolute, resolve } from "node:path";
+import { mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { APP_ROOT } from "../infra/paths.ts";
+import { jsonLines } from "../infra/files.ts";
 import { run } from "./run.ts";
 import { parseReview } from "./review-parse.ts";
 import { statusOf, type Task } from "./store.ts";
 
 const overflow = /\bcontext_length_exceeded\b|\bprompt(?: is| was)? too long\b|\bexceed(?:s|ed|ing)? (?:the )?(?:model.s )?(?:maximum )?context (?:window|length|limit)\b|\b(?:maximum context length is \d+|context (?:window|length|limit) (?:has been |was |is )?exceeded)\b/i;
-/** 只看本次调用独占的目录及匹配 ID 的会话最后一条助手消息，不从评审正文猜错因。 */
-function contextError(dir: string, id: string): {raw: string; path: string} | undefined {
-  for (const file of readdirSync(dir, {withFileTypes: true})) {
-    if (!file.isFile() || !file.name.endsWith(".jsonl")) continue;
-    const path = join(dir, file.name);
-    try {
-      const [first, ...lines] = readFileSync(path, "utf8").split("\n");
-      const header = JSON.parse(first);
-      if (header?.type !== "session" || header.id !== id) continue;
-      for (const line of lines.reverse()) {
-        let entry;
-        try { entry = JSON.parse(line); } catch { continue; }
-        const message = entry?.message;
-        if (entry?.type !== "message" || message?.role !== "assistant") continue;
-        if (message.stopReason === "error" && typeof message.errorMessage === "string" && overflow.test(message.errorMessage)) {
-          return {raw: message.errorMessage, path};
-        }
-        break;
-      }
-    } catch {} // 会话可能根本未能写出；评审失败仍走原调用结果。
-  }
+function contextError(dir: string, id: string) {
+  try {
+    const file = readdirSync(dir).find(name => name.endsWith("_" + id + ".jsonl"));
+    if (!file) return;
+    const path = join(dir, file), records = jsonLines<{type: string; id?: string; message?: {role: string; stopReason?: string; errorMessage?: string}}>(path);
+    if (records[0]?.type !== "session" || records[0].id !== id) return;
+    const end = records.findLast(entry => entry.type === "message" && entry.message?.role === "assistant")?.message;
+    if (end?.stopReason === "error" && typeof end.errorMessage === "string" && overflow.test(end.errorMessage)) return {raw: end.errorMessage, path};
+  } catch {} // 未写出可读会话时，按调用结果走普通重试。
 }
 export async function executeStaticReview(t: Task, round: number, input: string, timeoutMs: number, signal?: AbortSignal) {
   const inputPath = join(t.dir, "review-input-r" + round + ".md"), evidence: string[] = [];
@@ -39,9 +28,8 @@ export async function executeStaticReview(t: Task, round: number, input: string,
     if (statusOf(t.dir).state === "cancelled") return { error: "已停止", evidence };
     const remaining = deadline - Date.now(), session = randomUUID();
     if (remaining <= 0) { rawError += "\n评审每轮时限已用完，无法再次调用"; break; }
-    const sessionDir = join(t.dir, "review-sessions", session);
-    const cmd = t.config.reviewerCmd;
-    const command = cmd ? isAbsolute(cmd) ? cmd : resolve(t.worktree, cmd) : process.env.PI_BIN || "/Users/Admin/.local/bin/pi";
+    const sessionDir = join(t.dir, "review-sessions", session), cmd = t.config.reviewerCmd;
+    const command = cmd ? resolve(t.worktree, cmd) : process.env.PI_BIN || "/Users/Admin/.local/bin/pi";
     const args = cmd ? [String(round), inputPath, session] : ["--offline", "-p", "--session-id", session, "--session-dir", sessionDir,
       "--model", t.config.reviewerModel, "--thinking", t.config.reviewerThinking, "--no-extensions", "--no-mcp",
       "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",

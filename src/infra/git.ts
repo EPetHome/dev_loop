@@ -25,10 +25,8 @@ export const repoRoot = (cwd: string) => gitText(cwd, ["rev-parse", "--show-topl
 export const head = (cwd: string) => gitText(cwd, ["rev-parse", "HEAD"]);
 export const tree = (cwd: string, ref = "HEAD") => gitText(cwd, ["rev-parse", ref + "^{tree}"]);
 const paths = (s: string) => s.split("\0").filter(Boolean);
-export function changes(cwd: string): string[] {
-  return [...new Set([...paths(git(cwd, ["diff", "--cached", "--no-renames", "--name-only", "-z", "HEAD", "--"])),
-    ...paths(git(cwd, ["diff", "--no-renames", "--name-only", "-z", "--"])),
-    ...paths(git(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]))])];
-}
+// 状态两列分别检查索引和工作区；不让工作区恢复原样掩盖已暂存的改动。
+export const changes = (cwd: string) =>
+  paths(git(cwd, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"])).map(line => line.slice(3));
 export const changedSince = (cwd: string, base: string, ref = "HEAD") =>
   paths(git(cwd, ["diff", "--no-renames", "--name-only", "-z", base, ref, "--"]));

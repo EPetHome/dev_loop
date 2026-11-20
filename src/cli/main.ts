@@ -25,8 +25,7 @@ function options(args: string[]): Options {
     if (arg === "--推送" && out.command === "合入") { out.push = true; continue; }
     if (arg === "--auto" && out.command === "收尾") { out.automatic = true; continue; }
     if (arg === "--commit" && !["合入", "部署"].includes(out.command)) throw new InputError("未知选项：" + arg);
-    if (arg === "--交付提交" && out.command !== "续跑") throw new InputError("未知选项：" + arg);
-    if (arg === "--交付提交" && out.deliveryCommit) throw new InputError("只能指定一个 --交付提交");
+    if (arg === "--交付提交" && (out.command !== "续跑" || out.deliveryCommit)) throw new InputError("仅可在续跑时指定一次 --交付提交");
     const field = {"--commit":"commit","--交付提交":"deliveryCommit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--话":"words","--text-file":"file"}[arg];
     if (field) {
       const value = args.shift(); if (value === undefined || (field !== "words" && (!value || value.startsWith("--")))) throw new InputError(arg + " 缺值");
@@ -100,19 +99,18 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
     return deliver(dir,o.note);
   }
   if(o.command==="续跑" || o.command==="答复") {
-    const dir=select(o);
+    const dir=select(o), t=taskOf(dir);
     if(o.deliveryCommit) {
-      const t=taskOf(dir);
       if(o.target!==t.executionId)throw new InputError("--交付提交 须指定查询给出的执行编号");
       const receipt=confirmDelivery(dir,o.deliveryCommit);
       if(receipt.status.loop.phase==="已交付")await background(t,{delivery:receipt.commit});
       return {executionId:t.executionId,...receipt};
     }
     const result=resume(dir,o.words,o.command==="答复");
-    if(result.reviewOnly)await background(taskOf(dir),"review");
-    else if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
-    else if(!result.reused && !result.running)await background(taskOf(dir),true);
-    return {executionId:taskOf(dir).executionId,...result};
+    if(result.reviewOnly)await background(t,"review");
+    else if(result.status.loop.phase==="收尾中")await background(t,false,true);
+    else if(!result.reused && !result.running)await background(t,true);
+    return {executionId:t.executionId,...result};
   }
   if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");
   if(o.command==="对比") return comparison(select(o),o.other?select({...o,target:o.other}):undefined);

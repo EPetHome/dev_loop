@@ -64,8 +64,7 @@ export function summary(dir: string, s = statusOf(dir)): void {
       const records = checks.filter(c => c.step === extra);
       lines.push("| " + extra + " | " + records.at(-1)!.result + " | " + (records.reduce((n, c) => n + c.durationMs, 0) / 1000).toFixed(2) + "s |");
     }
-    const step = bucket === "testMs" ? "复测" : bucket === "reviewMs" ? "评审" : label;
-    const last = checks.filter((c) => c.step === step).at(-1);
+    const last = checks.findLast(c => c.step === label);
     const result = last?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
     lines.push("| " + label + " | " + result + " | " + (s.loop.durations[bucket as Bucket] / 1000).toFixed(2) + "s |");
   }
@@ -155,7 +154,7 @@ export function inputs(t: Task) {
   const prompt = readFileSync(t.prompt, "utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance, "utf8") : "";
   return { prompt, acceptance, promptHash: digest(prompt), acceptanceHash: digest(acceptance) };
 }
-export function missingChecks(dir: string, commit: string, hashes = inputs(taskOf(dir))): string[] {
+export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))): string[] {
   const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
   const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash), missing: string[] = [];
   if (!same.some(c => c.step === "复测" && ["通过", "没验证"].includes(c.result))) missing.push("复测：没有通过记录");
@@ -163,7 +162,7 @@ export function missingChecks(dir: string, commit: string, hashes = inputs(taskO
   if (missing.length && records.length !== same.length) missing.push("提示词或验收标准已变化，原检查不再算数");
   return missing;
 }
-export const checked = (dir: string, commit: string, hashes = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
+export const checked = (dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
 interface StepView { phase: Phase; message: string; complete?: boolean }
 function stepView(dir: string, view: StepView): void {
   update(dir, s => {

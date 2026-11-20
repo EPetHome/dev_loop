@@ -3,8 +3,8 @@ import { join } from "node:path";
 import { lock, BusyError, digest } from "../infra/files.ts";
 import { APP_ROOT } from "../infra/paths.ts";
 import { alive } from "../infra/exec.ts";
-import { git, head, tree, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, answersOf, summary, fail, PHASES, type Check, type Task } from "./store.ts";
+import { git, gitText, changes } from "../infra/git.ts";
+import { taskOf, statusOf, update, transition, waitFor, inputs, checked, appendCheck, checksOf, answersOf, fail, PHASES, type Task } from "./store.ts";
 import { operationPath, run } from "./run.ts";
 import { heartbeat, retryReview } from "./lifecycle.ts";
 import { executeStaticReview } from "./review-call.ts";
@@ -20,10 +20,10 @@ const quiet = (reason = ""): SettleResult => ({ continue: false, reason });
 const retry = (reason: string): SettleResult => ({ continue: true, reason });
 function returnToDeveloper(dir: string, kind: "test" | "review", reason: string): SettleResult {
   const s = update(dir, (s) => { if (kind === "test") s.loop.testReturns++; else s.loop.reviewReturns++; });
-  const count = kind === "test" ? s.loop.testReturns : s.loop.reviewReturns;
-  const max = kind === "test" ? s.loop.testAllowance : s.loop.reviewAllowance;
+  const [count, max, label, cause] = kind === "test" ? [s.loop.testReturns, s.loop.testAllowance, "复测", "复测退回到上限"] as const
+    : [s.loop.reviewReturns, s.loop.reviewAllowance, "评审必修", "评审必修到上限"] as const;
   if (count >= max) {
-    waitFor(dir, kind === "test" ? "复测退回到上限" : "评审必修到上限", (kind === "test" ? "复测" : "评审必修") + "退回 " + count + " 次，已到上限。可选：再给一轮（bin/loop 续跑）/ 停止 / 接受未验证（bin/loop 合入 " + taskOf(dir).executionId + " --接受未验证）。\n" + reason);
+    waitFor(dir, cause, label + "退回 " + count + " 次，已到上限。可选：再给一轮（bin/loop 续跑）/ 停止 / 接受未验证（bin/loop 合入 " + taskOf(dir).executionId + " --接受未验证）。\n" + reason);
     return quiet(reason);
   }
   transition(dir, "working", "开发中", reason, "developmentMs");
@@ -46,13 +46,14 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
     if (!initial.loop.ready) return quiet("工作区正在准备");
     pulse = setInterval(() => heartbeat(dir), 60000); pulse.unref();
     task = t; ownStart = Date.now(); selfBefore = initial.loop.durations.selfMs; selfTime();
-    const delivery = initial.loop.delivery, commit = head(t.worktree), dirty = changes(t.worktree);
-    const modelError = ending?.stopReason === "error" ? ending.errorMessage || lastReply || "（无出错详情）" : "";
-    const scene = "当前提交：" + commit + "\n上次登记：" + (delivery?.commit || "还没登记");
-    if (dirty.length || undeliveredCommit(t, initial, commit)) {
-      const candidate = digest(JSON.stringify([commit, dirty.sort()]));
-      if (!initial.loop.remindedCandidates?.includes(candidate)) {
-        const reason = "尚未交付。\n" + scene + "\n做完请" + (delivery ? "重新" : "") + "运行 " + APP_ROOT + "/bin/loop 交付。";
+    const [commit, currentTree] = gitText(t.worktree, ["rev-parse", "HEAD", "HEAD^{tree}"]).split("\n");
+    const delivery = initial.loop.delivery, dirty = changes(t.worktree);
+    if (dirty.length || !delivery || commit !== delivery.commit || currentTree !== delivery.tree || (confirmedCommit && !onTaskBranch(t))) {
+      const candidate = dirty.length || undeliveredCommit(t, initial, commit) ? digest(JSON.stringify([commit, dirty.sort()])) : "";
+      const scene = "当前提交：" + commit + "\n上次登记：" + (delivery?.commit || "还没登记");
+      if (candidate && !initial.loop.remindedCandidates?.includes(candidate)) {
+        const reason = (delivery ? "交付后又改了，尚未交付。" : "尚未交付。") + "\n" + scene +
+          "\n做完请" + (delivery ? "重新" : "") + "运行 " + APP_ROOT + "/bin/loop 交付。";
         const s = update(dir, s => {
           if (s.state === "cancelled") return;
           (s.loop.remindedCandidates ||= []).push(candidate);
@@ -61,71 +62,61 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         });
         return s.state === "cancelled" ? quiet(s.message) : retry(reason);
       }
-      const reason = ["候选仍未交付；可查询执行、续跑开发或停止。", scene, modelError || lastReply].filter(Boolean).join("\n");
-      waitFor(dir, "停下没交付", reason); return quiet(reason);
-    }
-    // 不用旧 commit 的检查放行回退、分叉或内容相同的新 HEAD。
-    if (!delivery || commit !== delivery.commit || tree(t.worktree, commit) !== delivery.tree || (confirmedCommit && !onTaskBranch(t))) {
-      if (modelError) {
-        const reason = "模型出错；可续跑开发或停止。\n" + modelError;
-        waitFor(dir, "模型出错", reason); return quiet(reason);
-      }
-      const reason = delivery ? "工作区与登记的交付不符；请检查任务分支和 HEAD。\n" + scene : lastReply || "开发方未交付；可续跑开发或停止。";
-      waitFor(dir, "停下没交付", reason); return quiet(reason);
+      const error = ending?.stopReason === "error" ? ending.errorMessage || lastReply || "（无出错详情）" : "";
+      let reason = lastReply || "开发方未交付；可续跑开发或停止。";
+      if (candidate) reason = ["候选仍未交付；可查询执行、续跑开发或停止。", scene, error || lastReply].filter(Boolean).join("\n");
+      else if (error) reason = "模型出错；可续跑开发或停止。\n" + error;
+      else if (delivery) reason = "工作区与登记的交付不符；请检查任务分支和 HEAD。\n" + scene;
+      waitFor(dir, !candidate && error ? "模型出错" : "停下没交付", reason); return quiet(reason);
     }
     const h = inputs(t); hashes = { promptHash: h.promptHash, acceptanceHash: h.acceptanceHash };
-    const finishing = () => {
-      update(dir, s => { s.loop.afterCommit = commit; });
-      transition(dir, "working", "收尾中", "复测、评审通过，等待收尾", "selfMs");
-      return quiet("收尾");
-    };
-    if (checked(dir, commit, h)) {
+    const complete = (testResult?: string) => {
+      const reused = testResult === undefined;
       if (t.after?.length || t.next) {
-        if (initial.loop.afterCommit !== commit) return finishing();
-        if (["开发中", "已交付"].includes(initial.loop.phase)) {
-          waitFor(dir, "收尾没走完", "代码没有改动。可运行 bin/loop 收尾 " + t.executionId + " 重试，或修改后重新交付。");
-          return quiet("等你");
+        if (initial.loop.afterCommit !== commit) {
+          update(dir, s => { s.loop.afterCommit = commit; });
+          transition(dir, "working", "收尾中", "复测、评审通过，等待收尾", "selfMs");
+          return quiet("收尾");
         }
-        return quiet("沿用");
+        if (reused && !["开发中", "已交付"].includes(initial.loop.phase)) return quiet("沿用");
+        if (!reused && initial.state === "completed") transition(dir, "completed", initial.loop.phase, "沿用此 commit 已走完的收尾", null);
+        else waitFor(dir, "收尾没走完", reused ? "代码没有改动。可运行 bin/loop 收尾 " + t.executionId + " 重试，或修改后重新交付。" : "同一 commit 不重复自动收尾；请修改后交付或手工运行 bin/loop 收尾 " + t.executionId);
+        return quiet(reused ? "等你" : "沿用");
       }
-      if (PHASES.indexOf(initial.loop.phase) > PHASES.indexOf("完成")) return quiet("沿用");
-      update(dir, (s) => { s.loop.reused = true; });
-      transition(dir, "completed", "完成", "沿用此 commit 的复测与评审通过记录", null);
-      return quiet("沿用");
-    }
+      if (reused && PHASES.indexOf(initial.loop.phase) > PHASES.indexOf("完成")) return quiet("沿用");
+      if (reused) update(dir, s => { s.loop.reused = true; });
+      const message = reused ? "沿用此 commit 的复测与评审通过记录" : "此 commit 复测" + (testResult === "没验证" ? "没验证（" + t.test + "）" : "通过") + "，评审通过";
+      transition(dir, "completed", "完成", message, null);
+      return quiet(reused ? "沿用" : "完成");
+    };
+    if (checked(dir, commit, h)) return complete();
     const reviewTest = reviewOnly ? retryReview(dir) : undefined;
     if (reviewOnly && !reviewTest) {
       transition(dir, "working", "开发中", "评审续跑条件已变化，请重新交付。", "developmentMs");
       return retry("评审续跑条件已变化，请重新交付。");
     }
-    const record = (step: string, result: string, start: number, evidence: string[], detail = "") => {
-      const c: Check = { commit, tree: delivery.tree, step, result, startedAt: new Date(start).toISOString(),
-        endedAt: new Date().toISOString(), durationMs: Date.now() - start, evidence,
-        promptHash: h.promptHash, acceptanceHash: h.acceptanceHash, ...(detail ? { detail } : {}) };
-      appendCheck(dir, c);
-    };
-    const testStart = Date.now(), log = join(dir, "test-" + commit + ".log");
-    let testResult = reviewTest?.result || "";
+    const record = (step: string, result: string, start: number, evidence: string[], detail?: string) => appendCheck(dir, {
+      commit, tree: delivery.tree, step, result, startedAt: new Date(start).toISOString(), endedAt: new Date().toISOString(),
+      durationMs: Date.now() - start, evidence, ...hashes, detail: detail || undefined,
+    });
+    const log = join(dir, "test-" + commit + ".log");
+    let testResult = reviewTest?.result || "没验证";
     if (!reviewTest) {
-      transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", t.limits.测试.timeoutMin * 60);
-      if (/^无\s*[:：]/.test(t.test)) {
-        testResult = "没验证"; writeFileSync(log, t.test + "\n");
-      } else {
-        const result = await run(t, "sh", ["-c", t.test], t.limits.测试.timeoutMin * 60000, signal);
-        selfTime();
-        testResult = result.code === 0 && !result.killed ? "通过" : "失败";
-        writeFileSync(log, result.output + (result.killed ? "\n复测超时或取消\n" : ""));
-        if (statusOf(dir).state === "cancelled") { record("复测", "已停止", testStart, [log]); return quiet("已停止"); }
-        if (testResult === "失败") {
-          const lines = result.output.trimEnd().split(/\r?\n/);
-          const reason = ["复测失败" + (result.killed ? "（超时或取消）" : "") + "，请修复后重新交付。", "命令：" + t.test,
-            "输出最后 60 行：", ...lines.slice(-60), "error/fail 行：", ...lines.filter((s) => /error|fail/i.test(s))].join("\n");
-          record("复测", "失败", testStart, [log], reason);
-          return returnToDeveloper(dir, "test", reason);
-        }
-      }
+      const start = Date.now(), timeout = t.limits.测试.timeoutMin * 60;
+      transition(dir, "working", "复测中", "正在复测：" + t.test, "testMs", timeout);
+      const result = /^无\s*[:：]/.test(t.test) ? undefined : await run(t, "sh", ["-c", t.test], timeout * 1000, signal);
       selfTime();
-      record("复测", testResult, testStart, [log], "命令：" + t.test);
+      writeFileSync(log, result ? result.output + (result.killed ? "\n复测超时或取消\n" : "") : t.test + "\n");
+      if (statusOf(dir).state === "cancelled") { record("复测", "已停止", start, [log]); return quiet("已停止"); }
+      if (result && (result.code !== 0 || result.killed)) {
+        const lines = result.output.trimEnd().split(/\r?\n/);
+        const reason = ["复测失败" + (result.killed ? "（超时或取消）" : "") + "，请修复后重新交付。", "命令：" + t.test,
+          "输出最后 60 行：", ...lines.slice(-60), "error/fail 行：", ...lines.filter(s => /error|fail/i.test(s))].join("\n");
+        record("复测", "失败", start, [log], reason);
+        return returnToDeveloper(dir, "test", reason);
+      }
+      if (result) testResult = "通过";
+      record("复测", testResult, start, [log], "命令：" + t.test);
     }
     if (statusOf(dir).state === "cancelled") return quiet("已停止");
     const runtime = join(dir,"snapshot-"+commit+".json");
@@ -163,27 +154,19 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
       return retry("提示词或验收标准在检查期间变化，请重新交付后检查。");
     }
     if (mustFix.length) return returnToDeveloper(dir, "review", "评审必修：\n" + mustFix.map((s, i) => (i + 1) + ". " + s).join("\n") + "\n修好后重新运行 bin/loop 交付；请逐条回复。");
-    if (t.after?.length || t.next) {
-      if (initial.loop.afterCommit !== commit) return finishing();
-      if (initial.state === "completed") transition(dir,"completed",initial.loop.phase,"沿用此 commit 已走完的收尾",null);
-      else waitFor(dir,"收尾没走完","同一 commit 不重复自动收尾；请修改后交付或手工运行 bin/loop 收尾 " + t.executionId);
-      return quiet("沿用");
-    }
-    transition(dir, "completed", "完成", "此 commit 复测" + (testResult === "没验证" ? "没验证（" + t.test + "）" : "通过") + "，评审通过", null);
-    return quiet("完成");
+    return complete(testResult);
   } catch (e) {
     if (release) fail(dir, e);
     return quiet(e instanceof Error ? e.message : String(e));
   } finally {
     clearInterval(pulse);
     try {
-      if (task && ownStart) {
-        const s = update(dir, (s) => { if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? s.loop.phase === "收尾中" ? "selfMs" : "developmentMs" : null; });
-        appendCheck(dir, { commit: s.loop.commit || task.baseCommit, tree: s.loop.delivery?.tree || "", step: "dev-loop 自身",
+      if (task && ownStart) update(dir, s => {
+        if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? s.loop.phase === "收尾中" ? "selfMs" : "developmentMs" : null;
+        appendCheck(dir, { commit: s.loop.commit || task!.baseCommit, tree: s.loop.delivery?.tree || "", step: "dev-loop 自身",
           result: s.loop.reused ? "沿用" : s.state === "failed" ? "失败" : "推进", startedAt: new Date(ownStart).toISOString(), endedAt: new Date().toISOString(),
           durationMs: Math.max(0, s.loop.durations.selfMs - selfBefore), evidence: [], ...hashes });
-        summary(dir, s);
-      }
+      });
     } finally { release?.(); }
   }
 }
