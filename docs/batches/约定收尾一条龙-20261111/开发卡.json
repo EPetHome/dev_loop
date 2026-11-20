@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "约定收尾一条龙-20261111",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": ["开发评审", "测试"],
+  "acceptance": "../../需求-约定收尾一条龙.md",
+  "tasks": [{
+    "name": "约定收尾一条龙",
+    "prompt": "../../prompt/提示词-约定收尾一条龙.md",
+    "scope": {"allow": ["src/**", "test/**", "README.md"]},
+    "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+  }],
+  "limits": {
+    "测试": {"maxRepairs": 3, "timeoutMin": 20},
+    "开发评审": {"maxRepairs": 5, "timeoutMin": 60}
+  }
+}

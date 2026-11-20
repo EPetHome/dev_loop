@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "W1-A1-链路入口修复-20261120",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": ["开发评审", "测试"],
+  "next": "../收尾后释放-20261120/开发卡.json",
+  "tasks": [{
+    "name": "W1-A1 链路入口修复",
+    "prompt": "../../prompt/提示词-W1-A1-链路入口修复.md",
+    "scope": {"allow": ["src/**", "test/**", "README.md"]},
+    "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+  }],
+  "limits": {
+    "测试": {"maxRepairs": 3, "timeoutMin": 20},
+    "开发评审": {"maxRepairs": 5, "timeoutMin": 60}
+  }
+}
