@@ -17,6 +17,7 @@ interface LaunchOptions {
   startupTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   reviewOnly?: boolean;
+  confirmedCommit?: string;
 }
 const launchFiles = (dir: string, id: string) => ({
   request: join(dir, "launch-" + id + ".json"), pid: join(dir, "launch-" + id + "-pid.json"),
@@ -91,7 +92,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   if (statusOf(dir).state === "cancelled") return;
   const prompt = join(dir, "developer-prompt.md"), s = statusOf(dir);
   const opening = resuming && s.loop.pendingOpening ? s.loop.pendingReturn : null;
-  writeFileSync(prompt, convention(t) + "\n交付只提交并登记。\n\n" + inputs(t).prompt + (opening ? "\n\n## 续跑带话\n" + opening : ""));
+  writeFileSync(prompt, convention(t) + "\n\n" + inputs(t).prompt + (opening ? "\n\n## 续跑带话\n" + opening : ""));
   const session = s.loop.session;
   const args = ["--cwd", t.worktree, "--name", t.executionId,
     ...(resuming && session?.id ? ["--session", session.file || session.id] : ["--session-id", t.executionId]), prompt];
@@ -126,11 +127,12 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   update(dir, (s) => { s.loop.launcher = identity(); });
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
-    if (options.reviewOnly) {
-      const result = await settle(dir, "", undefined, true);
+    if (options.reviewOnly || options.confirmedCommit) {
+      const result = await settle(dir, "", {reviewOnly: options.reviewOnly, confirmedCommit: options.confirmedCommit});
       if (!result.continue) { await startFinish(dir, options.env || process.env); return; }
       if (taskOf(dir).host !== "pi") {
-        waitFor(dir, "需手动接入会话", "补评审需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
+        const check = options.reviewOnly ? "补评审" : "确认交付后检查";
+        waitFor(dir, "需手动接入会话", check + "需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
       }
       update(dir, s => { s.loop.pendingReturn = result.reason; });
       const session = statusOf(dir).loop.session;
@@ -146,8 +148,11 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const deliveryFlag = process.argv.indexOf("--delivery", 3);
   const main = process.argv[2] === "--terminal"
     ? terminalSession(resolve(process.argv[3]), process.argv[4]).then((code) => { process.exitCode = code; })
-    : launchMain(resolve(process.argv[2]), process.argv.includes("--resume"), {reviewOnly: process.argv.includes("--review")});
+    : launchMain(resolve(process.argv[2]), process.argv.includes("--resume"), {
+      reviewOnly: process.argv.includes("--review"), confirmedCommit: deliveryFlag < 0 ? undefined : process.argv[deliveryFlag + 1],
+    });
   main.catch((e)=>{console.error(e);process.exitCode=1;});
 }

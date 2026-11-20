@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, realpathSync, readFileSync, chmodSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, write, until, getJson, NODE, ROOT } from "./helpers.ts";
+import { fixture, write, until, getJson, NODE, ROOT, MUST, PASS, sq } from "./helpers.ts";
 import { spawn, execFileSync } from "node:child_process";
 import { finish, pendingAcceptance } from "../src/cli/finish.ts";
 import { queued } from "../src/cli/queue.ts";
@@ -155,6 +155,50 @@ test("A7：接力下一批起点是上一批交付；最后一次部署才推进
   await f.cli(["收尾",second.executionId,"--json"]); assert.equal(statusOf(second.dir).state,"completed"); assert.equal(f.git("show","dev:src/first.txt"),"first"); assert.equal(f.git("show","dev:src/second.txt"),"second");
   assert.match(readFileSync(join(f.repo,"结果.md"),"utf8"),/版本：[\s\S]*证据：[\s\S]*恢复入口：[\s\S]*验收标准：/);
 });
+test("W1 A18 / 问题单 A4：真实必修退回，返修正式通过才接力，恢复和重放只开一次", async t => {
+  const reviewer = 'if grep -q needs-repair src/app.txt; then printf %s ' + sq(MUST) + '; else printf %s ' + sq(PASS) + '; fi';
+  const f = fixture(t, {reviewer, card: {next: "next.json"}});
+  write(join(f.repo, "next.json"), JSON.stringify({...f.raw, next: undefined}));
+  const first = await f.prepare();
+  write(join(first.worktree, "src/app.txt"), "good needs-repair\n");
+  const B = deliver(first.dir).commit, required = await settle(first.dir);
+  await startFinish(first.dir, f.env);
+  const returned = statusOf(first.dir), dirsOnReturn = readdirSync(f.root);
+  assert.equal(required.continue, true);
+  assert.match(required.reason, /评审必修：[\s\S]*src\/app.txt:1/);
+  assert.equal(returned.loop.phase, "开发中"); assert.equal(returned.loop.next, undefined);
+  assert.deepEqual(dirsOnReturn, [first.executionId]);
+  write(join(first.worktree, "src/app.txt"), "good repaired\n");
+  const repaired = deliver(first.dir).commit;
+  await settle(first.dir); await startFinish(first.dir, f.env);
+  const completed = await until(first.dir, () => statusOf(first.dir), s => s.state === "completed" && !s.loop.finisher);
+  const next = taskOf(join(f.root, completed.loop.next!));
+  await until(next.dir, () => existsSync(join(next.dir, "opened.json")), Boolean);
+  await until(next.dir, () => statusOf(next.dir), s => !s.loop.launcher);
+  await settle(first.dir); await startFinish(first.dir, f.env);
+  const resumed = JSON.parse((await f.cli(["续跑", first.executionId, "--json"])).stdout);
+  await assert.rejects(f.cli(["收尾", first.executionId, "--auto", "--json"]), /当前不在待收尾/);
+  const checks = checksOf(first.dir).filter(c => ["复测", "评审", "收尾"].includes(c.step)).map(({step, result, commit}) => ({step, result, commit}));
+  t.diagnostic(JSON.stringify({B, repaired, returned: returned.loop.phase, dirsOnReturn, end: completed.loop.phase, nextBase: next.baseCommit, replayNext: statusOf(first.dir).loop.next, dirs: readdirSync(f.root), checks}));
+  assert.equal(resumed.reused, true);
+  assert.equal(next.baseCommit, repaired);
+  assert.equal(statusOf(first.dir).loop.next, next.executionId);
+  assert.deepEqual(readdirSync(f.root).sort(), [first.executionId, next.executionId].sort());
+  assert.deepEqual(checks, [["复测", "通过", B], ["评审", "必修", B], ["复测", "通过", repaired], ["评审", "通过", repaired], ["收尾", "通过", repaired]].map(([step, result, commit]) => ({step, result, commit})));
+});
+
+for (const after of [false, true]) test("W1 D21：实际开发开场写明登记授权、命令和收尾边界 · " + (after ? "自动收尾" : "无自动收尾"), async t => {
+  const f = fixture(t, {card: {flow: after ? flow.slice(0, 3) : flow.slice(0, 2)}}), task = await f.prepare();
+  await launchSession(task.dir, false, {env: f.env});
+  const prompt = readFileSync(join(task.dir, "developer-prompt.md"), "utf8");
+  const opening = prompt.split("\n\n")[0]; t.diagnostic(opening.replaceAll("\n", " / "));
+  assert.ok(opening.includes("本会话是本人已明确授权由 dev-loop 管理的开发卡；开发完成后按本批说明登记交付。"));
+  assert.ok(opening.includes(ROOT + "/bin/loop 交付"));
+  assert.match(opening, /交付只提交并登记/);
+  if (after) assert.match(opening, /通过后自动收尾。不要手工合入、推送或部署/);
+  else assert.ok(opening.includes("用户要求合入或部署时") && opening.includes(ROOT + "/bin/loop 合入 " + task.executionId) && opening.includes(ROOT + "/bin/loop 部署 " + task.executionId));
+});
+
 test("固定说明、帮助、结果追加与待验数；不把部署成功当人工验收", async t => {
   const f=await finishingFixture(t);assert.match(convention(f.task),/通过后自动收尾。不要手工合入、推送或部署/);
   assert.match(convention({executionId:"old"}),/报错就把原文告诉用户，不要现场编步骤/);

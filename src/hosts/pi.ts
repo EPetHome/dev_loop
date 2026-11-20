@@ -60,7 +60,7 @@ export function registerPi(pi: PiAPI, options: {
     if (!dir) return;
     const messages = event.context?.contextMessages || ctx.sessionManager.getBranch().map((e) => e.message).filter(Boolean);
     const last = [...messages].reverse().find((m) => m.role === "assistant");
-    const result = await settle(dir, contentText(last?.content), ctx.signal, false, last);
+    const result = await settle(dir, contentText(last?.content), {signal: ctx.signal, ending: last});
     refresh();
     if (!result.continue) await startFinish(dir,options.env || process.env);
     if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};

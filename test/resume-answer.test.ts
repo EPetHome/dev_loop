@@ -72,7 +72,6 @@ test("续跑 A3：不带话保留原状态、留言与回执，不写待送", as
 
 for (const stopReason of ["error", "stop", undefined]) test("模型 A4/A5：从构造的 Pi 会话记录读取最后结束原因 " + stopReason, async t => {
   const f = fixture(t), task = await f.prepare(), p = piWindow(task, {...(stopReason ? {stopReason} : {}), errorMessage: "fetch failed\n原始错误详情"});
-  write(join(task.worktree, "src/app.txt"), "good not delivered\n"); update(task.dir, s => { s.loop.warned = true; });
   assert.equal(await p.events.agent_before_settle({}, p.ctx), undefined);
   const s = statusOf(task.dir), reason = stopReason === "error" ? "模型出错" : "停下没交付";
   assert.equal(s.state, "input_required"); assert.equal(s.loop.wait, reason); assert.equal(s.loop.facts!.stops.at(-1)!.reason, reason);
@@ -87,7 +86,8 @@ test("模型：event.context 结束原因同样传入，尚未交付提醒仍先
   const event = {context: {contextMessages: [{role: "assistant", content: [], stopReason: "error", errorMessage: "fetch failed"}]}};
   const first = await p.events.agent_before_settle(event, p.ctx);
   assert.equal(first.continue, true); assert.match(first.entries[0].content, /尚未交付/); assert.equal(statusOf(task.dir).state, "working");
-  await p.events.agent_before_settle(event, p.ctx); assert.equal(statusOf(task.dir).loop.wait, "模型出错"); p.close();
+  await p.events.agent_before_settle(event, p.ctx);
+  assert.equal(statusOf(task.dir).loop.wait, "停下没交付"); assert.match(statusOf(task.dir).message, /fetch failed/); p.close();
 });
 
 test("答复 A7：两次只追加带时间记录，送原文；公开计数、评审材料和输入哈希", async t => {

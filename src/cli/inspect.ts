@@ -1,10 +1,26 @@
-import { writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { checkout } from "../infra/checkout.ts";
-import { gitText } from "../infra/git.ts";
+import { changes, gitText, head } from "../infra/git.ts";
+import { APP_ROOT } from "../infra/paths.ts";
 import { taskOf, statusOf, checksOf, update, recordStep } from "../core/store.ts";
 import { InputError } from "../core/card.ts";
+import { onTaskBranch, undeliveredCommit, waitingForDelivery } from "../core/deliver.ts";
 import { snapshot, differences } from "../core/snapshot.ts";
+
+export function publicStatus(dir: string) {
+  const s = statusOf(dir);
+  if (!waitingForDelivery(s)) return s;
+  try {
+    const t = taskOf(dir);
+    if (!existsSync(t.worktree) || !onTaskBranch(t) || changes(t.worktree).length) return s;
+    const commit = head(t.worktree);
+    if (!undeliveredCommit(t, s, commit)) return s;
+    const deliveryConfirmation = {label: "用当前提交交付", commit, command: APP_ROOT + "/bin/loop 续跑 " + t.executionId + " --交付提交 " + commit};
+    return {...s, loop: {...s.loop, deliveryConfirmation}};
+  } catch { return s; } // Git 现场不可读时仍返回状态，但不声称可确认。
+}
+
 export async function comparison(dir: string, other?: string) {
   const t=taskOf(dir), deployed=(d: string)=>checksOf(d).filter(c=>c.step==="部署" && c.result.startsWith("已部署")).at(-1);
   const first=deployed(dir), second=other?deployed(other):undefined, report=join(dir,"comparison-"+Date.now()+".md");

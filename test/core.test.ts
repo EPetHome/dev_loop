@@ -82,7 +82,7 @@ test("A7：交付之后的未提交改动不跑检查、不扣退回次数",asyn
   const f=fixture(t),task=await f.prepare();
   write(join(task.worktree,"src/app.txt"),"good initial\n");deliver(task.dir);
   write(join(task.worktree,"src/app.txt"),"good after delivery\n");
-  const r=await settle(task.dir);assert.equal(r.continue,true);assert.match(r.reason,/重新运行 bin\/loop 交付/);
+  const r=await settle(task.dir);assert.equal(r.continue,true);assert.match(r.reason,/重新运行 .*bin\/loop 交付/);
   const s=statusOf(task.dir);assert.equal(s.loop.testReturns+s.loop.reviewReturns,0);assert.equal(existsSync(join(task.dir,"order")),false);
 });
 test("阶段：21 个常量；准备中、已交付、已放弃与自行提交拆分",async(t)=>{

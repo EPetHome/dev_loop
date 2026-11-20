@@ -26,7 +26,7 @@ export async function handleHook(event: HookEvent, eventName = event.hook_event_
       const pid = Number(event.session_pid || event.pid || process.ppid);
       if (!registerSession(dir, host, sessionIdOf(event), pid, event.transcript_path)) return "";
       return JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:
-        convention(taskOf(dir)) + "聊天不改变检查结论。\n" + takeReturn(dir)}});
+        convention(taskOf(dir)) + "\n聊天不改变检查结论。\n" + takeReturn(dir)}});
     }
     if (eventName === "PostToolUse") {
       heartbeat(dir, Date.now(), true); const reason = takeReturn(dir);

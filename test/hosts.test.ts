@@ -8,6 +8,8 @@ import { handleHook } from "../src/hosts/hook.ts";
 import { lastAssistantMessage, sessionIdOf } from "../src/hosts/hook-event.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { statusOf, checksOf, transition, update } from "../src/core/store.ts";
+import { resume } from "../src/core/lifecycle.ts";
+import { gitText, head } from "../src/infra/git.ts";
 function fakePi(dir: string, cwd: string, reply: string) {
   const events: Record<string, any> = {}, messages: any[] = [], callbacks: (()=>void)[] = [];
   let cleared = 0;
@@ -61,6 +63,42 @@ for (const host of ["pi","claude","codex"]) {
     assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"test\n");
   });
 }
+for (const host of ["pi", "claude", "codex"]) test("W1 A14 / 问题单 A1：首次只提交未登记，三次停下只催一次 · " + host, async t => {
+  const f = fixture(t, {card: {host}}), task = await f.prepare(), p = fakePi(task.dir, task.worktree, "已提交");
+  const event = {cwd: task.worktree, session_pid: process.pid, session_id: "first-delivery", last_assistant_message: "已提交"};
+  const env = {...f.env, LOOP_TASK_DIR: task.dir, LOOP_HOST: host};
+  if (host === "pi") p.events.session_start({}, p.ctx);
+  else await handleHook(event, "SessionStart", env);
+  const stop = async () => {
+    if (host === "pi") return (await p.events.agent_before_settle({}, p.ctx))?.entries[0].content;
+    const response = await handleHook(event, "Stop", env);
+    return response ? JSON.parse(response).reason : undefined;
+  };
+  write(join(task.worktree, "src/app.txt"), "good first commit\n");
+  gitText(task.worktree, ["commit", "-am", "B"]);
+  const B = head(task.worktree), stops = [];
+  for (let i = 0; i < 3; i++) {
+    const reminder = await stop(), s = statusOf(task.dir);
+    stops.push({reminder, phase: s.loop.phase, wait: s.loop.wait, message: s.message, delivery: s.loop.delivery?.commit});
+  }
+  const testedBeforeDelivery = existsSync(join(task.dir, "order"));
+  if (statusOf(task.dir).state === "input_required") resume(task.dir);
+  const receipt = deliver(task.dir); await stop();
+  if (host === "pi") p.events.session_shutdown();
+  const checks = checksOf(task.dir).filter(c => ["复测", "评审"].includes(c.step)).map(({step, result, commit}) => ({step, result, commit}));
+  t.diagnostic(JSON.stringify({A: task.baseCommit, B, stops, testedBeforeDelivery, receipt, checks, end: statusOf(task.dir).loop.phase}));
+  assert.ok(stops[0].reminder?.includes(B), "首次停下应提醒当前提交 B");
+  assert.match(stops[0].reminder, /还没登记[\s\S]*bin\/loop 交付/);
+  assert.deepEqual(stops.map(s => s.phase), ["开发中", "等你", "等你"]);
+  assert.deepEqual(stops.slice(1).map(s => s.wait), ["停下没交付", "停下没交付"]);
+  assert.ok(stops.every(s => !s.delivery));
+  assert.ok(stops.slice(1).every(s => !s.reminder && s.message.includes(B) && s.message.includes("还没登记")));
+  assert.equal(testedBeforeDelivery, false);
+  assert.equal(receipt.commit, B);
+  assert.deepEqual(checks, ["复测", "评审"].map(step => ({step, result: "通过", commit: B})));
+  assert.equal(statusOf(task.dir).state, "completed");
+});
+
 test("A8：pi 使用最后助手消息；Claude/Codex JSONL 回退兼容",async(t)=>{
   const f=fixture(t),task=await f.prepare(),p=fakePi(task.dir,task.worktree,"需要你确认输入数据");
   p.events.session_start({},p.ctx);await p.events.agent_before_settle({},p.ctx);

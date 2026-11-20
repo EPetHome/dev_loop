@@ -46,7 +46,7 @@ export interface Status {
     activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
-    warned: boolean; previousMustFix: string[]; previousReviewCommit: string | null;
+    remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
     testAllowance: number; reviewAllowance: number; reused: boolean;
   };
 }
@@ -136,7 +136,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","答复","停止","放弃"],
     loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null, answerCount: 0,
       ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
-      bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
+      bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
   writeJson(join(dir, "status.json"), s); idleSleep(dir, true);
   writeFileSync(join(dir, "checks.jsonl"), ""); writeFileSync(join(dir, "instructions.jsonl"), ""); summary(dir, s);

@@ -106,7 +106,7 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
       s.loop.pendingOpening = !running && t.host === "pi";
     }
     s.loop.testAllowance = Math.max(t.limits.测试.maxRepairs, s.loop.testReturns + 1);
-    s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.loop.warned = false; s.state = "working";
+    s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.state = "working";
     s.loop.facts!.resumes++; s.loop.reused = false;
   });
   return { reused: false, running: Boolean(running), status: transition(dir, "working", s.loop.ready ? "开发中" : "准备中", text !== undefined ? "已续跑；" + (t.host === "pi" ? "话已写入待送" : "未送达，需在窗口里说；下一次 hook 交接") + "；到上限的步骤再给一轮" : running ? "已续跑，请在原开发会话继续；到上限的步骤再给一轮" : "已续跑；到上限的步骤再给一轮", "developmentMs") };

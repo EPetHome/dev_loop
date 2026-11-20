@@ -81,7 +81,8 @@ test("无交付有改动仅提醒一次；第二次停下转等你",async(t)=>{
   const f=fixture(t),task=await f.prepare();write(join(task.worktree,"src/app.txt"),"good changed");
   assert.equal((await settle(task.dir)).continue,true);assert.equal(statusOf(task.dir).state,"working");
   assert.equal((await settle(task.dir,"没有更多可做")).continue,false);assert.equal(statusOf(task.dir).state,"input_required");
-  assert.equal(statusOf(task.dir).message,"没有更多可做");assert.equal(statusOf(task.dir).loop.testReturns,0);
+  const s=statusOf(task.dir);assert.equal(s.loop.wait,"停下没交付");
+  assert.match(s.message,/上次登记：还没登记\n没有更多可做$/);assert.equal(s.loop.testReturns,0);
 });
 test("提示词或验收标准哈希变化会重查；日志不是判定条件",async(t)=>{
   const f=fixture(t),task=await f.prepare();deliver(task.dir);await settle(task.dir);const commit=statusOf(task.dir).loop.commit!;

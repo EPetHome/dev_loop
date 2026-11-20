@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { fixture, write, sq, PASS, MUST, until } from "./helpers.ts";
+import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { fixture, write, sq, PASS, MUST, until, NODE } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { resume, registerSession } from "../src/core/lifecycle.ts";
@@ -39,6 +39,48 @@ test("A3/A4：临时失败记事实；续跑立即回执，后台只评审，不
   assert.equal(existsSync(join(task.dir, "opened.json")), false);
   assert.deepEqual(checksOf(task.dir).filter(c => c.step === "复测"), before);
   assert.match(readFileSync(join(task.dir, "review-input-r2.md"), "utf8"), /结果：通过/);
+});
+const overflow = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+for (const currentOverflow of [true, false]) test("W1 A17 / 问题单 A3：只读本次 Pi 评审结束原因，" + (currentOverflow ? "上下文超限不重试" : "旧超限与非末条超限不影响临时故障重试"), async t => {
+  const f = fixture(t, {config: {reviewerCmd: ""}}), task = await f.prepare(), bin = join(f.base, "fake-review-pi.cjs");
+  write(bin, "#!" + NODE + "\n" + `
+const fs = require("fs"), path = require("path"), t = process.env.LOOP_TASK_DIR;
+const arg = name => process.argv[process.argv.indexOf(name)+1];
+const id = arg("--session-id"), dir = process.argv.includes("--session-dir") ? arg("--session-dir") : path.join(t,"legacy-review-sessions");
+const err = errorMessage => ({type:"message",message:{role:"assistant",stopReason:"error",errorMessage}});
+const overflow = ${JSON.stringify(overflow)};
+const log = (filename, id, ...lines) => fs.writeFileSync(path.join(dir,filename), [{type:"session",id}, ...lines].map(x=>JSON.stringify(x)).join("\\n")+"\\n");
+fs.mkdirSync(dir,{recursive:true});
+log("other-review.jsonl", "another-attempt", err(overflow));
+const last = ${currentOverflow} ? [err(overflow)] : [err(overflow), err("连接暂时中断，稍后再试")];
+log("2026-test_"+id+".jsonl", id, ...last);
+fs.appendFileSync(path.join(t,"order"), "review\\n");
+console.log("评审未生成报告");
+`);
+  chmodSync(bin, 0o755);
+  const old = process.env.PI_BIN;
+  try { process.env.PI_BIN = bin; deliver(task.dir); await settle(task.dir); await settle(task.dir); }
+  finally { if (old === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = old; }
+  const {error} = JSON.parse((await f.cli(["查询", task.executionId, "--json"])).stdout).executions[0];
+  const s = statusOf(task.dir), review = checksOf(task.dir).findLast(c => c.step === "评审")!;
+  const order = readFileSync(join(task.dir, "order"), "utf8");
+  const files = review.evidence.map(path => ({path, bytes: readFileSync(path).byteLength}));
+  t.diagnostic(JSON.stringify({commit: review.commit, phase: s.loop.phase, error, order, evidence: files, materialBytes: readFileSync(join(task.dir, "review-input-r1.md")).byteLength}));
+  assert.equal(s.state, "failed");
+  assert.equal(review.result, "失败");
+  assert.equal(s.loop.reviewReturns, 0);
+  if (currentOverflow) {
+    assert.equal(error.category, "评审上下文超限");
+    assert.equal(error.raw, overflow);
+    assert.equal(review.detail, overflow);
+    assert.doesNotMatch(readFileSync(review.evidence[0], "utf8"), /context window/);
+    assert.ok(review.evidence.slice(1).some(path => readFileSync(path, "utf8").includes(overflow)));
+    assert.equal(order, "test\nreview\n");
+  } else {
+    assert.equal(error.category, "临时故障");
+    assert.match(error.raw, /缺少「## 必修」标题/);
+    assert.equal(order, "test\nreview\nreview\n");
+  }
 });
 test("复测没验证且日志已丢也可只补评审，通过后照常收尾", async t => {
   const f = await failed(t, {test: "无：文档无可运行检查", card: {flow: ["开发评审", "测试", "合入"]}}), {task} = f;

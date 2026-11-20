@@ -13,6 +13,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 /Users/Admin/Desktop/dev-loop/bin/loop 交付 --说明 '做了什么、如何自测'
 /Users/Admin/Desktop/dev-loop/bin/loop 查询 --all --brief --json
 /Users/Admin/Desktop/dev-loop/bin/loop 续跑 <执行编号或卡路径> [--话 文本 | --text-file 文件] --json
+/Users/Admin/Desktop/dev-loop/bin/loop 续跑 <执行编号> --交付提交 <完整SHA> --json
 /Users/Admin/Desktop/dev-loop/bin/loop 答复 <执行编号或卡路径> (--话 文本 | --text-file 文件) --json
 /Users/Admin/Desktop/dev-loop/bin/loop 停止 <执行编号或卡路径> --json
 /Users/Admin/Desktop/dev-loop/bin/loop 放弃 <执行编号或卡路径> --json
@@ -30,12 +31,14 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 
 - 启动回执只表示已接收；worktree、localFiles、setup、开会话均在后台完成。Terminal 接收命令不算会话启动成功：后台会在 60 秒内确认本次会话的进程登记；启动失败/超时写 failed，并保留 `launch-*.log` 原始错误。
 - 同一张卡有多个活动执行时，控制命令要求执行编号；可用 `--task 名` 核对任务名。
-- 交付可用 `--text-file 文件` 代替 `--说明`，不在此命令里跑检查。
+- 交付可用 `--text-file 文件` 代替 `--说明`，不在此命令里跑检查；普通 `交付` 在「等你」时仍拒收。
+- 停下时，HEAD 领先于起点（或上次登记），或有未提交文件，即有交付候选。三种宿主都按「完整 HEAD + 未提交文件清单」去重：第一次提醒当前提交、上次登记（首次写「还没登记」）和交付命令；同一候选再停下转「等你 · 停下没交付」，不再催。旧回执不会给新提交放行。
+- 查询给出「用当前提交交付」时，本人可运行 `续跑 <执行编号> --交付提交 <完整SHA>`，不得同时带话。程序在执行锁内重核等待原因、分支、HEAD、干净状态及自起点以来的累计文件范围；若不符，拒绝且保留现场和原回执。成功只登记该现有提交，不暂存、不造新提交；有有效检查就沿用，否则直接后台复测、评审，不等原会话再次停下。
 - 停止保留 worktree、分支和证据；放弃删除 worktree，保留本地分支和证据，不可原执行续跑。
 - 达到退回上限后，`续跑` 给耗尽的步骤再一轮；不带话时行为不变，原会话仍在就请在原会话继续输入。
 - `续跑 --话 文本` / `--text-file 文件` 原文按接收顺序追加到 `loop.pendingReturn`，保留尚未交接的内容，各段之间仅加两个换行，不改每段原话、不设长度上限。Pi 原会话仍在时送进窗口并开新一轮，只送一次后清空；会话已退出时用原 session 文件重开，原话放进开场提示，不重复注入。带话明确回开发，但不删除或作废已有检查结论。Claude/Codex 交给下一次现有 hook；交接前再次处于「等你」时仍可继续答复，已接收的多段原话按序一并交接一次，不覆盖前文。状态和回执明确写「未送达，需在窗口里说」，不冒充主动唤起。空话或全空白拒收，不续跑。
 - `答复` 只在「等你」时接收非空原话，追加带时间的答复记录后按带话续跑，送进开发会话的是 `本人答复：<原话>`。其他状态（含已停止、已放弃）拒收，不写答复记录。之后的评审输入按时间带全部「本人答复」，它们是本人开发途中的决定，和提示词冲突时按答复判；不改提示词、验收标准或它们的哈希，也不作废已有结论。
-- Pi 最后一条助手回复 `stopReason: "error"` 且本该记停下没交付时，改记等待原因「模型出错」，消息保留 `errorMessage` 原话；`stop`、缺结束原因和其他宿主照旧。「有改动且没催过就催一次尚未交付」不变。何时再续跑、试几次归调用方，dev-loop 不加自动重试。
+- 没有交付候选且本该在未交付处等待时，Pi 最后一条助手回复 `stopReason: "error"` 则改记「模型出错」，消息保留 `errorMessage` 原话；如果有候选，按上述停下规则判断，第二次停下在「停下没交付」的消息里保留原错。开发模型出错不另加自动重试。
 - 评审调用「临时故障」失败后，若最后一次核心检查是「评审 / 失败」、HEAD 仍是最后交付 commit、工作区干净、提示词/验收标准哈希未变，且同 commit、同哈希下有复测「通过」或「没验证」，`续跑` 立即返回回执，在后台只补评审：不开开发会话、不重跑复测或留痕。失败调用不计一次退回；补评审通过后照常完成/收尾，必修照常返修。Claude/Codex 的后台必修先保留 `pendingReturn`，用已有「需手动接入会话」明确等待交接，不因原进程存活就假报 working；下一次已接入的 Stop hook 用 `decision:block` 返回必修，SessionStart/PostToolUse 则用 `additionalContext` 交接，之后才转开发中。宿主已空闲时需在原会话继续或重新接入，不冒充已主动唤起。任一条件不满足仍走原续跑逻辑；检查原文丢失不影响复用。
 - `启动 --派单编号 X --指令编号 Y` 保留派单编号，重复启动指令返回同一回执。其他带编号的 PA 指令、能力声明尚未实现；答复已支持上述命令，但不支持指令编号去重。
 
@@ -52,7 +55,7 @@ Node ≥22.19；`bin/loop` 默认用 `/Users/Admin/.hermes/node/bin/node`，可�
 - 可选 `next` 相对卡目录指向下一张卡。启动前检查整条链（坏卡、环、中间批收尾都拒绝）；中间批通过后不动 dev，自动启动下一批，其起点为上批交付 commit，沿用派单号，`loop.next` 给出新执行编号。最后一批才合入、部署。
 - 收尾结束在卡目录追加 `结果.md`：版本、时间、dev 前后、证据、退回原因、恢复入口、验收标准位置。完成 message 带同级其他目录 `验收.md` 第一行「状态：待验」的批次数。程序检查或部署成功不等于本人验收通过。
 
-开发方固定说明：有收尾时不要手工合入、推送、部署；无收尾时用户要求才运行命令，报错原文返回，不临时编部署步骤。
+开发会话开场写明本卡已获本人授权由 dev-loop 管理、完成后登记交付，并给出实际命令。权限边界不变：有收尾时不要手工合入、推送、部署；无收尾时用户要求才运行命令，报错原文返回，不临时编部署步骤。
 
 ## 合入与推送
 
@@ -145,10 +148,12 @@ scope 也接受字符串数组；支持目录前缀、`*`、`**`、`?`。越界�
 
 localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出并报失败，可修复环境后续跑。旧 preparation/gate/methods 不读。
 
-未配置 reviewerCmd 时用 `pi -p`、全新会话、只读工具 `read,grep,find,ls`，关闭全局/项目扩展、MCP 和上下文文件发现。
-配置 reviewerCmd 时，它是**可执行脚本的路径，不是 shell 命令串**，相对 worktree；参数为：`轮次 输入文件路径 本次会话编号`。标准输出按 `src/core/review-prompt.md` 的标题格式返回，标准错误保留原文。两次调用共享本轮时限。
+未配置 reviewerCmd 时用 `pi -p`、全新会话、只读工具 `read,grep,find,ls`，关闭全局/项目扩展、MCP 和上下文文件发现；每次调用的 Pi 会话单独存在执行目录的 `review-sessions/<会话编号>/`。
+配置 reviewerCmd 时，它是**可执行脚本的路径，不是 shell 命令串**，相对 worktree；参数为：`轮次 输入文件路径 本次会话编号`，会话目录见 `LOOP_REVIEW_SESSION_DIR`。标准输出按 `src/core/review-prompt.md` 的标题格式返回，标准错误保留原文。
 
-评审材料的「本轮改动」diff 排除被删文件，另在「删除的文件」列路径和原行数（空文件 0 行，二进制不适用行数），不附被删内容。返修轮按上次评审 commit 计算，需求变化则按任务起点计算；新增文件和运行差异等材料不变。
+评审材料保留提示词、验收标准和原有差异规则：「本轮改动」diff 排除被删文件，另在「删除的文件」列路径和原行数（空文件 0 行，二进制不适用行数）；返修轮按上次评审 commit 计算，需求变化则按任务起点计算。复测正文不嵌整份日志，只给命令、结果、能识别的通过/失败数和失败测试名、至多 20 行输出尾部，以及原文路径和实际字节数；整个摘要最多 8192 UTF-8 字节，超长单行也截断。未识别的计数不写作 0；原日志缺失不作废可沿用的检查。
+
+评审临时故障可自动重试一次，两次调用共享本轮时限。若本次会话最后一条助手消息明确报上下文超限，记「评审上下文超限」，在查询 `error.raw` 返回模型原错，并留下该次会话证据；不自动原样重投。
 
 ### 部署
 
@@ -203,12 +208,12 @@ localFiles 建 worktree 后复制；setup 跑一次，失败保留原始输出�
 - 合入/推送/部署每次结果追加到 `checks.jsonl`，含 commit、tree、输入哈希、开始/结束时间、毫秒数、证据与详情。
 - 测试、评审原文在同目录；证据缺失不作废通过。
 
-状态协议 `loop-status/1`，state 仅 `working/input_required/completed/failed/cancelled`。`查询 --all --brief --json` 一次返回 `{complete:true, executions:[状态报告...]}`，不调用 git 或模型。
+状态协议 `loop-status/1`，state 仅 `working/input_required/completed/failed/cancelled`。`查询 --all --brief --json` 一次返回 `{complete:true, executions:[状态报告...]}`，不调用模型。仅对「等你 · 停下没交付」的执行只读查看 Git：当前在任务分支、工作区干净且 HEAD 是未登记的新提交时，公开查询（含 `--brief`）增加 `loop.deliveryConfirmation: {label, commit, command}`，其中 `commit` 为完整 SHA。其他状态或现场不提供；该字段不回写 `status.json`。
 
 `loop.facts` 是可直接照抄的执行事实，所有公开查询（含 `--brief`）原样带出：
 
 - `name`：卡上 `tasks[].name`，等于 task.json 的 `name`；`startedAt`：执行开始时间，等于 task.json 的 `createdAt`（ISO）。
-- `resumes`：成功续跑次数，初始为 0；收尾、合入不计入。
+- `resumes`：成功续跑次数（含本人确认交付），初始为 0；收尾、合入不计入。
 - `stops`：最近 50 条停下记录。进入 `input_required/failed/cancelled` 时追加，每条包含 `at`（ISO）、`step`（停下前的 PHASES 阶段）、`state`、`reason`、`message`（当时原话，最多 200 字）、`resumedAt`、`resolvedBy`。
 - `reason`：等你取 `loop.wait` 的六种原因；失败取 `error.category`；停止写「已停止」，放弃写「已放弃」。原因不随 `loop.wait` 清空而丢失。
 - 未解开时 `resumedAt/resolvedBy` 为 null；成功续跑、收尾、`合入 --接受未验证` 离开停下状态时补上时间和去向。去向为「续跑 / 收尾 / 合入（接受未验证） / 停止 / 放弃 / 沿用通过记录」；若已有未解开的停下记录，进入新停下状态前先关闭旧记录，例如等你后停止，旧条目写「停止」。
@@ -243,7 +248,7 @@ macOS 只在执行 `working` 时持有防睡：Pi、准备/复测/评审/收尾�
 
 准备中、开发中、已交付、复测中、评审中、等你、完成、失败、已停止、已放弃、已合入、合入失败、推送中、已推送、推送失败、推送结果不确定、部署中、已部署、部署失败、收尾中、已退回。
 
-启动或工作区未就绪的续跑为「准备中」；交付成功且未沿用为「已交付」；交付后又改代码/自行提交则回「开发中」；放弃并删除工作区为「已放弃」，不能续跑。
+启动或工作区未就绪的续跑为「准备中」；交付成功且未沿用为「已交付」；交付后出现新候选时先提示并回「开发中」，同一候选下次停下转「等你」；放弃并删除工作区为「已放弃」，不能续跑。
 
 `loop.wait` 只取六种原因：复测退回到上限、评审必修到上限、停下没交付、模型出错、需手动接入会话、收尾没走完。离开等你时清空；旧状态文件没有 wait 仍可读取，pi 用 message 第一行前 30 字补显原因。到上限后可运行 `bin/loop 续跑 <执行编号>` 再给一轮、停止，或 `bin/loop 合入 <执行编号> --接受未验证`。
 
@@ -260,6 +265,8 @@ bash -n bin/loop bin/pi-dev
 续跑带话、模型出错和答复 A1–A10 的替身验证在 `test/resume-answer.test.ts`：活会话只送一次、退出后精确恢复且开场不重复、无话兼容、构造 Pi 结束原因与催交付规则、答复原文追加/计数/评审输入及哈希不变、非等你/空话拒收、Claude/Codex 未送达回执和真实 hook CLI 交接。未开真实模型或窗口，不代替飞书/PA 的业务验收。
 
 停下事实与防睡批次 A1–A9 的替身验证在 `test/facts.test.ts`、`test/retry-review.test.ts`、`test/idle-sleep.test.ts`、`test/review-material.test.ts`，包括旧状态兼容、只补评审的条件回退、后台回执/返修/收尾、心跳租约与删除材料。A10 真实 `pmset -g assertions` **未验证**，由协调方在合入后执行；技术测试不替代本机验收。`test/idle-sleep.test.ts` 补 Claude/Codex 真实 hook 入口登记后超过 120 秒无事件仍防睡、等你和宿主退出释放；`test/hook-return.test.ts` 经真实 hook CLI 验证后台必修交接的 block/context 输出、只消费一次及后续修复交付，而非只断言状态字段。
+
+链路入口 W1-A1 的替身验证见 `test/hosts.test.ts`、`test/delivery-entry.test.ts`、`test/review-material.test.ts`、`test/retry-review.test.ts`、`test/finish.test.ts`：首次及返修候选去重、本人确认和现场变化、长日志摘要、会话超限、通过后接力与开场授权。
 
 本批一条龙 A1–A10 在 `test/finish.test.ts`：A1/A3/A8 自动部署与状态/去重，A2 只合入，A4/A5 失败回退和返修后推送，A6 回退失败，A7 接力，A9 同项目排队，A10 手工退回。`test/companion.test.ts` 覆盖陪跑、运行差异、live 前后、对比和释放；`test/deploy.test.ts` 补 deploy.env。仅用替身，不代表真实线上或真实 Pi 窗口验收。
 
