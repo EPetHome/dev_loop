@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import fs, { chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import fs, { chmodSync, existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { finish } from "../src/cli/finish.ts";
 import { join } from "node:path";
@@ -14,6 +14,8 @@ import { settle } from "../src/core/settle.ts";
 import { deploy } from "../src/steps/deploy.ts";
 import { compare } from "../src/infra/snapshot.ts";
 import { gitText } from "../src/infra/git.ts";
+import { gateRemoval } from "./finish-helpers.ts";
+import { delivered, reviewed } from "./step-helpers.ts";
 import { startCompanion } from "../src/hosts/after-settle.ts";
 function snapshotFixture(t: Parameters<typeof fixture>[0], body?: string) {
   const f=fixture(t,{config:{snapshot:"snapshot.cjs",setup:"test -f local.txt",deploy:{cmd:"deploy.cjs",check:"check.cjs",rollback:"check.cjs"}}});
@@ -91,12 +93,31 @@ test("手工释放拒绝未跟踪、已暂存和未暂存文件，不改文件�
   assert.equal(gitText(cwd,["status","--porcelain=v1"]),""); await rejectRelease("src/app.txt");
   assert.deepEqual(readFileSync(index),original);
   assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");
+  gitText(cwd,["update-index","--skip-worktree","outside.txt"]); unlinkSync(join(cwd,"outside.txt"));
+  assert.equal(gitText(cwd,["status","--porcelain=v1"]),""); await rejectRelease("outside.txt");
+  assert.equal(existsSync(join(cwd,"outside.txt")),false); gitText(cwd,["update-index","--no-skip-worktree","outside.txt"]);
   write(join(cwd,"中文 draft.txt"),"untracked\n"); write(join(cwd,"outside.txt"),"staged\n"); gitText(cwd,["add","outside.txt"]);
   await rejectRelease("中文 draft.txt","outside.txt","src/app.txt");
   assert.equal(readFileSync(join(cwd,"中文 draft.txt"),"utf8"),"untracked\n");
   assert.equal(readFileSync(join(cwd,"outside.txt"),"utf8"),"staged\n"); assert.equal(gitText(cwd,["show",":outside.txt"]),"staged");
   assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");
   assert.deepEqual(statusOf(task.dir),before); assert.equal(readFileSync(join(task.dir,"checks.jsonl"),"utf8"),records);
+});
+test("手工慢删除拒绝并发带话续跑；追加记录失败后再次释放只补登记", async t => {
+  const f = await delivered(t), {dir,worktree,executionId} = f.task; reviewed(f.task,f.commit);
+  const checks = checksOf(dir), deletion = await gateRemoval(t,f,"释放","append"), deleting = statusOf(dir);
+  assert.equal(deleting.state,"completed"); assert.ok(deleting.loop.releasePending?.target);
+  await assert.rejects(f.cli(["续跑",executionId,"--话","不得启动","--json"]),/工作区释放尚未结束.*释放/);
+  assert.deepEqual(statusOf(dir),deleting); assert.equal(existsSync(join(dir,"launcher.log")),false);
+  deletion.proceed(); const failed = await deletion.exited;
+  assert.equal(failed.code,1); assert.match(failed.stderr,/simulated checks.jsonl append EACCES/);
+  assert.equal(existsSync(worktree),false); assert.deepEqual(checksOf(dir),checks);
+  assert.ok(statusOf(dir).loop.releasePending?.target); assert.throws(()=>resume(dir,"不得启动"),/工作区释放尚未结束/);
+  const released = JSON.parse((await f.cli(["释放",executionId,"--json"])).stdout), after = statusOf(dir);
+  assert.deepEqual(released,{executionId,released:true}); assert.equal(after.state,"completed");
+  assert.equal(after.loop.releasePending,null); assert.equal(after.loop.released,true);
+  assert.throws(()=>resume(dir),/已释放/);
+  assert.deepEqual(checksOf(dir).filter(c=>c.step==="释放").map(c=>c.result),["已释放"]);
 });
 test("live 留痕失败只记记录；缺基线对比不影响状态，没登记脚本不阻断部署",async t=>{
   const f=snapshotFixture(t,"console.log('snapshot broken');process.exit(7);"),task=await f.prepare();transition(task.dir,"completed","完成","ready",null);

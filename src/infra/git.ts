@@ -24,14 +24,15 @@ export const changes = (cwd: string) => [...new Set(status(cwd).map(line => line
 export const changedSince = (cwd: string, base: string, ref = "HEAD") => paths(git(cwd, ["diff", "--no-renames", "--name-only", "-z", base, ref, "--"]));
 export function releaseChanges(cwd: string): string[] {
   const options = ["-c", "core.fsmonitor=false"], dirty = new Set(status(cwd, options).map(line => line.slice(3)));
-  const marked = paths(git(cwd, [...options, "ls-files", "-v", "-z"])).filter(line => /^[a-zS] /.test(line));
-  if (!marked.length) return [...dirty];
-  // 用没有索引标记或 stat 缓存的临时索引重查；真实索引仍负责报告已暂存改动。
-  const scratch = mkdtempSync(join(tmpdir(), "loop-release-index-")), env = {GIT_INDEX_FILE: join(scratch, "index")};
-  const sparse = new Set(marked.filter(line=>/^[Ss] /.test(line)).map(line=>line.slice(2)));
-  const full = [...options,"-c","core.sparseCheckout=false","-c","core.splitIndex=false","-c","core.ignoreStat=false"];
+  const marked = paths(git(cwd,[...options,"ls-files","-v","-z"])).filter(line=>/^[a-zS] /.test(line)); if (!marked.length) return [...dirty];
+  options.push("-c","core.splitIndex=false","-c","core.ignoreStat=false");
+  const full = [...options,"-c","core.sparseCheckout=false"], scratch = mkdtempSync(join(tmpdir(),"loop-release-index-")), env = {GIT_INDEX_FILE:join(scratch,"index")};
   try {
     git(cwd, [...full, "read-tree", "HEAD"], env);
-    for (const line of status(cwd, full, env)) if (!(line.startsWith(" D ") && sparse.has(line.slice(3)))) dirty.add(line.slice(3));
+    const lines = status(cwd, full, env), skipped = new Set(marked.filter(line=>/^[Ss] /.test(line)).map(line=>line.slice(2)));
+    // 只操作临时索引：Git rm --cached 留下规则之外的条目，包括非 cone 规则。
+    if (lines.some(line=>line.startsWith(" D ") && skipped.has(line.slice(3)))) git(cwd,[...options,"rm","--cached","-frq","--ignore-unmatch","--","."],env); else skipped.clear();
+    const omitted = skipped.size ? new Set(paths(git(cwd,[...options,"ls-files","-z"],env))) : undefined;
+    for (const line of lines) if (!(line.startsWith(" D ") && skipped.has(line.slice(3)) && omitted?.has(line.slice(3)))) dirty.add(line.slice(3));
   } finally { rmSync(scratch, {recursive:true,force:true}); } return [...dirty];
 }

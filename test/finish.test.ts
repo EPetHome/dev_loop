@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { write, until, NODE, ROOT } from "./helpers.ts";
 import { finish } from "../src/cli/finish.ts";
 import { gitText } from "../src/infra/git.ts";
@@ -15,7 +15,7 @@ import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { identity } from "../src/infra/exec.ts";
 import { reviewed, delivered } from "./step-helpers.ts";
-import { flow, finishingFixture, received } from "./finish-helpers.ts";
+import { flow, finishingFixture, gateRemoval, received } from "./finish-helpers.ts";
 test("A1/A3/A8：宿主自动独立收尾，部署前 dev 不变，部署中 working，同 commit 只一次", async t => {
   const f = await finishingFixture(t), events:Record<string,any>={};
   registerPi({on:(name,handler)=>{events[name]=handler;},sendMessage:()=>{}},{env:{...f.env,LOOP_TASK_DIR:f.task.dir},every:()=>({unref(){}}),clear:()=>{}});
@@ -30,6 +30,8 @@ test("A1/A3/A8：宿主自动独立收尾，部署前 dev 不变，部署中 wor
 });
 test("只合入不部署，收尾成功自动释放；无收尾的卡保留工作区", async t => {
   const f = await finishingFixture(t,{flow:flow.slice(0,3)}); await settle(f.task.dir);
+  gitText(f.task.worktree,["sparse-checkout","set","--no-cone","/*","!/outside.txt"]);
+  assert.equal(existsSync(join(f.task.worktree,"outside.txt")),false,"稀疏规则本来就不检出该文件");
   gitText(f.task.worktree,["update-index","--assume-unchanged","src/app.txt"]); // 标记本身不是修改。
   await startFinish(f.task.dir,f.env);
   const done = await until(f.task.dir,()=>statusOf(f.task.dir),s=>s.state==="completed" && !s.loop.finisher);
@@ -61,14 +63,15 @@ test("索引标记隐藏的修改在自动释放时保留，真实索引不变",
   const f = await delivered(t,{card:{flow:flow.slice(0,3)}}), {dir,worktree} = f.task;
   await settle(dir);
   gitText(worktree,["update-index","--assume-unchanged","src/app.txt"]);
-  gitText(worktree,["update-index","--skip-worktree","outside.txt"]);
+  gitText(worktree,["update-index","--skip-worktree","outside.txt","AGENTS.md"]);
   write(join(worktree,"src/app.txt"),"hidden change\n"); write(join(worktree,"outside.txt"),"skipped change\n");
+  unlinkSync(join(worktree,"AGENTS.md"));
   assert.equal(gitText(worktree,["status","--porcelain=v1"]),"");
   const index = gitText(worktree,["rev-parse","--git-path","index"]), original = readFileSync(index);
   const done = await finish(dir), entry = checksOf(dir).at(-1);
   assert.equal(done.state,"completed"); assert.equal(done.loop.released,false);
   assert.match(done.message,/工作区有未提交文件，已保留/);
-  assert.equal(entry?.result,"保留"); assert.deepEqual(entry?.detail?.split("\n"),["outside.txt","src/app.txt"]);
+  assert.equal(entry?.result,"保留"); assert.deepEqual(entry?.detail?.split("\n"),["AGENTS.md","outside.txt","src/app.txt"]);
   assert.deepEqual(readFileSync(index),original);
   assert.equal(readFileSync(join(worktree,"src/app.txt"),"utf8"),"hidden change\n");
   assert.equal(readFileSync(join(worktree,"outside.txt"),"utf8"),"skipped change\n");
@@ -97,25 +100,12 @@ test("慢删除不持有状态锁；删完即崩溃后手工收尾只补登记�
   try { assert.doesNotThrow(pulse); } finally { clock.mock.restore(); unlock(); }
   assert.deepEqual(statusOf(dir),before,"心跳遇到忙锁不抢写失败状态");
 
-  const gate = join(f.base,"release-gate"), marker = join(dir,"removing"); execFileSync("mkfifo",[gate]);
-  const interrupt = `
-import cp from 'node:child_process'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
-const run=cp.spawnSync;
-cp.spawnSync=(cmd,args,...rest)=>{
-  if(cmd!=='git'||args.at(-1)!==process.argv[2]||args.at(-2)!=='remove')return run(cmd,args,...rest);
-  fs.writeFileSync(process.argv[3],''); fs.readFileSync(process.argv[4]);
-  const result=run(cmd,args,...rest); process.exit(result.status===0 ? 71 : 72);
-};
-syncBuiltinESMExports();
-const {finish}=await import(${JSON.stringify(join(ROOT,"src/cli/finish.ts"))}); await finish(process.argv[1]);`;
-  const child = spawn(NODE,["--input-type=module","-e",interrupt,dir,worktree,marker,gate],{env:f.env,stdio:"inherit"});
-  const exited = new Promise<number|null>((resolve,reject)=>{child.on("error",reject);child.on("close",resolve);});
-  t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill("SIGKILL");});
-  await until(dir,()=>existsSync(marker),Boolean);
-  const deleting = statusOf(dir); assert.equal(deleting.state,"completed"); assert.ok(deleting.loop.releasePending);
+  const deletion = await gateRemoval(t,f,"收尾","after");
+  const deleting = statusOf(dir); assert.equal(deleting.state,"completed"); assert.ok(deleting.loop.releasePending?.target);
   assert.ok(existsSync(join(dir,"operation.lock"))); lock(statusLock)(); pulse();
-  assert.deepEqual(statusOf(dir),deleting);
-  write(gate,"remove\n"); assert.equal(await exited,71);
+  assert.throws(()=>stop(dir),/工作区释放尚未结束.*收尾/);
+  assert.deepEqual(statusOf(dir),deleting,"争用中的停止不写可续跑状态");
+  deletion.proceed(); assert.equal((await deletion.exited).code,71);
   assert.equal(existsSync(worktree),false); assert.equal(statusOf(dir).loop.released,false);
   await settle(dir); assert.equal(statusOf(dir).state,"completed");
   const committed = f.git("rev-parse","dev"), checks = checksOf(dir);
@@ -127,6 +117,23 @@ const {finish}=await import(${JSON.stringify(join(ROOT,"src/cli/finish.ts"))}); 
   assert.equal(f.git("rev-parse","dev"),committed);
   assert.deepEqual(checksOf(dir).slice(0,-1),checks); assert.equal(checksOf(dir).at(-1)?.result,"已释放");
   assert.throws(()=>resume(dir),/已释放/);
+});
+for (const replace of [false,true]) test("释放中断后识别工作区已移动，原路径被占用=" + replace, async t => {
+  const f = await delivered(t,{card:{flow:flow.slice(0,3)}}), {dir,worktree,branch} = f.task;
+  reviewed(f.task,f.commit); transition(dir,"working","收尾中","待收尾",null);
+  const deletion = await gateRemoval(t,f,"收尾","before");
+  deletion.proceed(); assert.equal((await deletion.exited).code,71);
+  const moved = join(f.base,"moved task"); f.git("worktree","move",worktree,moved);
+  if (replace) f.git("worktree","add","--detach",worktree,"dev");
+  const done = JSON.parse((await f.cli(["收尾",f.task.executionId,"--json"])).stdout), checks = checksOf(dir);
+  assert.equal(done.state,"completed"); assert.equal(done.loop.released,false); assert.equal(done.loop.releasePending,null);
+  assert.equal(gitText(moved,["branch","--show-current"]),branch);
+  assert.equal(readFileSync(join(moved,"src/app.txt"),"utf8"),"good delivered\n");
+  assert.equal(existsSync(worktree),replace);
+  if (replace) assert.equal(gitText(worktree,["rev-parse","HEAD"]),f.git("rev-parse","dev"));
+  assert.deepEqual(checks.filter(c=>c.step==="释放").map(c=>c.result),["失败"]);
+  assert.match(checks.at(-1)!.detail!,/Git 工作区登记不一致/); assert.ok(checks.at(-1)!.detail!.includes(moved));
+  assert.equal(checks.filter(c=>c.step==="合入").length,1); assert.doesNotMatch(done.message,/工作区已释放/);
 });
 test("关闭宿主不结束收尾；停止不打断部署脚本，之后不合入或推送", async t => {
   const f = await finishingFixture(t,{cmd:"fs.writeFileSync(dir+'/started','');const w=fs.watch(dir,()=>{if(fs.existsSync(dir+'/go')){fs.writeFileSync(dir+'/script-finished','');w.close();}});"});

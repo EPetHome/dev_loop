@@ -15,7 +15,7 @@ import { background } from "./background.ts";
 import { releaseWorktree } from "./inspect.ts";
 export function pendingAcceptance(card: string): number {
   const current = dirname(card), parent = dirname(current);
-  return readdirSync(parent,{withFileTypes:true}).filter(e => {
+  return readdirSync(parent,{withFileTypes:true}).filter(e=>{
     try { return e.isDirectory() && join(parent,e.name) !== current && readFileSync(join(parent,e.name,"验收.md"),"utf8").split(/\r?\n/)[0] === "状态：待验"; } catch { return false; }
   }).length;
 }
@@ -31,7 +31,7 @@ export async function finish(dir: string, automatic = false) {
     "恢复入口：bin/loop 退回 "+t.executionId,"验收标准："+(t.acceptance || "未登记"),""].join("\n"));
   const cleanup = () => { try { releaseWorktree(dir, true); } catch (e) { console.error("释放工作区未登记：", e); } return statusOf(dir); };
   try {
-    if (statusOf(dir).loop.releasePending) {
+    if (statusOf(dir).loop.releasePending?.auto) {
       if (automatic) throw new InputError("不自动重试已发起的收尾；收尾已通过，待手工接手释放"); return cleanup();
     }
     withLock(operationPath(dir), () => update(dir,s=>{
@@ -40,7 +40,7 @@ export async function finish(dir: string, automatic = false) {
       if(s.state==="cancelled" || (s.loop.phase!=="收尾中" && s.loop.wait!=="收尾没走完" && !interrupted))throw new InputError("当前不在待收尾");
       if(automatic && (s.loop.phase!=="收尾中" || s.loop.finisher))throw new InputError("不自动重试已发起的收尾；请显式运行 bin/loop 收尾 手工接手");
       if(!s.loop.commit)throw new InputError("没有交付记录");
-      commit=s.loop.commit; s.loop.finisher=owner; s.loop.afterCommit=commit; move(s,"working","收尾中","开始收尾","selfMs");
+      s.loop.afterCommit=commit=s.loop.commit; s.loop.finisher=owner; move(s,"working","收尾中","开始收尾","selfMs");
     }, "收尾"), 0); claimed=true;
     await queued(dir, async () => {
       const cancelled = () => statusOf(dir).state === "cancelled"; before = gitText(t.repo,["rev-parse","dev"]);
@@ -72,10 +72,9 @@ export async function finish(dir: string, automatic = false) {
         if (!launchStarted(statusOf(next.dir))) await background(next,"handoff");
       }
       if (cancelled()) return;
-      const reasons = checksOf(dir).filter(c=>c.step==="收尾" && c.result==="退回开发方").map(c=>c.detail).join("；");
-      const message = "收尾已走完；验收标准：" + (t.acceptance || "未登记") + "；中途退回 " + (statusOf(dir).loop.deployReturns || 0) + " 次" + (reasons?"："+reasons:"") + "；另有 " + pendingAcceptance(t.card) + " 批待验";
-      facts(message); record("通过",message);
-      update(dir, s=>{ if (move(s,"completed",after.length?s.loop.phase:"完成",message,null) && shouldRelease) s.loop.releasePending = new Date().toISOString(); });
+      const reasons = checksOf(dir).flatMap(c=>c.step==="收尾" && c.result==="退回开发方" ? [c.detail] : []).join("；"), returns = statusOf(dir).loop.deployReturns || 0;
+      const message = `收尾已走完；验收标准：${t.acceptance || "未登记"}；中途退回 ${returns} 次${reasons ? "："+reasons : ""}；另有 ${pendingAcceptance(t.card)} 批待验`; facts(message); record("通过",message);
+      update(dir, s=>{ if (move(s,"completed",after.length?s.loop.phase:"完成",message,null) && shouldRelease) s.loop.releasePending = {at:new Date().toISOString(),auto:true}; });
     }, true);
     if (shouldRelease) cleanup();
   } catch (e) {

@@ -33,6 +33,7 @@ export interface Check {
   commit: string; tree: string; step: string; result: string; promptHash: string; acceptanceHash: string;
   startedAt: string; endedAt: string; durationMs: number; evidence: string[]; detail?: string;
 }
+export interface ReleasePending { at: string; auto?: true; target?: {gitDir: string; id: string} }
 export interface Status {
   protocol: string; source: {worker: string; instance: string}; executionId: string; dispatchId: string | null; batchId: null;
   state: State; message: string; updatedAt: string; seq: number; generation: number; heartbeatSec: number; timeLimitSec: number | null;
@@ -43,7 +44,7 @@ export interface Status {
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null; startingSession: (Identity & {launchId: string}) | null;
     finisher?: Identity | null; afterCommit?: string | null; activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean;
     deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string;
-    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean; releasePending?: string | null;
+    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean; releasePending?: ReleasePending | null;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
     remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
@@ -98,19 +99,16 @@ export function waitFor(dir: string, reason: WaitReason, message: string, pendin
   if (move(s,"input_required","等你",message,"inputMs")) { s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn; }
 }); }
 export function fail(dir: string, error: unknown, category?: string): void {
-  const raw = error instanceof Error ? error.message : String(error);
-  const kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
-  update(dir,s => { if (move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; });
+  const raw = error instanceof Error ? error.message : String(error), kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
+  update(dir,s => { if (!s.loop.releasePending && !s.loop.released && move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; });
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
 export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {
-  const parsed = readCard(file), { repo, card } = parsed, task = card.tasks[0];
-  let config: Config;
+  const parsed = readCard(file), {repo,card} = parsed, task = card.tasks[0]; let config: Config;
   try { config = loadConfig(repo); } catch (e) { throw new InputError(e instanceof Error ? e.message : String(e)); }
   mkdirSync(root, { recursive: true }); root = realpathSync(root);
   const executionId = [basename(repo), card.name, task.name].map(ascii).join("-") + "-" + randomBytes(3).toString("hex");
-  const dir = join(root, executionId), createdAt = new Date().toISOString();
-  const t: Task = { executionId, dir, repo, card: parsed.file, cardHash: parsed.cardHash, name: task.name,
+  const dir = join(root, executionId), createdAt = new Date().toISOString(), t: Task = { executionId, dir, repo, card: parsed.file, cardHash: parsed.cardHash, name: task.name,
     prompt: task.prompt, acceptance: card.acceptance, scope: task.scope, test: task.test, host: card.host, limits: card.limits, config,
     after: card.after, ...(card.next ? {next: card.next} : {}),
     baseCommit: baseCommit || gitText(repo, ["rev-parse", "refs/heads/" + card.base]), branch: "dev-loop/" + executionId,
@@ -124,8 +122,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
       ready: false, prepared: false, abandoned: false, released: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
-  writeJson(join(dir, "status.json"), s); idleSleep(dir, true);
-  writeFileSync(join(dir, "checks.jsonl"), ""); writeFileSync(join(dir, "instructions.jsonl"), ""); summary(dir, s);
+  writeJson(join(dir,"status.json"),s); idleSleep(dir,true); writeFileSync(join(dir,"checks.jsonl"),""); writeFileSync(join(dir,"instructions.jsonl"),""); summary(dir,s);
   return t;
 }
 export function allTasks(root = tasksRoot()): string[] {
@@ -133,12 +130,10 @@ export function allTasks(root = tasksRoot()): string[] {
 }
 export function locate(cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (env.LOOP_TASK_DIR) { taskOf(env.LOOP_TASK_DIR); return resolve(env.LOOP_TASK_DIR); }
-  const current = realpathSync(cwd);
-  return allTasks(tasksRoot(env)).find((d) => inside(taskOf(d).worktree, current));
+  const current = realpathSync(cwd); return allTasks(tasksRoot(env)).find(d=>inside(taskOf(d).worktree,current));
 }
 export function inputs(t: Task) {
-  const prompt = readFileSync(t.prompt, "utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance, "utf8") : "";
-  return { prompt, acceptance, promptHash: digest(prompt), acceptanceHash: digest(acceptance) };
+  const prompt = readFileSync(t.prompt,"utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance,"utf8") : ""; return {prompt,acceptance,promptHash:digest(prompt),acceptanceHash:digest(acceptance)};
 }
 export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))): string[] {
   const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
