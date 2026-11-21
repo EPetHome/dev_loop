@@ -59,12 +59,43 @@ test("A1/A3/A8：宿主自动独立收尾，部署前 dev 不变，部署中 wor
   assert.equal(statusOf(f.task.dir).loop.phase,"已部署"); assert.equal(readFileSync(join(f.task.dir,"order"),"utf8"),"test\nreview\n");
   await settle(f.task.dir); await startFinish(f.task.dir,f.env); assert.equal(received(f.task.dir).length,2); assert.equal(statusOf(f.task.dir).loop.phase,"已部署");
 });
-test("A2：只合入不部署；手工收尾拒绝非待收尾和无约定的卡", async t => {
-  const f = await finishingFixture(t,{flow:flow.slice(0,3)}); await settle(f.task.dir); await finish(f.task.dir);
-  assert.equal(statusOf(f.task.dir).loop.phase,"已合入"); assert.equal(statusOf(f.task.dir).state,"completed");
+test("只合入不部署，收尾成功自动释放；无收尾的卡保留工作区", async t => {
+  const f = await finishingFixture(t,{flow:flow.slice(0,3)}); await settle(f.task.dir); await startFinish(f.task.dir,f.env);
+  const done = await until(f.task.dir,()=>statusOf(f.task.dir),s=>s.state==="completed" && !s.loop.finisher);
+  assert.equal(done.loop.phase,"已合入"); assert.equal(done.state,"completed");
   assert.equal(f.git("rev-parse","dev^2"),f.commit); assert.equal(existsSync(join(f.task.dir,"calls.jsonl")),false);
+  assert.equal(done.loop.released,true); assert.equal(existsSync(f.task.worktree),false);
+  assert.equal(f.git("rev-parse",f.task.branch),f.commit); assert.ok(existsSync(join(f.task.dir,"test-"+f.commit+".log")));
+  assert.deepEqual(checksOf(f.task.dir).filter(c=>c.step==="释放").map(c=>[c.result,c.commit]),[["已释放",f.commit]]);
+  assert.match(done.message,/工作区已释放/); assert.match(readFileSync(join(f.repo,"结果.md"),"utf8"),/工作区已释放/);
   await assert.rejects(finish(f.task.dir),/当前不在待收尾/);
-  const plain = await delivered(t); await assert.rejects(finish(plain.task.dir),/没有约定收尾/);
+  const plain = await delivered(t); await settle(plain.task.dir); await startFinish(plain.task.dir,plain.env);
+  assert.equal(statusOf(plain.task.dir).state,"completed"); assert.equal(statusOf(plain.task.dir).loop.released,false);
+  assert.ok(existsSync(plain.task.worktree)); assert.ok(!checksOf(plain.task.dir).some(c=>c.step==="释放"));
+  await assert.rejects(finish(plain.task.dir),/没有约定收尾/);
+});
+test("收尾时发现未跟踪文件，正常完成且只列出前 20 个路径", async t => {
+  const f = await delivered(t,{card:{flow:flow.slice(0,3)}}); await settle(f.task.dir);
+  const paths = ["draft 中文.txt", ...Array.from({length:21},(_,i)=>`tmp/notes-${String(i).padStart(2,"0")}.txt`)];
+  for (const path of paths) write(join(f.task.worktree,path),"unsaved\n");
+  const done = await finish(f.task.dir), checks = checksOf(f.task.dir);
+  assert.equal(done.state,"completed"); assert.equal(done.loop.phase,"已合入"); assert.equal(done.loop.wait,null);
+  assert.equal(done.loop.released,false); assert.equal(f.git("rev-parse","dev^2"),f.commit);
+  assert.match(done.message,/工作区有未提交文件，已保留/);
+  for (const path of paths) assert.equal(readFileSync(join(f.task.worktree,path),"utf8"),"unsaved\n");
+  assert.deepEqual(checks.slice(-2).map(c=>[c.step,c.result]),[["收尾","通过"],["释放","保留"]]);
+  assert.deepEqual(checks.at(-1)?.detail?.split("\n"),paths.slice(0,20));
+});
+test("Git 拒绝删除时记释放失败及原始错误，不影响已通过的收尾", async t => {
+  const f = await delivered(t,{card:{flow:flow.slice(0,3)}}); await settle(f.task.dir);
+  f.git("worktree","lock","--reason","keep this fixture",f.task.worktree);
+  const done = await finish(f.task.dir), checks = checksOf(f.task.dir);
+  assert.equal(done.state,"completed"); assert.equal(done.loop.phase,"已合入"); assert.equal(done.error,null);
+  assert.equal(done.loop.released,false); assert.ok(existsSync(f.task.worktree)); assert.equal(f.git("rev-parse","dev^2"),f.commit);
+  assert.deepEqual(checks.slice(-2).map(c=>[c.step,c.result]),[["收尾","通过"],["释放","失败"]]);
+  assert.match(checks.at(-1)!.detail!,/fatal: .*locked working tree.*keep this fixture/);
+  assert.doesNotMatch(done.message,/工作区已释放/);
+  assert.doesNotMatch(readFileSync(join(f.repo,"结果.md"),"utf8"),/工作区已释放/);
 });
 test("A9：同项目两次收尾排队；部署段不重叠，均完成", async t => {
   const f = await finishingFixture(t,{cmd:"fs.writeFileSync(dir+'/started',''); const ready=()=>{if(fs.existsSync(dir+'/go'))w.close();};const w=fs.watch(dir,ready);ready();"});
@@ -84,6 +115,7 @@ test("关闭宿主不结束收尾；停止不打断部署脚本，之后不合�
   stop(f.task.dir); assert.equal(existsSync(join(f.task.dir,"script-finished")),false); write(join(f.task.dir,"go"),"");
   await until(f.task.dir,()=>statusOf(f.task.dir),s=>!s.loop.finisher);
   assert.equal(existsSync(join(f.task.dir,"script-finished")),true); assert.equal(f.git("rev-parse","dev"),f.before); assert.equal(statusOf(f.task.dir).state,"cancelled");
+  assert.equal(statusOf(f.task.dir).loop.released,false); assert.ok(existsSync(f.task.worktree));
   update(f.task.dir,s=>{s.loop.session=null;});const continued=resume(f.task.dir);assert.equal(continued.reused,false);assert.equal(continued.status.state,"working");assert.equal(continued.status.loop.phase,"开发中");
 });
 test("核心只转收尾中且不报 completed；同 commit 不重复，沿用不盖附加阶段", async t => {
@@ -112,6 +144,7 @@ test("A4/A5：失败检查只回退一次，返修收到原因；新 commit 重�
   const failed=statusOf(f.task.dir); assert.equal(failed.state,"working"); assert.equal(failed.loop.phase,"开发中"); assert.equal(failed.loop.deployReturns,1);
   assert.match(failed.loop.pendingReturn!,/health is broken/); assert.equal(f.git("rev-parse","dev"),f.before); assert.equal(f.git("ls-remote","origin","refs/heads/dev").split(/\s/)[0],f.before);
   assert.deepEqual(received(f.task.dir).map(c=>c.name),["deploy","check","rollback"]);
+  assert.equal(failed.loop.released,false); assert.ok(existsSync(f.task.worktree)); assert.ok(!checksOf(f.task.dir).some(c=>c.step==="释放"));
   const events:Record<string,any>={}, messages:any[]=[], callbacks:(()=>void)[]=[];
   registerPi({on:(e,h)=>{events[e]=h;},sendMessage:(m,o)=>messages.push({m,o})},{env:{LOOP_TASK_DIR:f.task.dir},every:cb=>{callbacks.push(cb);return {unref(){}};},clear:()=>{}});
   const ctx={cwd:f.task.worktree,hasUI:false,sessionManager:{getSessionId:()=>"fake",getBranch:()=>[]}};
@@ -123,6 +156,8 @@ test("A4/A5：失败检查只回退一次，返修收到原因；新 commit 重�
   const done=statusOf(f.task.dir); assert.equal(done.state,"completed"); assert.equal(done.loop.phase,"已推送"); assert.match(done.message,/退回 1 次[\s\S]*health is broken/);
   assert.equal(checksOf(f.task.dir).filter(c=>c.step==="复测").length,2); assert.equal(checksOf(f.task.dir).filter(c=>c.step==="评审").length,2);
   assert.equal(f.git("ls-remote","origin","refs/heads/dev").split(/\s/)[0],f.git("rev-parse","dev")); events.session_shutdown();
+  assert.equal(done.loop.released,true); assert.equal(existsSync(f.task.worktree),false);
+  assert.deepEqual(checksOf(f.task.dir).slice(-3).map(c=>[c.step,c.result]),[["推送","已推送"],["收尾","通过"],["释放","已释放"]]);
 });
 test("A6：回退也失败不返修，明确等你；达到 2 轮上限后不再自动退回", async t => {
   const broken=await finishingFixture(t,{check:"process.exit(7);",rollback:"process.exit(8);"}); await settle(broken.task.dir); await finish(broken.task.dir);
@@ -142,6 +177,8 @@ test("试合并冲突退回返修；资格不足、推送失败转等你；手�
   reviewed(missing.task,missing.commit); waitFor(missing.task.dir,"收尾没走完","retry"); await finish(missing.task.dir); assert.equal(statusOf(missing.task.dir).loop.phase,"已部署");
   const pushFail=await finishingFixture(t,{flow:["开发评审","合入","推送"]}); await settle(pushFail.task.dir); await finish(pushFail.task.dir);
   assert.equal(statusOf(pushFail.task.dir).state,"input_required"); assert.match(statusOf(pushFail.task.dir).message,/origin/); assert.equal(statusOf(pushFail.task.dir).loop.deployReturns,0);
+  assert.equal(pushFail.git("rev-parse","dev^2"),pushFail.commit); assert.equal(statusOf(pushFail.task.dir).loop.released,false);
+  assert.ok(existsSync(pushFail.task.worktree)); assert.ok(!checksOf(pushFail.task.dir).some(c=>c.step==="释放"));
 });
 test("A7：接力下一批起点是上一批交付；最后一次部署才推进 dev，沿用派单号", async t => {
   const f=await finishingFixture(t,{flow:flow.slice(0,2)}), nextCard=join(f.repo,"next.json");
@@ -149,6 +186,7 @@ test("A7：接力下一批起点是上一批交付；最后一次部署才推进
   const first=createTask(f.card,f.root,"dispatch-chain"); await prepare(first.dir); write(join(first.worktree,"src/first.txt"),"first\n"); const a=deliver(first.dir).commit;
   await settle(first.dir); await startFinish(first.dir,f.env);
   const completed=await until(first.dir,()=>statusOf(first.dir),s=>s.state==="completed" && !s.loop.finisher); assert.ok(completed.loop.next);
+  assert.equal(completed.loop.released,false); assert.ok(existsSync(first.worktree)); assert.ok(!checksOf(first.dir).some(c=>c.step==="释放"));
   const second=taskOf(join(f.root,completed.loop.next!)); await until(second.dir,()=>existsSync(join(second.dir,"opened.json")),Boolean);
   await until(second.dir,()=>statusOf(second.dir),s=>!s.loop.launcher); assert.equal(second.baseCommit,a); assert.equal(second.dispatchId,"dispatch-chain"); assert.equal(f.git("rev-parse","dev"),f.before);
   assert.equal(readFileSync(join(second.worktree,"src/first.txt"),"utf8"),"first\n"); write(join(second.worktree,"src/second.txt"),"second\n"); deliver(second.dir); await settle(second.dir);

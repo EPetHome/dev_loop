@@ -37,7 +37,7 @@ export function lock(path: string, waitMs = 0): () => void {
     }
   }
 }
-export function withLock<T>(path: string, action: () => T): T {
-  const release = lock(path, 2000);
+export function withLock<T>(path: string, action: () => T, waitMs = 2000): T {
+  const release = lock(path, waitMs);
   try { return action(); } finally { release(); }
 }

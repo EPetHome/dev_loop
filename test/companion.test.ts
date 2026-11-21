@@ -13,6 +13,7 @@ import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { deploy } from "../src/steps/deploy.ts";
 import { compare } from "../src/infra/snapshot.ts";
+import { gitText } from "../src/infra/git.ts";
 import { startCompanion } from "../src/hosts/after-settle.ts";
 function snapshotFixture(t: Parameters<typeof fixture>[0], body?: string) {
   const f=fixture(t,{config:{snapshot:"snapshot.cjs",setup:"test -f local.txt",deploy:{cmd:"deploy.cjs",check:"check.cjs",rollback:"check.cjs"}}});
@@ -67,9 +68,30 @@ test("部署前后 live、静态依赖摘要；对比一个/两个执行、释�
   const two=JSON.parse((await f.cli(["对比",task.executionId,second.executionId,"--json"])).stdout);assert.match(two.diff,/变化 \/value/);assert.ok(two.diff.includes(c1));assert.ok(two.diff.includes(c2));
   assert.deepEqual(getJson(join(b.evidenceDir,"snapshot-static.json")).files,["src/app.txt"]);
   transition(second.dir,"working","开发中","working",null);assert.throws(()=>releaseWorktree(second.dir),/未完成/);
-  const released=JSON.parse((await f.cli(["释放",task.executionId,"--json"])).stdout);assert.equal(released.released,true);assert.equal(existsSync(task.worktree),false);assert.equal(statusOf(task.dir).loop.phase,"已部署");
+  const released=JSON.parse((await f.cli(["释放",task.executionId,"--json"])).stdout);assert.deepEqual(released,{executionId:task.executionId,released:true});assert.equal(existsSync(task.worktree),false);assert.equal(statusOf(task.dir).loop.phase,"已部署");
   assert.equal(existsSync(a.evidenceDir),true);assert.ok(f.git("show-ref","--verify","refs/heads/"+task.branch));assert.equal(existsSync(join(task.dir,"checks.jsonl")),true);
+  assert.deepEqual(checksOf(task.dir).filter(c=>c.step==="释放").map(c=>c.result),["已释放"]);
   assert.throws(()=>resume(task.dir),/已释放/);assert.throws(()=>releaseWorktree(task.dir),/已释放/);await settle(task.dir);assert.equal(statusOf(task.dir).state,"completed");
+});
+test("手工释放拒绝未跟踪、已暂存和未暂存文件，不改文件、状态或检查记录", async t => {
+  const f = fixture(t), task = await f.prepare(), cwd = task.worktree;
+  write(join(cwd,"src/app.txt"),"good delivered\n"); deliver(task.dir); await settle(task.dir);
+  f.git("config","status.showUntrackedFiles","no");
+  write(join(cwd,"中文 draft.txt"),"untracked\n"); write(join(cwd,"outside.txt"),"staged\n");
+  gitText(cwd,["add","outside.txt"]); write(join(cwd,"src/app.txt"),"unstaged\n");
+  const before = statusOf(task.dir), records = readFileSync(join(task.dir,"checks.jsonl"),"utf8");
+  assert.equal(before.state,"completed");
+  await assert.rejects(f.cli(["释放",task.executionId,"--json"]),(e: {code: number; stderr: string})=>{
+    assert.equal(e.code,1);
+    const {error} = JSON.parse(e.stderr);
+    assert.equal(error.category,"输入问题"); assert.match(error.raw,/工作区有未提交文件/);
+    for (const path of ["中文 draft.txt","outside.txt","src/app.txt"]) assert.ok(error.raw.includes(path));
+    return true;
+  });
+  assert.equal(readFileSync(join(cwd,"中文 draft.txt"),"utf8"),"untracked\n");
+  assert.equal(readFileSync(join(cwd,"outside.txt"),"utf8"),"staged\n"); assert.equal(gitText(cwd,["show",":outside.txt"]),"staged");
+  assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");
+  assert.deepEqual(statusOf(task.dir),before); assert.equal(readFileSync(join(task.dir,"checks.jsonl"),"utf8"),records);
 });
 test("live 留痕失败只记记录；缺基线对比不影响状态，没登记脚本不阻断部署",async t=>{
   const f=snapshotFixture(t,"console.log('snapshot broken');process.exit(7);"),task=await f.prepare();transition(task.dir,"completed","完成","ready",null);

@@ -30,8 +30,8 @@ export interface Task {
   baseCommit: string; branch: string; worktree: string; createdAt: string; dispatchId: string | null; after?: string[]; next?: string;
 }
 export interface Check {
-  commit: string; tree: string; step: string; result: string; startedAt: string; endedAt: string; durationMs: number;
-  evidence: string[]; promptHash: string; acceptanceHash: string; detail?: string;
+  commit: string; tree: string; step: string; result: string; promptHash: string; acceptanceHash: string;
+  startedAt: string; endedAt: string; durationMs: number; evidence: string[]; detail?: string;
 }
 export interface Status {
   protocol: string; source: {worker: string; instance: string}; executionId: string; dispatchId: string | null; batchId: null;
@@ -40,10 +40,10 @@ export interface Status {
   evidence: string[]; actions: string[];
   loop: {
     phase: Phase; wait?: WaitReason | null; facts?: Facts; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
-    session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
-    startingSession: (Identity & {launchId: string}) | null;
-    finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string; released?: boolean;
-    activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean; ready: boolean; prepared: boolean; abandoned: boolean;
+    session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null; startingSession: (Identity & {launchId: string}) | null;
+    finisher?: Identity | null; afterCommit?: string | null; activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean;
+    deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string;
+    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
     remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
@@ -94,17 +94,13 @@ export function update(dir: string, action: (s: Status) => void, resolvedBy: Res
 }
 export function move(s: Status, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null) {
   if (s.state === "cancelled" && state !== "cancelled") return false;
-  Object.assign(s, {state, message, error:null, timeLimitSec}); Object.assign(s.loop, {phase, bucket, wait:null});
-  return true;
+  Object.assign(s, {state, message, error:null, timeLimitSec}); Object.assign(s.loop, {phase, bucket, wait:null}); return true;
 }
 export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) =>
   update(dir, s => { move(s,state,phase,message,bucket,timeout); });
-export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void {
-  update(dir, s => {
-    if (!move(s,"input_required","等你",message,"inputMs")) return;
-    s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
-  });
-}
+export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void { update(dir, s => {
+  if (move(s,"input_required","等你",message,"inputMs")) { s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn; }
+}); }
 export function fail(dir: string, error: unknown, category?: string): void {
   const raw = error instanceof Error ? error.message : String(error);
   const kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
@@ -130,7 +126,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","答复","停止","放弃"],
     loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null, answerCount: 0,
-      ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
+      ready: false, prepared: false, abandoned: false, released: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
       bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
   writeJson(join(dir, "status.json"), s); idleSleep(dir, true);
@@ -161,10 +157,8 @@ export const checked = (dir: string, commit: string, hashes: Pick<Check, "prompt
 interface StepView { phase: Phase; message: string; complete?: boolean }
 function stepView(dir: string, view: StepView): void {
   update(dir, s => {
-    if (s.state !== "completed" && !(s.state === "input_required" && view.complete) && !(s.state === "working" && s.loop.finisher)) return;
-    if (s.state !== "working") { s.state = "completed"; s.loop.bucket = null; }
-    s.loop.wait = null; s.timeLimitSec = null; s.error = null;
-    s.loop.phase = view.phase; s.message = view.message;
+    if (s.state === "completed" || (s.state === "input_required" && view.complete)) move(s,"completed",view.phase,view.message,null);
+    else if (s.state === "working" && s.loop.finisher) move(s,"working",view.phase,view.message,s.loop.bucket);
   }, "合入（接受未验证）");
 }
 export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
@@ -172,6 +166,5 @@ export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash"
   const t = taskOf(dir); let hashes = {promptHash: "", acceptanceHash: ""};
   try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
   appendCheck(dir, {...entry, tree: gitText(t.repo, ["rev-parse", entry.commit + "^{tree}"]), promptHash: hashes.promptHash, acceptanceHash: hashes.acceptanceHash});
-  if (view) stepView(dir, view);
-  summary(dir);
+  if (view) stepView(dir, view); else summary(dir);
 }
