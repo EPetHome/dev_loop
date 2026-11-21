@@ -1,4 +1,4 @@
-import { locate, fail, taskOf, statusOf, update, PHASES } from "../core/store.ts";
+import { locate, taskOf, statusOf, update, PHASES } from "../core/store.ts";
 import { registerSession, heartbeat, shutdownSession } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { convention } from "./convention.ts";
@@ -49,7 +49,7 @@ export function registerPi(pi: PiAPI, options: {
     }
     const taskDir = dir;
     timer = (options.every || setInterval)(() => {
-      try { heartbeat(taskDir); } catch (e) { fail(taskDir, e); }
+      try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：", e); }
     }, 60000);
     timer?.unref?.();
     name = taskOf(dir).name; refresh();

@@ -43,7 +43,7 @@ export interface Status {
     session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null; startingSession: (Identity & {launchId: string}) | null;
     finisher?: Identity | null; afterCommit?: string | null; activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean;
     deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string;
-    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean;
+    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean; releasePending?: string | null;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
     remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
@@ -58,15 +58,13 @@ export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.json
 export const appendCheck = (dir: string, check: Check) => appendJson(join(dir, "checks.jsonl"), check);
 export function summary(dir: string, s = statusOf(dir)): void {
   const labels: Record<Bucket, string> = { developmentMs: "开发", testMs: "复测", reviewMs: "评审", inputMs: "等你", selfMs: "dev-loop 自身" };
-  const checks = checksOf(dir), lines = ["# " + s.executionId, "", s.loop.phase + "：" + s.message.replace(/\s+/g, " ").slice(0, 220),
+  const steps = new Map<string,{result:string; ms:number}>();
+  for (const {step,result,durationMs} of checksOf(dir)) steps.set(step,{result,ms:(steps.get(step)?.ms || 0)+durationMs});
+  const lines = ["# " + s.executionId, "", s.loop.phase + "：" + s.message.replace(/\s+/g, " ").slice(0, 220),
     s.loop.reused ? "结论：沿用此 commit 的已有检查。" : "", "", "| 步骤 | 结论 | 累计耗时 |", "|---|---|---|"];
   for (const [bucket, label] of Object.entries(labels)) {
-    if (bucket === "selfMs") for (const extra of new Set(checks.map(c => c.step).filter(step => !Object.values(labels).includes(step)))) {
-      const records = checks.filter(c => c.step === extra);
-      lines.push("| " + extra + " | " + records.at(-1)!.result + " | " + (records.reduce((n, c) => n + c.durationMs, 0) / 1000).toFixed(2) + "s |");
-    }
-    const last = checks.findLast(c => c.step === label);
-    const result = last?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
+    if (bucket === "selfMs") for (const [step,{result,ms}] of steps) if (!Object.values(labels).includes(step)) lines.push(`| ${step} | ${result} | ${(ms/1000).toFixed(2)}s |`);
+    const result = steps.get(label)?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
     lines.push("| " + label + " | " + result + " | " + (s.loop.durations[bucket as Bucket] / 1000).toFixed(2) + "s |");
   }
   lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl"));
@@ -74,8 +72,7 @@ export function summary(dir: string, s = statusOf(dir)): void {
 }
 export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑"): Status {
   return withLock(join(dir, "status.lock"), () => {
-    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase};
-    s.loop.facts ||= newFacts(taskOf(dir));
+    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase}; s.loop.facts ||= newFacts(taskOf(dir));
     if (s.loop.bucket) s.loop.durations[s.loop.bucket] += Math.max(0, now - s.loop.clockAt);
     s.loop.clockAt = now; action(s);
     const stopped = ["input_required", "failed", "cancelled"].includes(s.state), at = new Date(now).toISOString();
@@ -96,8 +93,7 @@ export function move(s: Status, state: State, phase: Phase, message: string, buc
   if (s.state === "cancelled" && state !== "cancelled") return false;
   Object.assign(s, {state, message, error:null, timeLimitSec}); Object.assign(s.loop, {phase, bucket, wait:null}); return true;
 }
-export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) =>
-  update(dir, s => { move(s,state,phase,message,bucket,timeout); });
+export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) => update(dir, s => { move(s,state,phase,message,bucket,timeout); });
 export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void { update(dir, s => {
   if (move(s,"input_required","等你",message,"inputMs")) { s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn; }
 }); }
@@ -119,8 +115,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     after: card.after, ...(card.next ? {next: card.next} : {}),
     baseCommit: baseCommit || gitText(repo, ["rev-parse", "refs/heads/" + card.base]), branch: "dev-loop/" + executionId,
     worktree: join(dir, "worktree"), createdAt, dispatchId };
-  mkdirSync(dir); // 随机编号若碰撞，拒绝而不是覆盖已有执行。
-  writeJson(join(dir, "task.json"), t);
+  mkdirSync(dir); writeJson(join(dir, "task.json"), t); // 编号碰撞时 mkdir 拒绝覆盖。
   const s: Status = { protocol: "loop-status/1", source: {worker: "loop", instance: hostname()}, executionId, dispatchId, batchId: null,
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
@@ -134,8 +129,7 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
   return t;
 }
 export function allTasks(root = tasksRoot()): string[] {
-  try { return readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(root, e.name)); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  try { return readdirSync(root,{withFileTypes:true}).flatMap(e=>e.isDirectory()?[join(root,e.name)]:[]); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
 }
 export function locate(cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (env.LOOP_TASK_DIR) { taskOf(env.LOOP_TASK_DIR); return resolve(env.LOOP_TASK_DIR); }

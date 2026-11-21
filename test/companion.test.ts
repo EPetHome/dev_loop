@@ -77,17 +77,22 @@ test("手工释放拒绝未跟踪、已暂存和未暂存文件，不改文件�
   const f = fixture(t), task = await f.prepare(), cwd = task.worktree;
   write(join(cwd,"src/app.txt"),"good delivered\n"); deliver(task.dir); await settle(task.dir);
   f.git("config","status.showUntrackedFiles","no");
-  write(join(cwd,"中文 draft.txt"),"untracked\n"); write(join(cwd,"outside.txt"),"staged\n");
-  gitText(cwd,["add","outside.txt"]); write(join(cwd,"src/app.txt"),"unstaged\n");
   const before = statusOf(task.dir), records = readFileSync(join(task.dir,"checks.jsonl"),"utf8");
   assert.equal(before.state,"completed");
-  await assert.rejects(f.cli(["释放",task.executionId,"--json"]),(e: {code: number; stderr: string})=>{
+  const rejectRelease = (...paths: string[]) => assert.rejects(f.cli(["释放",task.executionId,"--json"]),(e: {code: number; stderr: string})=>{
     assert.equal(e.code,1);
     const {error} = JSON.parse(e.stderr);
     assert.equal(error.category,"输入问题"); assert.match(error.raw,/工作区有未提交文件/);
-    for (const path of ["中文 draft.txt","outside.txt","src/app.txt"]) assert.ok(error.raw.includes(path));
+    for (const path of paths) assert.ok(error.raw.includes(path));
     return true;
   });
+  gitText(cwd,["update-index","--assume-unchanged","src/app.txt"]); write(join(cwd,"src/app.txt"),"unstaged\n");
+  const index = gitText(cwd,["rev-parse","--git-path","index"]), original = readFileSync(index);
+  assert.equal(gitText(cwd,["status","--porcelain=v1"]),""); await rejectRelease("src/app.txt");
+  assert.deepEqual(readFileSync(index),original);
+  assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");
+  write(join(cwd,"中文 draft.txt"),"untracked\n"); write(join(cwd,"outside.txt"),"staged\n"); gitText(cwd,["add","outside.txt"]);
+  await rejectRelease("中文 draft.txt","outside.txt","src/app.txt");
   assert.equal(readFileSync(join(cwd,"中文 draft.txt"),"utf8"),"untracked\n");
   assert.equal(readFileSync(join(cwd,"outside.txt"),"utf8"),"staged\n"); assert.equal(gitText(cwd,["show",":outside.txt"]),"staged");
   assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");

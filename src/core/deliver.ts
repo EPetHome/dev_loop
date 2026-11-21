@@ -4,7 +4,6 @@ import { alive } from "../infra/exec.ts";
 import { inScope, InputError } from "./card.ts";
 import { taskOf, statusOf, update, inputs, appendCheck, checked, fail, type Bucket, type Status, type Task } from "./store.ts";
 import { operationPath } from "./run.ts";
-
 export const onTaskBranch = (t: Task) => gitText(t.worktree, ["branch", "--show-current"]) === t.branch;
 export const waitingForDelivery = (s: Status) => s.state === "input_required" && s.loop.phase === "等你" && s.loop.wait === "停下没交付" && s.loop.ready && !s.loop.released && !s.loop.abandoned;
 export function undeliveredCommit(t: Task, s: Status, commit: string) {
@@ -45,7 +44,7 @@ function delivery(dir: string, note: string, expected?: string) {
     const t = taskOf(dir), s = statusOf(dir), begin = Date.now(), cwd = t.worktree;
     if (expected && !waitingForDelivery(s)) throw new InputError("只在「等你 · 停下没交付」时可确认交付；请重新查询执行");
     if (!expected) {
-      if (s.loop.phase === "收尾中" || alive(s.loop.finisher)) throw new InputError("正在收尾，不能交付");
+      if (s.loop.phase === "收尾中" || s.loop.releasePending || alive(s.loop.finisher)) throw new InputError("正在收尾，不能交付");
       if (["cancelled", "input_required", "failed"].includes(s.state)) throw new InputError("任务未运行，请先 bin/loop 续跑");
       if (!s.loop.ready) throw new InputError("工作区尚未准备好");
       previousBucket = s.loop.bucket; update(dir, s => { s.loop.bucket = "selfMs"; });

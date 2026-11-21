@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } fr
 import { dirname, join, resolve } from "node:path";
 import { gitText, head, changes } from "../infra/git.ts";
 import { inside } from "../infra/config.ts";
-import { lock, appendJson } from "../infra/files.ts";
+import { lock, withLock, BusyError, appendJson } from "../infra/files.ts";
 import { InputError } from "./card.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
 import { taskOf, statusOf, answersOf, update, move, transition, appendCheck, checksOf, inputs, checked, type Status, type Task } from "./store.ts";
@@ -53,15 +53,13 @@ export function registerSession(dir: string, host: string, id: string, pid = pro
   return registered;
 }
 export function heartbeat(dir: string, now = Date.now(), throttled = false): void {
-  const s = statusOf(dir);
-  if (s.state === "working" && !(throttled && now - Date.parse(s.updatedAt) < 60000)) update(dir, () => {});
+  const s = statusOf(dir); if (s.state !== "working" || (throttled && now - Date.parse(s.updatedAt) < 60000)) return;
+  try { update(dir, () => {}); } catch (e) { if (!(e instanceof BusyError)) throw e; }
 }
-export function shutdownSession(dir: string): void {
-  update(dir, (s) => {
-    if (s.loop.session) s.loop.session.endedAt = new Date().toISOString();
-    if (s.loop.bucket === "developmentMs") s.loop.bucket = null;
-  });
-}
+export function shutdownSession(dir: string): void { update(dir, s => {
+  if (s.loop.session) s.loop.session.endedAt = new Date().toISOString();
+  if (s.loop.bucket === "developmentMs") s.loop.bucket = null;
+}); }
 /** 只复用同一交付、同一输入下的复测；检查失败记录仍须是最近一次核心检查。 */
 export function retryReview(dir: string) {
   const t = taskOf(dir), s = statusOf(dir), commit = s.loop.delivery?.commit;
@@ -76,6 +74,7 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
   const requireWaiting = (s: Status) => { if (answering && s.state !== "input_required") throw new InputError("答复只在「等你」时接收；当前为「" + s.loop.phase + "」"); };
   requireWaiting(s);
   if (s.loop.released) throw new Error("工作区已释放，不能续跑；请重新启动卡");
+  if (s.loop.releasePending) throw new InputError("收尾已通过，待释放；可运行 bin/loop 收尾 " + t.executionId);
   if (s.loop.abandoned) throw new Error("已放弃并删除 worktree，不能续跑；请重新启动卡");
   if (s.loop.phase === "收尾中" || alive(s.loop.finisher) || alive(s.loop.startingSession) || alive(s.loop.activeProcess) || alive(s.loop.launcher)) throw new Error("执行正在准备或检查，请先停止再续跑");
   const running = alive(s.loop.session) && !s.loop.session?.endedAt;
@@ -114,12 +113,9 @@ export function stop(dir: string, abandon = false): Status {
   const stopped = transition(dir, "cancelled", abandon ? "已放弃" : "已停止", abandon ? "已放弃，保留分支和证据" : "已停止；可续跑", null);
   signalProcess(stopped.loop.startingSession);
   signalProcess(stopped.loop.activeProcess, true); signalProcess(stopped.loop.launcher, true); signalProcess(stopped.loop.session);
-  if (abandon) {
-    const release = lock(operationPath(dir), 2000);
-    try {
-      clearCheck(t); if (existsSync(t.worktree)) gitText(t.repo, ["worktree", "remove", "--force", t.worktree]);
-      rmSync(t.worktree, { recursive: true, force: true }); update(dir, (s) => { s.loop.abandoned = true; });
-    } finally { release(); }
-  }
+  if (abandon) withLock(operationPath(dir), () => {
+    clearCheck(t); if (existsSync(t.worktree)) gitText(t.repo, ["worktree", "remove", "--force", t.worktree]);
+    rmSync(t.worktree, { recursive: true, force: true }); update(dir, (s) => { s.loop.abandoned = true; });
+  });
   return abandon ? statusOf(dir) : stopped;
 }

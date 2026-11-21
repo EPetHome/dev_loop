@@ -36,7 +36,7 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
     catch (e) { if (e instanceof BusyError) return quiet("该任务的交付/检查正在处理中"); throw e; }
     const t = taskOf(dir), initial = statusOf(dir);
     if (confirmedCommit && (initial.state !== "working" || initial.loop.phase !== "已交付" || initial.loop.delivery?.commit !== confirmedCommit)) return quiet();
-    if (initial.loop.released) return quiet("工作区已释放");
+    if (initial.loop.released || initial.loop.releasePending) return quiet(initial.loop.released ? "工作区已释放" : "收尾已通过，等待释放工作区");
     if (alive(initial.loop.finisher)) return quiet("正在收尾");
     if (initial.state === "working" && initial.loop.finisher) { waitFor(dir,"收尾没走完","收尾进程已退出，可运行 bin/loop 收尾 " + t.executionId + " 手工接手。"); return quiet("等你"); }
     if (["cancelled", "input_required", "failed"].includes(initial.state)) return quiet(initial.message);

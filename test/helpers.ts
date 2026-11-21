@@ -1,6 +1,6 @@
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, chmodSync, rmSync, watch, watchFile, unwatchFile, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { execFileSync, execFile, spawn } from "node:child_process";
 import { once } from "node:events";
 import { promisify } from "node:util";
@@ -9,6 +9,11 @@ import { prepare } from "../src/core/lifecycle.ts";
 import { signalProcess, identity } from "../src/infra/exec.ts";
 // 所有测试（含子进程）强制替身，绝不调用本机 caffeinate。
 process.env.LOOP_CAFFEINATE_CMD = "/usr/bin/true";
+// macOS 的 /usr/bin/git 每次都通过 Xcode shim；测试直接使用它解析到的同一 Git。
+if (process.platform === "darwin" && execFileSync("/bin/sh", ["-c", "command -v git"], {encoding:"utf8"}).trim() === "/usr/bin/git") {
+  const gitPath = execFileSync("/usr/bin/xcrun", ["--find", "git"], {encoding:"utf8"}).trim();
+  process.env.PATH = dirname(gitPath) + ":" + process.env.PATH;
+}
 export const ROOT = resolve(import.meta.dirname, "..");
 export const NODE = process.execPath;
 export const PASS = "## 结论：通过\n## 必修\n无\n## 小问题\n- 建议示例\n## 需求疑问\n- 疑问示例\n## 上轮必修复查\n无\n";
@@ -19,7 +24,7 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, "tasks");
   mkdirSync(repo); mkdirSync(root);
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-  git("init", "-b", "dev");
+  git("init", "--template=", "-b", "dev");
   appendFileSync(join(repo, ".git", "config"), "\n[user]\n\tname = Loop Test\n\temail = loop-test@example.invalid\n");
   write(join(repo, "src/app.txt"), "good\n"); write(join(repo, "outside.txt"), "protected\n");
   write(join(repo, "prompt.md"), "实现 good；不要改 scope 外文件。\n");
