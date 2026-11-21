@@ -48,15 +48,13 @@ export function registerSession(dir: string, host: string, id: string, pid = pro
     const p = identity(pid), starting = s.loop.startingSession;
     if (!p.startedAt) throw new Error("无法读取开发会话进程身份：" + pid);
     if (starting && (starting.pid !== p.pid || starting.startedAt !== p.startedAt)) return;
-    s.loop.session = { ...p, host, id, ...(file ? { file } : {}) };
-    s.loop.startingSession = null; registered = true;
+    s.loop.session = {...p,host,id,...(file?{file}:{})}; s.loop.startingSession = null; registered = true;
   });
   return registered;
 }
 export function heartbeat(dir: string, now = Date.now(), throttled = false): void {
   const s = statusOf(dir);
-  if (s.state !== "working" || (throttled && now - Date.parse(s.updatedAt) < 60000)) return;
-  update(dir, () => {});
+  if (s.state === "working" && !(throttled && now - Date.parse(s.updatedAt) < 60000)) update(dir, () => {});
 }
 export function shutdownSession(dir: string): void {
   update(dir, (s) => {

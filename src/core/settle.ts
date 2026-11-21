@@ -12,10 +12,7 @@ import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
 import { testLogSummary } from "./test-summary.ts";
 import { snapshot, differences } from "./snapshot.ts";
 export interface SettleResult { continue: boolean; reason: string }
-interface SettleOptions {
-  signal?: AbortSignal; reviewOnly?: boolean; confirmedCommit?: string;
-  ending?: {stopReason?: string; errorMessage?: string};
-}
+interface SettleOptions { signal?: AbortSignal; reviewOnly?: boolean; confirmedCommit?: string; ending?: {stopReason?: string; errorMessage?: string} }
 const quiet = (reason = ""): SettleResult => ({continue:false, reason});
 function backToDevelopment(dir: string, reason: string): SettleResult {
   transition(dir,"working","开发中",reason,"developmentMs"); return {continue:true, reason};
@@ -57,10 +54,9 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         return s.state === "cancelled" ? quiet(s.message) : {continue:true, reason};
       }
       const error = ending?.stopReason === "error" ? ending.errorMessage || lastReply || "（无出错详情）" : "";
-      let reason = lastReply || "开发方未交付；可续跑开发或停止。";
-      if (candidate) reason = ["候选仍未交付；可查询执行、续跑开发或停止。", scene, error || lastReply].filter(Boolean).join("\n");
-      else if (error) reason = "模型出错；可续跑开发或停止。\n" + error;
-      else if (delivery) reason = "工作区与登记的交付不符；请检查任务分支和 HEAD。\n" + scene;
+      const reason = candidate ? ["候选仍未交付；可查询执行、续跑开发或停止。",scene,error||lastReply].filter(Boolean).join("\n")
+        : error ? "模型出错；可续跑开发或停止。\n"+error : delivery ? "工作区与登记的交付不符；请检查任务分支和 HEAD。\n"+scene
+        : lastReply || "开发方未交付；可续跑开发或停止。";
       waitFor(dir, !candidate && error ? "模型出错" : "停下没交付", reason); return quiet(reason);
     }
     const {prompt, acceptance, ...requirements} = inputs(t); hashes = requirements;
@@ -114,8 +110,8 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
         record("复测", "失败", start, [log], reason);
         return returnToDeveloper(dir, "test", reason);
       }
-      verifyPin();
-      writeJson(attempt,attemptKey(new Date(start).toISOString())); record("复测",testResult = result ? "通过" : "没验证",start,[log],"命令："+t.test);
+      verifyPin(); writeJson(attempt,attemptKey(new Date(start).toISOString()));
+      record("复测",testResult = result ? "通过" : "没验证",start,[log],"命令："+t.test);
     }
     const runtime = join(dir,"snapshot-"+commit+".json");
     if (!reviewTest && statusOf(dir).state !== "cancelled") await snapshot(pinned,cwd,commit,runtime,"scenario",{deadline,signal});
@@ -136,8 +132,7 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
     update(dir, s => { if (move(s,"working","评审中","正在评审第 " + round + " 轮","reviewMs",reviewSeconds)) s.loop.reviewRounds = round; });
     const reviewStart = Date.now(), budget = reviewSeconds * 1000 + Math.min(0,deadline-reviewStart);
-    const outcome = await executeStaticReview(pinned,round,material,budget,signal);
-    selfTime();
+    const outcome = await executeStaticReview(pinned,round,material,budget,signal); selfTime();
     if (statusOf(dir).state === "cancelled") { record("评审", "已停止", reviewStart, outcome.evidence); return quiet("已停止"); }
     verifyPin();
     if (!outcome.review) {
@@ -152,11 +147,9 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
     if (latest.promptHash !== hashes.promptHash || latest.acceptanceHash !== hashes.acceptanceHash) return backToDevelopment(dir,"提示词或验收标准在检查期间变化，请重新交付后检查。");
     return mustFix.length ? returnToDeveloper(dir,"review","评审必修：\n" + mustFix.map((s,i) => (i+1) + ". " + s).join("\n") + "\n修好后重新运行 bin/loop 交付；请逐条回复。") : complete(testResult);
   } catch (e) {
-    if (release) fail(dir, e);
-    return quiet(e instanceof Error ? e.message : String(e));
+    if (release) fail(dir, e); return quiet(e instanceof Error ? e.message : String(e));
   } finally {
-    clearInterval(pulse);
-    try {
+    try { clearInterval(pulse);
       if (task && ownStart) update(dir, s => {
         if (s.loop.bucket === "selfMs") s.loop.bucket = s.state === "working" ? s.loop.phase === "收尾中" ? "selfMs" : "developmentMs" : null;
         appendCheck(dir, { commit: s.loop.commit || task!.baseCommit, tree: s.loop.delivery?.tree || "", step: "dev-loop 自身",

@@ -17,6 +17,4 @@ export async function run(t: Task, command: string, args: string[], timeoutMs: n
 export const operationPath = (dir: string) => join(dir, "operation.lock");
 export const checkWorktree = (dir: string) => join(dir,"check-worktree");
 export const checkAttempt = (dir: string) => join(dir,"check-attempt.json");
-export function clearCheck(t: Task) {
-  rmSync(checkAttempt(t.dir),{force:true}); removeCheckout(t.repo,checkWorktree(t.dir));
-}
+export function clearCheck(t: Task) { rmSync(checkAttempt(t.dir),{force:true}); removeCheckout(t.repo,checkWorktree(t.dir)); }

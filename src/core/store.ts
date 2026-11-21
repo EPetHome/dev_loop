@@ -107,9 +107,8 @@ export function waitFor(dir: string, reason: WaitReason, message: string, pendin
 }
 export function fail(dir: string, error: unknown, category?: string): void {
   const raw = error instanceof Error ? error.message : String(error);
-  update(dir, s => {
-    if (move(s,"failed","失败",raw,null)) s.error = {category:category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知"), raw};
-  });
+  const kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
+  update(dir,s => { if (move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; });
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
 export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {

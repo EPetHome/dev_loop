@@ -146,7 +146,7 @@ scope 也接受字符串数组；支持目录前缀、`*`、`**`、`?`。越界�
 }
 ```
 
-开发 worktree 建好后复制 localFiles、运行 setup；setup 失败保留原始输出，可修正后续跑。正式复测和评审使用交付 SHA 的独立 detached worktree，不读开发工作区的后续改动。独立检出复制登记的 localFiles、运行 setup（输出 `check-setup-<sha>.log`），setup 与测试命令共用复测时限；可选留痕只用剩余复测时间，在另一份包含原复测产物的隔离副本中执行，失败只记记录，不改评审源码或产物。评审临时故障后保留该次复测检出和产物；符合补评审条件时复用它，不再跑 setup、复测或留痕。旧记录没有可用的原检出时，在同一 SHA 重建检出，不假造丢失的产物。正常结束或进入新检查时清理旧检出。命令使用所在检出，不依赖开发工作区的绝对路径。旧 preparation/gate/methods 不读。
+开发 worktree 建好后复制 localFiles、运行 setup；setup 失败保留原始输出，可修正后续跑。正式复测和评审使用交付 SHA 的独立 detached worktree，不读开发工作区的后续改动。独立检出复制登记的 localFiles、运行 setup（输出 `check-setup-<sha>.log`），setup 与测试命令共用复测时限；可选留痕的检出、复制和脚本共用剩余复测时间。指向原检出内部的软链接在副本中改指副本对应文件；链接越界或无法解析时只记留痕失败，不运行脚本。准备超时也只记留痕失败，副本后台清理，不占用评审时限；评审仍读原源码和原产物。评审临时故障后保留该次复测检出和产物；符合补评审条件时复用它，不再跑 setup、复测或留痕。旧记录没有可用的原检出时，在同一 SHA 重建检出，不假造丢失的产物。正常结束或进入新检查时清理旧检出。命令使用所在检出，不依赖开发工作区的绝对路径。旧 preparation/gate/methods 不读。
 
 未配置 reviewerCmd 时用 `pi -p`、全新会话、只读工具 `read,grep,find,ls`，关闭全局/项目扩展、MCP 和上下文文件发现；每次调用的 Pi 会话单独存在执行目录的 `review-sessions/<会话编号>/`。
 配置 reviewerCmd 时，它是**可执行脚本的路径，不是 shell 命令串**，相对 worktree；参数为：`轮次 输入文件路径 本次会话编号`，会话目录见 `LOOP_REVIEW_SESSION_DIR`。标准输出按 `src/core/review-prompt.md` 的标题格式返回，标准错误保留原文。

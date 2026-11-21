@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-
 const bytes = Buffer.byteLength;
 function clip(text: string, limit: number, tail = false): string {
   const b = Buffer.from(text);
@@ -19,10 +18,7 @@ export function testLogSummary(command: string, result: string, log: string): st
     const count = /^(?:#|ℹ)\s+(pass|fail)\s+(\d{1,15})\s*$/.exec(line);
     if (count) counts[count[1]] = Number(count[2]);
     const maven = /^(?:\[(?:INFO|ERROR)\]\s+)?Tests run: (\d{1,15}), Failures: (\d{1,15}), Errors: (\d{1,15}), Skipped: (\d{1,15})\s*$/.exec(line);
-    if (maven) {
-      counts.fail = Number(maven[2]) + Number(maven[3]);
-      counts.pass = Number(maven[1]) - counts.fail - Number(maven[4]);
-    }
+    if (maven) { counts.fail = Number(maven[2])+Number(maven[3]); counts.pass = Number(maven[1])-counts.fail-Number(maven[4]); }
     const name = /^\s*not ok \d+ - (.+)$/.exec(line)?.[1] ?? /^\s*✖ (.+) \([\d.]+m?s\)\s*$/.exec(line)?.[1];
     if (name && names.size < 6 && !/\s+#\s*(?:TODO|SKIP)\b/i.test(name)) names.add(clip(name, 240));
   }

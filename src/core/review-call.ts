@@ -28,8 +28,8 @@ export async function executeStaticReview(t: Task, round: number, input: string,
     if (remaining <= 0) { rawError += "\n评审每轮时限已用完，无法再次调用"; break; }
     const sessionDir = join(t.dir,"review-sessions",session);
     const args = cmd ? [String(round), inputPath, session] : ["--offline", "-p", "--session-id", session, "--session-dir", sessionDir,
-      "--model", t.config.reviewerModel, "--thinking", t.config.reviewerThinking, "--no-extensions", "--no-mcp",
-      "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
+      "--model",t.config.reviewerModel,"--thinking",t.config.reviewerThinking,"--tools","read,grep,find,ls",
+      "--no-extensions","--no-mcp","--no-skills","--no-prompt-templates","--no-themes","--no-context-files",
       "--append-system-prompt", join(APP_ROOT, "src/core/review-prompt.md"), "@" + inputPath];
     try {
       mkdirSync(sessionDir, {recursive: true});
@@ -39,9 +39,8 @@ export async function executeStaticReview(t: Task, round: number, input: string,
       const ending = contextError(sessionDir, session);
       if (ending) return {error: ending.raw, contextOverflow: true, evidence: [...evidence, ending.path]};
       const parsed = parseReview(result.stdout);
-      if (!result.killed && result.code === 0 && parsed.ok) return { review: parsed.review, evidence };
-      rawError += "\n第 " + attempt + " 次：退出码 " + result.code + (result.killed ? "（超时或取消）" : "") +
-        "\n" + result.output + (parsed.ok ? "" : "\n" + parsed.error);
+      if (!result.killed && result.code === 0 && parsed.ok) return {review:parsed.review,evidence};
+      rawError += `\n第 ${attempt} 次：退出码 ${result.code}${result.killed?"（超时或取消）":""}\n${result.output}${parsed.ok?"":"\n"+parsed.error}`;
     } catch (e) {
       keep(join(t.dir,"review-error-r"+round+"-a"+attempt+".log"), rawError += "\n" + (e instanceof Error ? e.message : String(e)));
     }

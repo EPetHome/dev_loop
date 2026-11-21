@@ -90,7 +90,8 @@ test("留痕 A1–A3：四个时机读取 deploy.env，覆盖宿主且保留框�
   ];
   for(const [out,mode,sha] of outputs){
     const value=getJson(out);assert.equal(value.probe,"1");assert.equal(value.mode,mode);assert.equal(value.task,task.dir);assert.equal(value.repo,task.repo);assert.equal(value.commit,sha);assert.equal(value.out,out);
-    assert.notEqual(value.tmp,cfg.deploy.env.TMPDIR);assert.match(value.tmp,/[/\\]\.loop-snapshot-/);assert.equal(value.isolated,true);assert.equal(existsSync(value.tmp),false);
+    assert.notEqual(value.tmp,cfg.deploy.env.TMPDIR);assert.match(value.tmp,/[/\\]\.loop-snapshot-/);assert.equal(value.isolated,true);
+    await until(task.dir,()=>!existsSync(value.tmp),Boolean,value.tmp);
   }
   const records=checksOf(task.dir).filter(c=>c.step==="留痕");assert.deepEqual(records.map(c=>c.result),["已存","已存","已存","已存"]);assert.deepEqual(records.map(c=>c.evidence[0]),outputs.map(([out])=>out));assert.equal(process.env.PROBE,"0");
 });
@@ -141,6 +142,65 @@ test("W1 r2 必修3：留痕改写已跟踪源码和复测产物后失败，评�
   assert.equal(read,"B\nB\n"); assert.equal(s.state,"completed");
   assert.equal(readFileSync(join(task.worktree,"src/app.txt"),"utf8"),"B\n");
   assert.equal(existsSync(join(task.worktree,"dist/report")),false);
+});
+
+for (const target of ["内部", "外部"]) test("W1 r3 必修1：留痕绝对软链接 · " + target, async t => {
+  const f = snapshotFixture(t, `
+    const before=fs.readFileSync('dist/latest','utf8');
+    fs.writeFileSync('dist/latest','C\\n');
+    fs.writeFileSync(e.LOOP_TASK_DIR+'/snapshot-read',before);
+    console.error('留痕更新副本后退出'); process.exit(9);`);
+  const external = join(f.base,"external-report"); write(external,"外部原文\n");
+  f.raw.tasks[0].test = 'mkdir -p dist; printf "B\\n" > dist/report; ln -s ' + (target === "内部" ? '"$PWD/dist/report"' : sq(external)) + ' dist/latest';
+  write(f.card,JSON.stringify(f.raw));
+  write(join(f.repo,"reviewer.sh"), '#!/bin/sh\ncat dist/report > "$LOOP_TASK_DIR/review-read"\ngrep -qx B dist/report || exit 11\nprintf %s ' + sq(PASS) + '\n');
+  f.git("add","reviewer.sh"); f.git("commit","-m","review reads raw coverage report");
+  const task = await f.prepare(), {commit} = deliver(task.dir); await settle(task.dir);
+  const s = statusOf(task.dir), read = (name: string) => existsSync(join(task.dir,name)) ? readFileSync(join(task.dir,name),"utf8") : null;
+  const snapshot = checksOf(task.dir).find(c => c.step === "留痕");
+  t.diagnostic(JSON.stringify({commit,target,phase:s.loop.phase,reviewer:read("review-read"),snapshot:read("snapshot-read"),detail:snapshot?.detail}));
+  assert.equal(snapshot?.result,"失败"); assert.equal(read("review-read"),"B\n"); assert.equal(s.state,"completed");
+  assert.equal(readFileSync(external,"utf8"),"外部原文\n");
+  if (target === "外部") { assert.equal(read("snapshot-read"),null); assert.match(snapshot.detail!,/链接.*越出/); }
+  else { assert.equal(read("snapshot-read"),"B\n"); assert.match(snapshot.detail!,/留痕更新副本后退出/); }
+});
+
+test("W1 r3 必修2：留痕副本准备期间耗尽复测时限，只记留痕失败并进入评审", async t => {
+  const f = snapshotFixture(t, "fs.writeFileSync(e.LOOP_TASK_DIR+'/snapshot-ran','');");
+  f.raw.host = "claude"; f.raw.limits = {测试:{timeoutMin:79},开发评审:{timeoutMin:1}};
+  f.raw.tasks[0].test = "node gate-copy-test.cjs"; write(f.card,JSON.stringify(f.raw));
+  write(join(f.repo,"gate-copy-test.cjs"), `
+const fs=require('fs'),dir=process.env.LOOP_TASK_DIR;
+const check=()=>{if(fs.existsSync(dir+'/allow-test'))watcher.close();};
+const watcher=fs.watch(dir,check);fs.writeFileSync(dir+'/test-moving','');check();`);
+  f.git("add","gate-copy-test.cjs"); f.git("commit","-m","controlled checkout deadline fixture");
+  const task = await f.prepare(), {commit} = deliver(task.dir), preload = join(f.base,"hold-copy.mjs");
+  write(preload, `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+if(process.argv.includes('--snapshot-copy')) {
+  fs.cpSync=()=>{fs.writeFileSync(process.env.LOOP_TASK_DIR+'/copy-enter','');Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0);};
+  syncBuiltinESMExports();
+}`);
+  const oldOptions = process.env.NODE_OPTIONS, original = fs.cpSync, epoch = Date.now();
+  process.env.NODE_OPTIONS = "--import=" + preload;
+  t.after(() => { if (oldOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS=oldOptions; t.mock.restoreAll(); syncBuiltinESMExports(); });
+  t.mock.timers.enable({apis:["Date","setTimeout"],now:epoch});
+  t.mock.method(fs,"cpSync",(...args:Parameters<typeof original>)=>{
+    if (String(args[0]) === join(task.dir,"check-worktree")) t.mock.timers.tick(62_000); // 旧版在 Stop 进程同步复制
+    return original(...args);
+  }); syncBuiltinESMExports();
+  const marker = join(task.dir,"copy-enter"), done = join(task.dir,"settled"), active = settle(task.dir).then(r=>{write(done,"");return r;});
+  await until(task.dir,()=>existsSync(join(task.dir,"test-moving")),Boolean);
+  t.mock.timers.tick(79 * 60000 - 1000); write(join(task.dir,"allow-test"),"");
+  await until(task.dir,()=>existsSync(marker)||existsSync(done),Boolean);
+  if (existsSync(marker)) t.mock.timers.tick(1000);
+  await active;
+  const s=statusOf(task.dir), checks=checksOf(task.dir).filter(c=>["复测","留痕","评审"].includes(c.step));
+  t.diagnostic(JSON.stringify({commit,elapsedMs:Date.now()-epoch,copyStarted:existsSync(marker),phase:s.loop.phase,checks:checks.map(c=>[c.step,c.result,c.detail])}));
+  assert.deepEqual(checks.map(c=>[c.step,c.result]),[["复测","通过"],["留痕","失败"],["评审","通过"]]);
+  assert.match(checks[1].detail!,/副本准备.*超时/);
+  assert.equal(existsSync(marker),true); assert.equal(existsSync(join(task.dir,"snapshot-ran")),false);
+  assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"review\n"); assert.equal(s.state,"completed");
+  assert.ok(Date.now()-epoch < 80 * 60000);
 });
 
 test("返修必修2：异常输出清理再失败只追加失败记录，核心仍完成",async t=>{

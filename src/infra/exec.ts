@@ -22,10 +22,7 @@ export function signalProcess(p?: Identity | null, group = false): void {
   }
 }
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
-export interface ExecOptions {
-  cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
-  onSpawn?: (p: Identity) => void;
-}
+export interface ExecOptions { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal; onSpawn?: (p: Identity) => void }
 export function childExec(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
   return new Promise((accept) => {
     let stdout = "", stderr = "", output = "", killed = false, done = false;
