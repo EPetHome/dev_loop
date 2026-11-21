@@ -10,7 +10,7 @@ import { settle } from "../src/core/settle.ts";
 import { createTask, statusOf, checksOf, update, checked } from "../src/core/store.ts";
 import { resume, heartbeat } from "../src/core/lifecycle.ts";
 import { lock, BusyError } from "../src/infra/files.ts";
-import { createChildExec } from "../src/infra/exec.ts";
+import { childExec } from "../src/infra/exec.ts";
 
 test("复测默认上限 3 次：连续失败转等你，不会调用评审",async(t)=>{
   const f=fixture(t),task=await f.prepare();
@@ -104,12 +104,12 @@ test("两进程状态并发更新，seq 不丢增量；死进程的操作锁可�
   const release=lock(path);assert.throws(()=>lock(path),BusyError);release();assert.equal(existsSync(path),false);
 });
 test("子进程中文长输出跨块仍保留原文",async(t)=>{
-  const f=fixture(t),value="错误✓".repeat(50000),exec=createChildExec();
+  const f=fixture(t),value="错误✓".repeat(50000),exec=childExec;
   const result=await exec(NODE,["-e",'process.stdout.write("错误✓".repeat(50000))'],{cwd:f.repo,timeoutMs:10000});
   assert.equal(result.code,0);assert.equal(result.stdout,value);assert.equal(result.output,value);
 });
 test("子进程整组取消与时限：不使用固定 sleep 等待",async(t)=>{
-  const f=fixture(t),controller=new AbortController(),exec=createChildExec(),marker=join(f.base,"child.json");
+  const f=fixture(t),controller=new AbortController(),exec=childExec,marker=join(f.base,"child.json");
   const script='const {spawn}=require("child_process"),fs=require("fs");const c=spawn(process.execPath,["-e","setInterval(()=>{},60000)"]);fs.writeFileSync(process.argv[1],JSON.stringify({pid:process.pid,child:c.pid}));setInterval(()=>{},60000);';
   const running=exec(NODE,["-e",script,marker],{cwd:f.repo,timeoutMs:10000,signal:controller.signal});
   await until(f.base,()=>getJson(marker),v=>Boolean(v.child));controller.abort();assert.equal((await running).killed,true);

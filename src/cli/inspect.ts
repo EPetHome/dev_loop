@@ -7,7 +7,7 @@ import { taskOf, statusOf, checksOf, update, recordStep } from "../core/store.ts
 import { InputError } from "../core/card.ts";
 import { onTaskBranch, undeliveredCommit, waitingForDelivery } from "../core/deliver.ts";
 import { snapshot, differences } from "../core/snapshot.ts";
-
+import { clearCheck } from "../core/run.ts";
 export function publicStatus(dir: string) {
   const s = statusOf(dir);
   if (!waitingForDelivery(s)) return s;
@@ -18,7 +18,6 @@ export function publicStatus(dir: string) {
     return {...s, loop: {...s.loop, deliveryConfirmation}};
   } catch { return s; } // Git 现场不可读时仍返回状态，但不声称可确认。
 }
-
 export async function comparison(dir: string, other?: string) {
   const t=taskOf(dir), deployed=(d: string)=>checksOf(d).filter(c=>c.step==="部署" && c.result.startsWith("已部署")).at(-1);
   const first=deployed(dir), second=other?deployed(other):undefined, report=join(dir,"comparison-"+Date.now()+".md");
@@ -33,7 +32,7 @@ export async function comparison(dir: string, other?: string) {
 export function releaseWorktree(dir: string) {
   const t=taskOf(dir), s=statusOf(dir), start=Date.now();
   if(s.state!=="completed" || s.loop.released)throw new InputError(s.loop.released?"工作区已释放":"未完成，无法释放工作区");
-  gitText(t.repo,["worktree","remove","--force",t.worktree]);
+  clearCheck(t); gitText(t.repo,["worktree","remove","--force",t.worktree]);
   update(dir,s=>{s.loop.released=true;});
   recordStep(dir,{step:"释放",result:"已释放",commit:s.loop.commit || t.baseCommit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:[]});
   return {executionId:t.executionId,released:true};

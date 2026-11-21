@@ -6,7 +6,7 @@ import { lock, appendJson } from "../infra/files.ts";
 import { InputError } from "./card.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
 import { taskOf, statusOf, answersOf, update, move, transition, appendCheck, checksOf, inputs, checked, type Status, type Task } from "./store.ts";
-import { operationPath, run } from "./run.ts";
+import { clearCheck, operationPath, run } from "./run.ts";
 export function copyLocalFiles(t: Task, cwd = t.worktree) {
   for (const path of t.config.localFiles) {
     const source = resolve(t.repo, path), dest = resolve(cwd, path);
@@ -16,23 +16,23 @@ export function copyLocalFiles(t: Task, cwd = t.worktree) {
     cpSync(source, dest, {recursive: true, dereference: false, force: true});
   }
 }
-export async function setup(t: Task, log: string, signal?: AbortSignal) {
+export async function setup(t: Task, log: string, signal?: AbortSignal, timeoutMs = t.limits.测试.timeoutMin * 60000) {
   if (!t.config.setup) return;
-  const result = await run(t, "sh", ["-c", t.config.setup], t.limits.测试.timeoutMin * 60000, signal);
+  const result = await run(t, "sh", ["-c", t.config.setup], timeoutMs, signal);
   writeFileSync(join(t.dir, log), result.output);
-  if ((result.code || result.killed) && statusOf(t.dir).state !== "cancelled") throw new Error("setup 失败（可修正环境后续跑）\n" + result.output);
+  if ((result.code || result.killed) && statusOf(t.dir).state !== "cancelled") throw new Error("setup 失败"+(result.killed?"（超时或取消）":"（可修正环境后续跑）")+"\n"+result.output);
 }
 export async function prepare(dir: string): Promise<void> {
   const release = lock(operationPath(dir), 2000), t = taskOf(dir), start = Date.now();
   try {
-    if (statusOf(dir).state === "cancelled") return;
-    if (!statusOf(dir).loop.prepared) {
+    const s = statusOf(dir);
+    if (s.state === "cancelled" || s.loop.ready) return;
+    if (!s.loop.prepared) {
       if (!existsSync(join(t.worktree, ".git"))) gitText(t.repo, ["worktree", "add", "-b", t.branch, t.worktree, t.baseCommit]);
       copyLocalFiles(t); update(dir, s => { s.loop.prepared = true; });
     }
-    if (t.config.setup && !statusOf(dir).loop.ready) {
-      update(dir, (s) => { s.timeLimitSec = t.limits.测试.timeoutMin * 60; });
-      await setup(t, "setup.log");
+    if (t.config.setup) {
+      update(dir, s => { s.timeLimitSec = t.limits.测试.timeoutMin * 60; }); await setup(t,"setup.log");
     }
     if (statusOf(dir).state === "cancelled") return;
     const {promptHash, acceptanceHash} = inputs(t);
@@ -68,10 +68,9 @@ export function shutdownSession(dir: string): void {
 export function retryReview(dir: string) {
   const t = taskOf(dir), s = statusOf(dir), commit = s.loop.delivery?.commit;
   if (!commit || !existsSync(t.worktree) || head(t.worktree) !== commit || changes(t.worktree).length) return;
-  const h = inputs(t), records = checksOf(dir), last = records.filter(c => ["复测", "评审"].includes(c.step)).at(-1);
+  const h = inputs(t), records = checksOf(dir), last = records.findLast(c => c.step === "复测" || c.step === "评审");
   const same = (c: typeof last) => c?.commit === commit && c.promptHash === h.promptHash && c.acceptanceHash === h.acceptanceHash;
-  if (last?.step !== "评审" || last.result !== "失败" || !same(last)) return;
-  return records.filter(c => c.step === "复测" && ["通过", "没验证"].includes(c.result) && same(c)).at(-1);
+  if (last?.step === "评审" && last.result === "失败" && same(last)) return records.findLast(c => c.step === "复测" && ["通过","没验证"].includes(c.result) && same(c));
 }
 export function resume(dir: string, text?: string, answering = false): {reused: boolean; running: boolean; reviewOnly?: boolean; status: Status} {
   if ((text !== undefined || answering) && !text?.trim()) throw new InputError("话不能为空");
@@ -89,9 +88,7 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
     return { reused: true, running: Boolean(running), status: transition(dir, pending ? "working" : "completed", pending ? "收尾中" : s.loop.phase === "等你" || s.loop.phase === "已停止" ? "完成" : s.loop.phase, "沿用此 commit 的复测与评审通过记录", pending ? "selfMs" : null) };
   }
   if (text === undefined && s.state === "failed" && s.error?.category === "临时故障" && retryReview(dir)) {
-    const status = update(dir, s => {
-      if (move(s,"working","评审中","已续跑，后台只重做评审","selfMs")) { s.loop.facts!.resumes++; s.loop.reused = false; }
-    });
+    const status = update(dir,s => { if (move(s,"working","评审中","已续跑，后台只重做评审","selfMs")) { s.loop.facts!.resumes++; s.loop.reused = false; } });
     return {reused: false, running: Boolean(running), reviewOnly: true, status};
   }
   if (running && s.state !== "input_required") throw new Error("开发会话仍在运行；请在原会话继续或先停止");
@@ -122,7 +119,7 @@ export function stop(dir: string, abandon = false): Status {
   if (abandon) {
     const release = lock(operationPath(dir), 2000);
     try {
-      if (existsSync(t.worktree)) gitText(t.repo, ["worktree", "remove", "--force", t.worktree]);
+      clearCheck(t); if (existsSync(t.worktree)) gitText(t.repo, ["worktree", "remove", "--force", t.worktree]);
       rmSync(t.worktree, { recursive: true, force: true }); update(dir, (s) => { s.loop.abandoned = true; });
     } finally { release(); }
   }

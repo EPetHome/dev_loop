@@ -4,7 +4,7 @@ import fs, { chmodSync, existsSync, readFileSync, readdirSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { finish } from "../src/cli/finish.ts";
 import { join } from "node:path";
-import { fixture, write, getJson, NODE, until } from "./helpers.ts";
+import { fixture, write, getJson, NODE, until, PASS, sq } from "./helpers.ts";
 import { companion } from "../src/cli/companion.ts";
 import { comparison, releaseWorktree } from "../src/cli/inspect.ts";
 import { createTask, statusOf, checksOf, transition } from "../src/core/store.ts";
@@ -122,6 +122,27 @@ test("返修必修2：snapshot 输出目录不阻断陪跑、复测评审、部�
   const failed=checksOf(task.dir).filter(c=>c.step==="留痕" && c.result==="失败");assert.equal(failed.length,4);assert.ok(failed.every(c=>/EISDIR|directory/.test(c.detail!)));
   assert.equal(existsSync(join(task.dir,"snapshot-"+commit+".json")),false);
 });
+test("W1 r2 必修3：留痕改写已跟踪源码和复测产物后失败，评审仍读 B 与原产物", async t => {
+  const f = snapshotFixture(t, `
+    if (fs.readFileSync('dist/report','utf8') !== 'B\\n') throw Error('未拿到原复测产物');
+    fs.writeFileSync('src/app.txt','C\\n'); fs.writeFileSync('dist/report','C\\n'); console.error('snapshot 真实失败'); process.exit(7);`);
+  const repo = f.repo;
+  write(join(repo,"reviewer.sh"), '#!/bin/sh\ncat src/app.txt dist/report > "$LOOP_TASK_DIR/review-read"\n' +
+    'grep -qx B src/app.txt && grep -qx B dist/report || exit 11\nprintf %s ' + sq(PASS) + '\n');
+  f.raw.tasks[0].test = "mkdir -p dist; cp src/app.txt dist/report"; write(f.card,JSON.stringify(f.raw));
+  f.git("add","reviewer.sh"); f.git("commit","-m","review from source and report");
+  const task = await f.prepare(); write(join(task.worktree,"src/app.txt"),"B\n");
+  const {commit} = deliver(task.dir); await settle(task.dir);
+  const s = statusOf(task.dir), checks = checksOf(task.dir).filter(c=>["复测","留痕","评审"].includes(c.step));
+  const read = existsSync(join(task.dir,"review-read")) ? readFileSync(join(task.dir,"review-read"),"utf8") : null;
+  t.diagnostic(JSON.stringify({commit, state:s.state, error:s.error, read, checks:checks.map(({step,result,detail})=>({step,result,detail}))}));
+  assert.deepEqual(checks.map(c=>[c.step,c.result,c.commit]),[["复测","通过",commit],["留痕","失败",commit],["评审","通过",commit]]);
+  assert.match(checks[1].detail!,/snapshot 真实失败/);
+  assert.equal(read,"B\nB\n"); assert.equal(s.state,"completed");
+  assert.equal(readFileSync(join(task.worktree,"src/app.txt"),"utf8"),"B\n");
+  assert.equal(existsSync(join(task.worktree,"dist/report")),false);
+});
+
 test("返修必修2：异常输出清理再失败只追加失败记录，核心仍完成",async t=>{
   const f=snapshotFixture(t,"fs.mkdirSync(e.LOOP_SNAPSHOT_OUT);"),task=await f.prepare();write(join(task.worktree,"src/app.txt"),"good cleanup-failure\n");const {commit}=deliver(task.dir),out=join(task.dir,"snapshot-"+commit+".json"),original=fs.rmSync;let calls=0;
   t.mock.method(fs,"rmSync",(path: Parameters<typeof original>[0],options?: Parameters<typeof original>[1])=>{if(String(path)===out && ++calls>1)throw Object.assign(new Error("simulated output EACCES"),{code:"EACCES"});return original(path,options);});syncBuiltinESMExports();

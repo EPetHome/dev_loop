@@ -61,14 +61,10 @@ bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] 
 bin/loop 部署 <执行编号或卡路径> [--commit <sha>] [--json]
 bin/loop 收尾|退回|陪跑|释放 <执行编号或卡路径> [--json]
 bin/loop 对比 <执行编号或卡路径> [<另一个执行编号或卡路径>] [--json]
-flow 按 开发评审, 测试, 合入, 部署, 推送 的子序列；next 相对卡目录，最后一批才收尾。
-合入默认仅本地；手工仅 --推送 才扫描并推送 origin/dev；部署须登记 .autoreview.json 的 deploy.cmd。
-自动部署还须 check/rollback；deploy.env 为当前配置的大写字符串环境变量（禁止 LOOP_）。
-收尾走卡并脱离开发会话；退回只动线上不动 dev；陪跑/snapshot 失败不阻断；验收后可释放工作区。
-LOOP_TASKS_ROOT：执行根目录；开发方优先通过 LOOP_TASK_DIR 定位任务。
-本人确认交付只在「等你 · 停下没交付」且查询提供 loop.deliveryConfirmation 时使用；只登记已有提交，后台接着检查。
-答复仅等你时接收，原文追加 answers.jsonl 并带话续跑；Claude/Codex 未送达，需在窗口里说。
-多任务/整合/验收（第3步）尚不支持。`;
+flow 按卡执行；next 相对卡目录，最后一批才合入、部署。手工合入默认仅本地；部署的 deploy.cmd、check/rollback、deploy.env 见 README。
+LOOP_TASKS_ROOT 指向执行根目录，开发方优先用 LOOP_TASK_DIR 定位任务。
+仅「等你」时可答复；Claude/Codex 未送达，需在窗口里说。「停下没交付」且查询给出 loop.deliveryConfirmation 时，可确认已有提交并在后台检查。
+完整用法见 README.md。`;
 export async function main(args = process.argv.slice(2)): Promise<unknown> {
   const o=options([...args]), root=tasksRoot();
   if (["帮助","help","--help","-h"].includes(o.command)) return help;

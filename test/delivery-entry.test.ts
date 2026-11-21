@@ -123,7 +123,7 @@ else {
   assert.equal(head(task.worktree), B);
   assert.equal(readFileSync(path, "utf8"), "C\n");
   assert.deepEqual(changes(task.worktree), ["src/app.txt"]);
-  assert.doesNotMatch(f.git("worktree", "list", "--porcelain"), /dev-loop-(deploy|check)-/);
+  assert.equal(f.git("worktree", "list", "--porcelain").includes(join(task.dir,"check-worktree")), phase === "评审");
 });
 
 test("W1 A16：确认查询给出的完整 SHA，只登记现有 B，原会话不重开、后台只派一次", async t => {

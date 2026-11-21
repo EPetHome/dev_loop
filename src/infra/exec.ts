@@ -26,8 +26,8 @@ export interface ExecOptions {
   cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
   onSpawn?: (p: Identity) => void;
 }
-export function createChildExec() {
-  return (command: string, args: string[], options: ExecOptions): Promise<ExecResult> => new Promise((accept) => {
+export function childExec(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
+  return new Promise((accept) => {
     let stdout = "", stderr = "", output = "", killed = false, done = false;
     let timer: ReturnType<typeof setTimeout> | undefined, reap: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(command, args, { cwd: options.cwd, env: { ...process.env, ...options.env },
@@ -57,7 +57,6 @@ export function createChildExec() {
     if (options.signal?.aborted) kill();
   });
 }
-export const childExec = createChildExec();
 export async function detach(command: string, args: string[], log: string, cwd: string, env: NodeJS.ProcessEnv, acknowledge = false) {
   const fd = openSync(log,"a");
   try {

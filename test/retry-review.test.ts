@@ -40,6 +40,31 @@ test("A3/A4：临时失败记事实；续跑立即回执，后台只评审，不
   assert.deepEqual(checksOf(task.dir).filter(c => c.step === "复测"), before);
   assert.match(readFileSync(join(task.dir, "review-input-r2.md"), "utf8"), /结果：通过/);
 });
+test("W1 r2 必修1：只补评审沿用同次复测生成的覆盖率报告", async t => {
+  const f = fixture(t, {test: 'echo test >> "$LOOP_TASK_DIR/order"; mkdir -p dist; cp src/app.txt dist/coverage.json',
+    config: {setup: 'echo setup >> "$LOOP_TASK_DIR/setup-count"'}, reviewer: `
+    if ! grep -q 'report from B' dist/coverage.json; then echo '原复测报告缺失' >&2; exit 8; fi
+    pwd > "$LOOP_TASK_DIR/review-worktree"
+    if [ ! -e "$LOOP_TASK_DIR/retry-go" ]; then echo '临时断连' >&2; exit 7; fi
+    printf %s ${sq(PASS)}`});
+  const task = await f.prepare(); write(join(task.worktree,"src/app.txt"), "report from B\n");
+  const {commit} = deliver(task.dir); await settle(task.dir);
+  const failed = statusOf(task.dir), before = checksOf(task.dir).filter(c => c.step === "复测");
+  const cwd = readFileSync(join(task.dir,"review-worktree"), "utf8").trim();
+  assert.equal(failed.error?.category,"临时故障"); assert.match(failed.error.raw,/临时断连/); assert.notEqual(cwd,task.worktree);
+  // 开发工作区以内的忽略产物也不能冒充原复测报告。
+  write(join(task.worktree,"dist/coverage.json"),"report from C\n"); write(join(task.dir,"retry-go"),"");
+  const receipt = JSON.parse((await f.cli(["续跑",task.executionId,"--json"])).stdout);
+  const s = await until(task.dir, () => statusOf(task.dir), s => !s.loop.launcher && s.state !== "working");
+  const order = readFileSync(join(task.dir,"order"),"utf8"), setups = readFileSync(join(task.dir,"setup-count"),"utf8");
+  t.diagnostic(JSON.stringify({commit, initial:failed.state, retry:receipt.reviewOnly, final:s.state, error:s.error, order, setups}));
+  assert.equal(receipt.reviewOnly,true); assert.equal(s.state,"completed");
+  assert.equal(readFileSync(join(task.dir,"review-worktree"),"utf8").trim(),cwd);
+  assert.equal(order,"test\nreview\nreview\nreview\n"); assert.equal(setups,"setup\nsetup\n");
+  assert.deepEqual(checksOf(task.dir).filter(c => c.step === "复测"),before);
+  assert.equal(readFileSync(join(task.worktree,"dist/coverage.json"),"utf8"),"report from C\n");
+  assert.equal(existsSync(cwd),false);
+});
 const oldOverflow = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
 for (const [name, raw, overflow] of [
   ["Codex", oldOverflow, true],

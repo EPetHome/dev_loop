@@ -146,7 +146,7 @@ scope 也接受字符串数组；支持目录前缀、`*`、`**`、`?`。越界�
 }
 ```
 
-开发 worktree 建好后复制 localFiles、运行 setup；setup 失败保留原始输出，可修正后续跑。正式复测、留痕和评审在交付 SHA 的临时 detached worktree 中运行，不读开发工作区后续改动；退出检查时移除检出。临时检出独立复制登记的 localFiles、运行 setup（输出 `check-setup-<sha>.log`）；命令使用当前检出，不依赖开发工作区的绝对路径。只补评审不重跑复测或留痕。旧 preparation/gate/methods 不读。
+开发 worktree 建好后复制 localFiles、运行 setup；setup 失败保留原始输出，可修正后续跑。正式复测和评审使用交付 SHA 的独立 detached worktree，不读开发工作区的后续改动。独立检出复制登记的 localFiles、运行 setup（输出 `check-setup-<sha>.log`），setup 与测试命令共用复测时限；可选留痕只用剩余复测时间，在另一份包含原复测产物的隔离副本中执行，失败只记记录，不改评审源码或产物。评审临时故障后保留该次复测检出和产物；符合补评审条件时复用它，不再跑 setup、复测或留痕。旧记录没有可用的原检出时，在同一 SHA 重建检出，不假造丢失的产物。正常结束或进入新检查时清理旧检出。命令使用所在检出，不依赖开发工作区的绝对路径。旧 preparation/gate/methods 不读。
 
 未配置 reviewerCmd 时用 `pi -p`、全新会话、只读工具 `read,grep,find,ls`，关闭全局/项目扩展、MCP 和上下文文件发现；每次调用的 Pi 会话单独存在执行目录的 `review-sessions/<会话编号>/`。
 配置 reviewerCmd 时，它是**可执行脚本的路径，不是 shell 命令串**，相对 worktree；参数为：`轮次 输入文件路径 本次会话编号`，会话目录见 `LOOP_REVIEW_SESSION_DIR`。标准输出按 `src/core/review-prompt.md` 的标题格式返回，标准错误保留原文。
@@ -238,7 +238,7 @@ macOS 只在执行 `working` 时持有防睡：Pi、准备/复测/评审/收尾�
 - pi 会话启动后每 60 秒心跳，仅 working 时更新；最终停下边界可注入 custom_message 并请求继续。
 - pi 每秒读到 `pendingReturn` 时发送 custom message 并 `triggerTurn:true`，清除待送原因，无 UI 也生效。退出后重开的续跑原话用 `pendingOpening` 标记已放入开场，插件只清空待送，不再注入第二次。独立收尾进程每 60 秒心跳，`loop.finisher` 是其身份，`loop.afterCommit` 防止同 commit 重复自动发起。
 - pi 另外每秒读状态，有变化刷新底部 `dev-loop【<阶段>】<任务名> · <附加信息>` 和标题 `【<阶段>】<任务名>`；无附加信息时不带分隔符。评审显示「第 N 轮」，等你显示原因，失败显示错误类别，附加步骤显示短 sha / 结果原因。无 UI 时不调用界面接口，关闭时清理定时器和状态栏。Claude/Codex 不做阶段显示。
-- Claude/Codex：薄入口 `hosts/hook.ts`，处理 SessionStart、PostToolUse（至少间隔 60 秒）、Stop；不处理 UserPromptSubmit。插件 Stop 外层时限为 4900 秒，保留 100 秒开销余量；两项 timeoutMin 合计超过 80 分钟的卡会在启动前明确拒绝，可降低时限或改用 pi。pi 不受这个外层上限约束。
+- Claude/Codex：薄入口 `hosts/hook.ts`，处理 SessionStart、PostToolUse（至少间隔 60 秒）、Stop；不处理 UserPromptSubmit。插件 Stop 外层时限为 4900 秒，保留 100 秒开销余量；隔离 setup、复测和可选留痕不叠加独立预算。复测与评审两项 timeoutMin 合计超过 80 分钟的卡会在启动前明确拒绝，可降低时限或改用 pi。pi 不受这个外层上限约束。
 - 插件清单在 `plugins/dev-loop/`，**没有安装**。本步自动开终端只针对 pi；Claude/Codex 的真实插件加载没有验证，需手动接入 hook，其卡准备后转等你，不冒充已开会话。连续长时间不调工具的 hook 宿主没有定时心跳，防睡按上一节绑定宿主进程，不以租约过期冒充任务停下。
 - 生产 pi 启动在 macOS Terminal；自动测试用 `LOOP_LAUNCH_CMD` 可执行替身（收到 pi-dev 参数，cwd=worktree，环境含 LOOP_TASK_DIR），绝不打开真实终端。
 

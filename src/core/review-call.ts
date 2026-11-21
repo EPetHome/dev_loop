@@ -21,12 +21,12 @@ export async function executeStaticReview(t: Task, round: number, input: string,
   const inputPath = join(t.dir, "review-input-r" + round + ".md"), evidence: string[] = [];
   writeFileSync(inputPath, input);
   const keep = (path: string, text: string) => { writeFileSync(path,text); evidence.push(path); };
-  const deadline = Date.now() + timeoutMs; let rawError = "";
+  const deadline = Date.now() + timeoutMs, cmd = t.config.reviewerCmd; let rawError = "";
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (statusOf(t.dir).state === "cancelled") return { error: "已停止", evidence };
     const remaining = deadline - Date.now(), session = randomUUID();
     if (remaining <= 0) { rawError += "\n评审每轮时限已用完，无法再次调用"; break; }
-    const sessionDir = join(t.dir, "review-sessions", session), cmd = t.config.reviewerCmd;
+    const sessionDir = join(t.dir,"review-sessions",session);
     const args = cmd ? [String(round), inputPath, session] : ["--offline", "-p", "--session-id", session, "--session-dir", sessionDir,
       "--model", t.config.reviewerModel, "--thinking", t.config.reviewerThinking, "--no-extensions", "--no-mcp",
       "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls",
@@ -43,8 +43,7 @@ export async function executeStaticReview(t: Task, round: number, input: string,
       rawError += "\n第 " + attempt + " 次：退出码 " + result.code + (result.killed ? "（超时或取消）" : "") +
         "\n" + result.output + (parsed.ok ? "" : "\n" + parsed.error);
     } catch (e) {
-      rawError += "\n" + (e instanceof Error ? e.message : String(e));
-      keep(join(t.dir,"review-error-r"+round+"-a"+attempt+".log"), rawError);
+      keep(join(t.dir,"review-error-r"+round+"-a"+attempt+".log"), rawError += "\n" + (e instanceof Error ? e.message : String(e)));
     }
   }
   return { error: rawError, evidence };
