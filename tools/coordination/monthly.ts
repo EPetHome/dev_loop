@@ -57,8 +57,9 @@ export function monthly(project: Project, month: string, today: number, history:
     return r.ledgerOK && c && official(c) && (roundOf(c) ?? 1) === 1 ? [{execution:r.id, result:c.result, source:c.source}] : [];
   });
   const rounds = reviewed.filter(r=>r.ledgerOK).map(r=>({execution:r.id, count:r.checks.filter(official).length, source:ref(join(r.dir,"checks.jsonl"))}));
-  const bugs = list.filter(issue=>issue.bug), attribution = bugs.map(issue=>({issue,run:introducedRun(project,issue)}));
-  const escaped = attribution.flatMap(({issue,run})=>run && ids.has(run.id) ? [{source:ref(issue.file), execution:run.id, introduced:issue.introduced}] : []);
+  const bugs = list.filter(issue=>issue.bug), attribution = bugs.map(issue=>({issue,binding:introducedRun(project,issue)}));
+  const escaped = attribution.flatMap(({issue,binding})=>binding && ids.has(binding.run.id) ? [{source:ref(issue.file), execution:binding.run.id,
+    introduced:issue.introduced, introducedCommit:binding.introducedCommit, deliveryCommit:binding.deliveryCommit, sources:binding.sources}] : []);
   const completed = runs.filter(r=>r.status.state === "completed");
   const development = completed.map(r=>finishTimes(r).developmentMs).filter(duration);
   const total = completed.map(r=>stages.map(key=>finishTimes(r)[key])).filter(xs=>xs.every(duration)).map(xs=>xs.reduce<number>((a,b)=>a+(b as number),0));
@@ -81,8 +82,8 @@ export function monthly(project: Project, month: string, today: number, history:
       denominator:knownStops.length,unknown:runs.length-knownStops.length,basis:"按停下事件计，分母是有停下历史字段的执行；不计产品失败、仅重试未停下或主动停止"},
     firstMustFix:{...ratio(first.filter(f=>f.result === "必修").length,first.length,runs.length-first.length,"分母：首轮明确通过或有必修；首轮未结束不补造结论"),evidence:first},
     repairRounds:{...ratio(rounds.reduce((a,r)=>a+r.count,0),rounds.length,runs.length-rounds.length,"累计有正式结论的评审轮次 / 有完整流水且产出评审结论的执行，不计一次调用内重试"),evidence:rounds},
-    escapes:{count:escaped.length,denominator:reviewed.length,unknownAttribution:attribution.filter(({issue,run})=>!run && !/^非\s*dev-loop/.test(issue.introduced)).length,
-      basis:"按能追到本月通过评审之交付的 bug 单计；分母只说明有评审的执行样本，不是漏网率，未建单不可见",evidence:escaped},
+    escapes:{count:escaped.length,denominator:reviewed.length,unknownAttribution:attribution.filter(({issue,binding})=>!binding && !/^非\s*dev-loop/.test(issue.introduced)).length,
+      basis:"按有引入记录且随本月执行最终通过版本交付的 bug 单计；分母只说明有评审的执行样本，不是漏网率，未建单不可见",evidence:escaped},
     durationMs:{development:median(development,completed.length),total:median(total,completed.length),denominator:completed.length,
       basis:"已完成执行；各段合计含等待与 dev-loop 自身，不拿不完整记录补零。",evidence:completed.map(r=>statusRef(r,"loop.durations"))},
     falsePositives:{...ratio(falsePositives.length,classified.length,Math.max(0,must.size-classified.length),"分母：已独立回查且能判定的必修条目；未回查和判断不了均为未知，不算没有误报"),

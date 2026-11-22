@@ -9,7 +9,7 @@ import { Project } from "./coordination/history.ts";
 import { archiveText, issues, issueViews } from "./coordination/issues.ts";
 import { monthly } from "./coordination/monthly.ts";
 import { candidates, collect, confirmationPath, reportSignals, type Decision } from "./coordination/signals.ts";
-import { applyPlan, locked, pendingPlans, planId, savedPlan, type Change, type Plan, type WriteResult } from "./coordination/write-plan.ts";
+import { applyPlan, capturedOriginals, locked, pendingPlans, planId, previewAttempt, savedPlan, type Change, type Plan, type WriteResult } from "./coordination/write-plan.ts";
 
 const loop = resolve(import.meta.dirname,"../bin/loop");
 const commands = ["开工","查询","体检","月报","候选决定"];
@@ -41,14 +41,14 @@ function options(argv: string[]) {
 }
 type Options = NonNullable<ReturnType<typeof options>>;
 
-function preview(o: Options, now: number) {
+function preview(o: Options, now: number, recovery?: Plan) {
   const project = new Project(o.root,o.tasks,loop), card = o.card ? project.path(o.card) : "", today = day(now);
+  const originals = recovery && capturedOriginals(recovery);
   if (card && !entry(project.root,card)?.isFile()) throw new Error("找不到普通开发卡文件：" + card);
   const inspection = health(project,card,o.changed), changes: Change[] = [], blocked: {source:Ref; reason:string}[] = [];
   const reviewHistory = o.command === "体检" ? [] : project.runs.map(r=>collect(r,project));
   const forOpening = o.command === "开工" ? reviewHistory.filter(h=>h.run.card !== card && h.run.batch && h.run.started !== undefined && h.run.started <= now) : reviewHistory;
-  const cs = candidates(project,forOpening), list = o.command === "体检" ? [] : issues(project);
-  const plan: Plan = {project:project.root,command:o.command,changes};
+  const cs = candidates(project,forOpening), list = o.command === "体检" ? [] : issues(project,originals);
   const month = o.month || today.slice(0,7), monthDir = join(project.state,"monthly");
   let report: ReturnType<typeof monthly> | undefined, monthlyFile: string | undefined;
   if (["开工","月报"].includes(o.command)) {
@@ -72,9 +72,9 @@ function preview(o: Options, now: number) {
     const issue = list[i], path = join(project.setting("issues","issues"),"【history】",basename(issue.file));
     const result = project.read.get(path,()=>({existing:entry(project.root,path)}));
     if (!result || result.existing) blocked.push({source:v.source,reason:`历史目标已存在或不可用，不覆盖：${path}`});
-    else changes.push({kind:"关单",from:issue.file,to:path,before:hash(issue.text),content:archiveText(issue,path,today,v),summary:`证据齐全，归档 ${issue.name}`,sources:[v.source,...v.evidence]});
+    else changes.push({kind:"关单",from:issue.file,to:path,before:hash(issue.text),content:archiveText(issue,path,recovery?.date || today,v),summary:`证据齐全，归档 ${issue.name}`,sources:[v.source,...v.evidence]});
   }
-  const av = collectIssues ? acceptances(project,list,now,o.command === "开工",card,o.readerReady || project.config.acceptanceReaderReady === true) : [];
+  const av = collectIssues ? acceptances(project,list,now,o.command === "开工",card,o.readerReady || project.config.acceptanceReaderReady === true,originals) : [];
   for (const row of av) {
     const {file,reason,sources,batch} = row.view;
     if (row.updated) changes.push({kind:"结束提醒",from:file,to:file,before:hash(row.text),content:row.updated,summary:`${batch}：${reason} → 未确认（无反馈）`,sources});
@@ -99,6 +99,7 @@ function preview(o: Options, now: number) {
   }
   const dirs = project.read.list(join(project.state,"plans")).filter(e=>e.isDirectory() && /^[a-f0-9]{64}$/.test(e.name)).map(e=>e.name);
   const incomplete = pendingPlans(project.root,dirs);
+  const plan = previewAttempt({project:project.root,command:o.command,changes,date:today});
   return {plan, report:{protocol:"coordinate-report/1",project:project.root,command:o.command,mode:"preview",generatedAt:new Date(now).toISOString(),
     readyToLaunch:"工具不判定开工资格、不代投递",planId:planId(plan),changes:describe(changes),blocked,incomplete,
     previous:reportSignals(forOpening,project.root),candidates:cs,issues:iv,acceptances:av.map(r=>r.view),health:inspection,
@@ -119,9 +120,10 @@ export function coordinate(argv: string[], now = Date.now()) {
     if (!initial.plan.changes.length) return {...initial.report,mode:"applied",applied:{plan:null,complete:true,results:[] as WriteResult[]}};
   }
   return locked(o.root,()=>{
-    const current = preview(o,now), saved = savedPlan(o.root,id);
-    if (!saved && planId(current.plan) !== id) throw new Error("预览已变化，请重新预览；未修改项目文件");
+    const saved = savedPlan(o.root,id);
     if (saved && saved.command !== o.command) throw new Error("请用原命令恢复计划");
+    const current = preview(o,now,saved);
+    if (!saved && planId(current.plan) !== id) throw new Error("预览已变化，请重新预览；未修改项目文件");
     if (current.report.incomplete.some(p=>p!==id)) throw new Error("存在中断的计划，请先用原命令 --apply 恢复：" + current.report.incomplete.join("、"));
     const plan = saved || current.plan, applied = applyPlan(plan,current.plan);
     return {...current.report,mode:"applied",planId:id,changes:describe(plan.changes),applied};

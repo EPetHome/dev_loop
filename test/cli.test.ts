@@ -12,8 +12,14 @@ test("A1：启动先返回回执/status，后台 worktree、localFiles、setup�
   const f=fixture(t,{config:{setup:"node setup.cjs"},cliTimeoutMs:30000});
   write(join(f.repo,"setup.cjs"),'const fs=require("fs");const p=process.env.LOOP_TASK_DIR;fs.writeFileSync(p+"/setup-started","yes");const done=()=>{if(fs.existsSync(p+"/release-setup")){w.close();process.exit(0);}};const w=fs.watch(p,done);done();\n');
   f.git("add","setup.cjs");f.git("commit","-m","controlled setup");
-  // setup 等本测试放行；必须先收到真实 CLI 回执，不能把机器启动耗时当成先后顺序。
-  const receipt=JSON.parse((await f.cli(["启动",f.card,"--派单编号","PA-1","--指令编号","start-1","--json"])).stdout);
+  // 不计测试检出中 bin/loop 的首次执行开销；帮助不启动任务，计时仍覆盖完整的启动命令。
+  await f.cli(["帮助"]);
+  const began = performance.now();
+  const reply = await f.cli(["启动",f.card,"--派单编号","PA-1","--指令编号","start-1","--json"]);
+  const elapsed = performance.now() - began;
+  assert.ok(elapsed < 5000,`启动回执需在 5 秒内，实测 ${Math.round(elapsed)}ms`);
+  // setup 仍等本测试放行，用闸门独立验证回执不等待 setup。
+  const receipt=JSON.parse(reply.stdout);
   assert.match(receipt.executionId,/^[A-Za-z0-9_-]+-[a-f0-9]{6}$/);
   const dir=receipt.taskDir, initial=statusOf(dir);
   assert.equal(initial.state,"working");assert.equal(initial.dispatchId,"PA-1");

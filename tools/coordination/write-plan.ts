@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { bytes, entry, hash, json, missing, mkdir, publish, type Ref } from "./files.ts";
 
 export interface Change { kind: "关单" | "结束提醒" | "月报" | "候选决定" | "候选确认"; to: string; from?: string; before?: string; content: string; summary: string; sources: Ref[] }
-export interface Plan { project: string; command: string; changes: Change[] }
+export interface Plan { project: string; command: string; changes: Change[]; date?: string; retryOf?: string }
 export const planId = (plan: Plan) => hash(json(plan));
 export const statePath = (root: string) => join(root, ".dev-loop-coord");
 const plans = (root: string) => join(statePath(root),"plans");
@@ -49,6 +49,28 @@ export function pendingPlans(root:string, dirs: string[]) {
   });
 }
 
+/** 同一预览并发只认一次；旧尝试完整但有冲突时，新预览另开尝试，不改旧回执。 */
+export function previewAttempt(plan: Plan): Plan {
+  while (plan.changes.length) {
+    const id = planId(plan), dir = pathOf(plan.project,id);
+    const results = plan.changes.map((_,i)=>readRecord<WriteResult>(plan.project,receiptPath(dir,i)));
+    if (results.some(r=>!r) || !results.some(r=>r?.status === "conflict")) break;
+    plan = {...plan,retryOf:id};
+  }
+  return plan;
+}
+
+/** 把已接管但未发布的源按原路径提供给重新预览；真实源路径出现时永远用真实文件。 */
+export function capturedOriginals(plan: Plan) {
+  const root = plan.project, dir = pathOf(root,planId(plan)), originals = new Map<string,string>();
+  for (const [i,{from}] of plan.changes.entries()) {
+    if (!from || entry(root,from) || entry(root,receiptPath(dir,i))) continue;
+    const original = bytes(root,originalPath(dir,i));
+    if (original) originals.set(from,original.toString("utf8"));
+  }
+  return originals;
+}
+
 /** 持项目锁执行。只发布完整文件，保留移动前原件；不以文件名相同认定为本工具的产物。 */
 export function applyPlan(plan: Plan, current: Plan, afterCapture?: (change: Change) => void) {
   const root = plan.project, id = planId(plan), dir = pathOf(root,id), manifest = join(dir,"plan.json");
@@ -66,8 +88,8 @@ export function applyPlan(plan: Plan, current: Plan, afterCapture?: (change: Cha
     if (alreadyLinked) {
       if (hash(bytes(root,to)!) !== hash(content)) conflict("发布后文件已被编辑，保留用户内容");
       if (from && from !== to && entry(root,from)) conflict("源路径已重新出现，未移除该文件");
-    } else if (!captured && !fresh) conflict("预览依据已变化，保留现场；请重新预览");
-    else if (dest && (!from || from !== to || captured)) conflict("目标已存在，未覆盖：" + to);
+    } else if (dest && (!from || from !== to || captured)) conflict("目标已存在，未覆盖：" + to);
+    else if (!fresh) conflict("预览依据已变化，保留现场；请重新预览");
     else {
       mkdir(root,dirname(to));
       const sourceMode = from ? (captured ?? entry(root,from))?.mode : undefined;

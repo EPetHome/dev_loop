@@ -1,6 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { array, inside, object, ref, sha, str, time, type Doc, type Ref } from "./files.ts";
-import { checked, deployments, mergeFacts, statusRef, taskRef, type Batch, type Execution, type Project } from "./history.ts";
+import { checked, delivered, deployments, mergeFacts, statusRef, taskRef, type Batch, type Execution, type Project } from "./history.ts";
 import { field, links, plain, sections } from "./markdown.ts";
 
 const issueStatus = /^([^\S\r\n]*(?:[-*]\s+)?(?:\*\*)?状态(?:\*\*)?[^\S\r\n]*[:：](?:\*\*)?[^\S\r\n]*)([^\r\n]+)/m;
@@ -8,22 +9,28 @@ const closed = /^(?:已解决|不做|重复)(?:$|[（(·：:\s])/;
 const unspecified = /^(?:待|未知|未填|暂无|无$|[-—]+$|<)/;
 const meaningful = (s: string) => !!s && !unspecified.test(plain(s));
 export type Issue = { file: string; text: string; name: string; ids: string[]; bug: boolean; history: boolean; header: string; status: string; related: string; introduced: string; attribution: string };
-export function issues(project: Project) {
+export function issues(project: Project, originals?: ReadonlyMap<string,string>) {
   const dir = project.setting("issues", "issues"), history = join(dir,"【history】");
-  return [dir, history].flatMap(folder => project.read.list(folder).flatMap((e): Issue[] => {
-    if (!e.isFile() || !/^【(?:bug|req)】.+\.md$/.test(e.name)) return [];
-    const file = join(folder,e.name), text = project.read.text(file);
-    if (text === undefined) return [];
-    const header = text.split(/^##\s/m,1)[0], name = basename(file,".md");
-    const ids = [...new Set([name, e.name, ...[field(header,"编号"),field(header,"问题单"),header.split(/\r?\n/,1)[0].match(/\b[A-Z]{2,}[0-9]{2,}\b/)?.[0] || ""].map(plain).filter(Boolean)])];
-    return [{file, text, name, ids, bug:e.name.startsWith("【bug】"), history:folder === history, header, status:plain(field(header,"状态")),
-      related:field(header,"关联批次"), introduced:field(header,"引入批次"), attribution:plain(field(header,"本该拦住"))}];
-  }));
+  return [dir, history].flatMap(folder => {
+    const paths = new Set(project.read.list(folder).flatMap(e=>e.isFile() ? [join(folder,e.name)] : []));
+    // 只读本项目已登记的问题单；恢复区副本仍以原路径解释单内相对链接。
+    if (folder === dir && originals) for (const file of originals.keys()) if (dirname(file) === folder) paths.add(file);
+    return [...paths].sort((a,b)=>a.localeCompare(b)).flatMap((file): Issue[] => {
+      const filename = basename(file);
+      if (!/^【(?:bug|req)】.+\.md$/.test(filename)) return [];
+      const text = project.read.text(file) ?? originals?.get(file);
+      if (text === undefined) return [];
+      const header = text.split(/^##\s/m,1)[0], name = basename(file,".md");
+      const ids = [...new Set([name, filename, ...[field(header,"编号"),field(header,"问题单"),header.split(/\r?\n/,1)[0].match(/\b[A-Z]{2,}[0-9]{2,}\b/)?.[0] || ""].map(plain).filter(Boolean)])];
+      return [{file, text, name, ids, bug:filename.startsWith("【bug】"), history:folder === history, header, status:plain(field(header,"状态")),
+        related:field(header,"关联批次"), introduced:field(header,"引入批次"), attribution:plain(field(header,"本该拦住"))}];
+    });
+  });
 }
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
 const unquote = (s: string) => { try { return decodeURIComponent(s); } catch { return s; } };
-export const mentions = (text: string, value: string) => !!value && new RegExp(`(?:^|[\\s\\x60<(/（〔【、，；,：:])${escape(value)}(?=$|[\\s\\x60>./)）〕】、，；,。·：:])`).test(text);
+export const mentions = (text: string, value: string) => !!value && new RegExp(`(?:^|[\\s\\x60<\\[(/（〔【、，；,：:])${escape(value)}(?=$|[\\s\\x60>./)\\]）〕】、，；,。·：:])`).test(text);
 const batchMatches = (issue: Issue, batch: Batch, text: string) => mentions(text,batch.name) || links(text).some(name => {
   const target = resolve(dirname(issue.file), unquote(name.split("#")[0]));
   return [batch.card, batch.dir, batch.results, batch.acceptance].includes(target) && (target !== batch.dir || basename(batch.card) === "开发卡.json");
@@ -37,12 +44,34 @@ function fixRun(project: Project, issue: Issue) {
   const batches = project.batches.filter(b => batchMatches(issue,b,link));
   return batches.length === 1 ? batches[0].runs.at(-1) : undefined;
 }
+// 连字符或斜杠内的片段不是独立提交号；不能把执行编号里的日期或随机尾段当 SHA。
+const shaToken = /(?<![\w/-])[0-9a-f]{7,64}(?![\w/-])/g;
+const noIntroduction = /^(定位不到|非\s*dev-loop)(?:$|[（(，、：:\s])/;
+function isAncestor(project: Project, from: string, to: string) {
+  if (from === to) return true;
+  const {status} = spawnSync("git",["--no-replace-objects","merge-base","--is-ancestor",from,to,"--"],{cwd:project.root,timeout:3000,
+    env:{...process.env,GIT_DIR:undefined,GIT_WORK_TREE:undefined,GIT_COMMON_DIR:undefined,GIT_NO_LAZY_FETCH:"1",GIT_ALLOW_PROTOCOL:""}});
+  return status === 0;
+}
+function introductionFor(project: Project, run: Execution, prefix: string) {
+  const final = delivered(run);
+  if (!run.ledgerOK || !sha(final)) return;
+  const review = run.checks.findLast(c=>c.step === "评审" && c.commit === final);
+  if (review?.result !== "通过") return;
+  const test = run.checks.findLast(c=>c.step === "复测" && c.commit === final && c.value.promptHash === review.value.promptHash && c.value.acceptanceHash === review.value.acceptanceHash);
+  if (test?.result !== "通过") return;
+  const seen = run.checks.filter(c=>["开发","复测","评审"].includes(c.step) && sha(c.commit) && c.commit.startsWith(prefix));
+  if (new Set(seen.map(c=>c.commit)).size !== 1 || !isAncestor(project,seen[0].commit,final)) return;
+  return {run, introducedCommit:seen[0].commit, deliveryCommit:final, sources:[seen[0].source,test.source,review.source,statusRef(run,"loop.delivery")]};
+}
 export function introducedRun(project: Project, issue: Issue) {
-  const commit = /\b[0-9a-f]{7,64}\b/.exec(issue.introduced)?.[0];
-  if (!commit) return;
-  const matching = project.runs.filter(r => (mentions(issue.introduced,r.id) || r.batch && batchMatches(issue,r.batch,issue.introduced)) &&
-    r.checks.some(c => c.step === "评审" && c.result === "通过" && sha(c.commit) && c.commit.startsWith(commit)));
-  return matching.length === 1 ? matching[0] : undefined;
+  if (noIntroduction.test(issue.introduced)) return;
+  const byId = project.runs.filter(r=>mentions(issue.introduced,r.id));
+  const [prefix,...extra] = new Set(issue.introduced.match(shaToken));
+  if (!prefix || extra.length || byId.length > 1) return;
+  const runs = byId.length ? byId : project.runs.filter(r=>r.batch && batchMatches(issue,r.batch,issue.introduced));
+  const matches = runs.flatMap(run=>{ const found = introductionFor(project,run,prefix); return found ? [found] : []; });
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 export type Authorization = { id: string; decision: string; source: Ref };
@@ -64,11 +93,75 @@ export function authorizationFor(run: Execution) {
   });
   return recorded.sort((a,b)=>a.at-b.at);
 }
-const authorizationIds = (text: string) => {
-  const rows = text.split(/\r?\n/).filter(l => !l.startsWith(">") && /\[授权\]|^授权项[：:]/.test(l));
-  const ids = [...new Set(rows.flatMap(l => [...l.matchAll(/\bA\d+\b/g)].map(m=>m[0])))];
-  return {ids, unknown: rows.some(r => !/\bA\d+\b/.test(r))};
-};
+const itemIds = (s: string) => s.match(/\bA\d+\b/g) || [];
+const sceneIds = (s: string) => s.match(/\bS\d+\b/g) || [];
+const issueIdsIn = (s: string) => s.match(/\b[A-Z]{2,}\d{2,}\b/g) || [];
+const criterion = /^(?:[-*+]\s+)?(A\d+)[.．、)）]\s*/;
+const authTag = /\[授权\]|【授权】/;
+function issueAuthorization(issue: Issue, explicit: string) {
+  const rows = issue.text.split(/\r?\n/).filter(l=>!l.trimStart().startsWith(">") && (authTag.test(l) || /^授权项\s*[:：]/.test(plain(l))));
+  if (explicit) rows.push(explicit);
+  const ids = new Set([...rows.flatMap(itemIds), ...["验收项","验收条目"].flatMap(label=>itemIds(field(issue.header,label)))]);
+  return {ids, required:new Set(rows.flatMap(itemIds)), unknown:rows.some(r=>!itemIds(r).length)};
+}
+type AcceptanceRow = {id?: string; text: string; source: Ref; authorized: boolean};
+function criteriaRows(text: string, file: string, firstLine = 1) {
+  const rows: AcceptanceRow[] = [];
+  let current: AcceptanceRow | undefined, fence = "";
+  for (const [i,raw] of text.split(/\r?\n/).entries()) {
+    const marker = /^\s*(`{3,}|~{3,})/.exec(raw)?.[1];
+    if (marker) { if (!fence) fence = marker; else if (marker.startsWith(fence)) fence = ""; current = undefined; continue; }
+    if (fence || raw.trimStart().startsWith(">")) continue;
+    if (/^## 协调记录：/.test(raw)) break;
+    if (/^#{1,6}\s/.test(raw)) { current = undefined; continue; }
+    const line = plain(raw), start = criterion.exec(line);
+    if (!line) { current = undefined; continue; }
+    if (start || authTag.test(line) && !current) {
+      current = {id:start?.[1],text:line,source:ref(file,firstLine+i),authorized:authTag.test(line)};
+      rows.push(current);
+    } else if (current) {
+      current.text += "\n" + line;
+      current.authorized ||= authTag.test(line);
+    }
+  }
+  return rows;
+}
+function batchAuthorization(project: Project, run: Execution, acceptance: string) {
+  const batch = run.batch;
+  if (!batch) return [];
+  const rows = criteriaRows(acceptance,batch.acceptance);
+  for (const key of ["acceptance","prompt"]) {
+    const name = str(run.task[key]);
+    if (!name) continue;
+    const file = project.read.get(name,()=>project.path(name));
+    if (!file || file === batch.acceptance) continue;
+    const text = project.read.text(file) || "";
+    const sectionsOfCriteria = sections(text).filter(s=>s.title === "验收标准");
+    if (sectionsOfCriteria.length) for (const s of sectionsOfCriteria) rows.push(...criteriaRows(s.body,file,s.bodyLine));
+    else if (key === "acceptance") rows.push(...criteriaRows(text,file));
+  }
+  return rows;
+}
+function authorizationRequirements(project: Project, issue: Issue, run: Execution, acceptance: string, targets: string[], reported: string) {
+  const explicit = issueAuthorization(issue,reported), rows = batchAuthorization(project,run,acceptance);
+  const scenes = new Set(targets.flatMap(sceneIds));
+  const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
+  const belongs = (text: string) => sceneIds(text).some(s=>scenes.has(s)) || issueIdsIn(text).some(id=>issue.ids.includes(id)) || names.some(name=>text.includes(name));
+  const associated = new Set(rows.flatMap(row=>row.id && (explicit.ids.has(row.id) || belongs(row.text)) ? [row.id] : []));
+  const required = new Map<string,Ref[]>();
+  for (const id of explicit.required) required.set(id,[ref(issue.file)]);
+  const unclear: Ref[] = [];
+  for (const row of rows.filter(r=>r.authorized)) {
+    if (row.id && associated.has(row.id)) {
+      required.set(row.id,[...(required.get(row.id) || []),row.source]);
+    } else {
+      // 另一个明确命名的场景/问题单只约束它自己。不把无关联条目凭空分配给本单。
+      const disjoint = !belongs(row.text) && sceneIds(row.text).length > 0 && scenes.size > 0;
+      if (!disjoint) unclear.push(row.source);
+    }
+  }
+  return {required, unclear, unknown:explicit.unknown};
+}
 
 function localLink(root: string, file: string, link: string) {
   if (/^[a-z]+:/i.test(link)) return;
@@ -84,7 +177,7 @@ const sameObservation = (a: unknown, b: unknown): boolean => {
   return keys.length === Object.keys(b).length && keys.every(k => Object.hasOwn(y,k) && sameObservation(x[k],y[k]));
 };
 /** 跨批历史手工对照由单上指向对照文件，并注明唯一目标；不从文字「已证明」推导。 */
-function legacyProof(report: Doc, target: string, versions: Set<string>, logOK: (p: string) => boolean) {
+function legacyProof(report: Doc, target: string, versions: Set<string>, logOK: (p: string) => boolean, pinnedBefore?: string) {
   const separator = target.indexOf(" / ");
   if (separator < 0 || !sha(report["测试来源"]) || !Object.keys(object(report["测试文件SHA256"])).length || !Object.values(object(report["测试文件SHA256"])).every(v => /^[a-f0-9]{64}$/.test(str(v)))) return;
   const scenario = target.slice(0, separator), checkpoint = target.slice(separator+3);
@@ -95,7 +188,7 @@ function legacyProof(report: Doc, target: string, versions: Set<string>, logOK: 
     if (yes?.status !== "通过" || !sameObservation(yes.actual,yes.expected)) continue;
     const before = rows.find(r => {
       const no = observed(r);
-      return r["版本"] !== after["版本"] && r["退出"] === 1 && Array.isArray(r["命令"]) && sameObservation(r["命令"],after["命令"]) &&
+      return (!pinnedBefore || r["版本"] === pinnedBefore) && r["版本"] !== after["版本"] && r["退出"] === 1 && Array.isArray(r["命令"]) && sameObservation(r["命令"],after["命令"]) &&
         no?.status === "失败" && sameObservation(no.expected,yes.expected) && !sameObservation(no.actual,no.expected);
     });
     if (before) return {before: str(before["版本"]), after: str(after["版本"]), logs:[str(before["日志"]),str(after["日志"])]};
@@ -106,6 +199,9 @@ function proofFor(project: Project, issue: Issue, run: Execution, current: Retur
   const targets = new Set([plain(field(issue.header,"防复发检查")), ...declared.map(targetName)].filter(Boolean));
   if (targets.size !== 1) return;
   const target = [...targets][0];
+  const oldVersions = new Set(declared.map(row=>Object.hasOwn(row,"before") ? row.before : run.task.baseCommit));
+  const expectedOld = declared.length ? [...oldVersions][0] : run.task.baseCommit;
+  if (declared.length && (oldVersions.size !== 1 || !sha(expectedOld))) return;
   const files = new Map<string,{root:string; source?:Ref}>();
   const matched = run.checks.filter(c => c.step === "防复发证明" && c.commit === current.commit &&
     c.value.promptHash === current.hashes?.promptHash && c.value.acceptanceHash === current.hashes?.acceptanceHash);
@@ -128,14 +224,15 @@ function proofFor(project: Project, issue: Issue, run: Execution, current: Retur
     const before = object(report.before), after = object(report.after);
     const isReview = /^REVIEW\.md\b/.test(issue.attribution);
     if (issue.ids.includes(str(report.issue)) && targetName(report) === target && report.result === "已证明" &&
-        report.executionId === run.id && sha(before.commit) && sha(after.commit) && after.commit === current.commit && before.commit !== after.commit &&
+        report.executionId === run.id && sha(expectedOld) && before.commit === expectedOld && sha(after.commit) && after.commit === current.commit && before.commit !== after.commit &&
         /^[0-9a-f]{64}$/.test(str(report.materialsHash)) && observation(before) && observation(after) &&
         (isReview || sameObservation(before.expected,after.expected) && !sameObservation(before.expected,before.actual) && sameObservation(after.expected,after.actual)) &&
         before.result === (isReview ? "命中目标" : "目标断言失败") && after.result === (isReview ? "正常对照未误报" : "通过") && logOK(str(before.log)) && logOK(str(after.log)) &&
         (!source || !matched.some(c => c.result === "未证明" && c.value.issue === report.issue && c.source.line! > source.line!))) {
       return {target, before:before.commit, after:after.commit, source:ref(file), check:source, logs:[str(before.log),str(after.log)].map(p=>resolve(dirname(file),p)), auth:str(report.authorization)};
     }
-    const legacy = !source && !isReview && legacyProof(report,target,mergeFacts(run,current.commit).versions,logOK);
+    const legacyVersions = declared.length ? new Set([current.commit]) : mergeFacts(run,current.commit).versions;
+    const legacy = !source && !isReview && legacyProof(report,target,legacyVersions,logOK,declared.length ? str(expectedOld) : undefined);
     if (legacy) return {...legacy, target, source:ref(file), logs:legacy.logs.map(p=>resolve(dirname(file),p)), auth:str(report.authorization)};
   }
 }
@@ -152,7 +249,7 @@ export function issueViews(project: Project, list: Issue[]) {
     if (!issueStatus.test(issue.header) || !/^(待修复|修复中|已合入待验|已部署|待验)(?:$|[（(·：:\s])/.test(issue.status)) reasons.push("未识别或缺少问题单状态");
     if (!meaningful(issue.related) || !run) reasons.push("关联批次没有唯一可读的修复执行");
     const intro = plain(issue.introduced);
-    if (!/^(定位不到|非\s*dev-loop)(?:$|[（(，、：:\s])/.test(intro) && (!meaningful(intro) || !/\b[0-9a-f]{7,64}\b/.test(intro) || !intro.replace(/\b[0-9a-f]{7,64}\b/g,"").replace(/[\p{P}\s]/gu,""))) reasons.push("引入批次缺执行/批次及提交，或未明确定位不到 / 非 dev-loop");
+    if (!noIntroduction.test(intro) && (!meaningful(intro) || !intro.match(shaToken) || !intro.replace(shaToken,"").replace(/[\p{P}\s]/gu,""))) reasons.push("引入批次缺执行/批次及提交，或未明确定位不到 / 非 dev-loop");
     const attribution = qualifiedAttribution.exec(issue.attribution);
     if (!attribution || !meaningful(attribution[3].replace(/[）)]$/,""))) reasons.push("本该拦住缺层级或原因");
     if (!run?.batch) return {...view, state:"待修复"};
@@ -167,10 +264,14 @@ export function issueViews(project: Project, list: Issue[]) {
     const auths = authorizationFor(run), acceptance = project.read.text(run.batch.acceptance) || "";
     // 批次整体「通过」不等于本人做过这一项。精确到本执行、条目编号及正式答复/本人实做。
     const actual = decisionsIn(acceptance,run.batch.acceptance).filter(d=>d.decision.endsWith("已做"));
-    const required = authorizationIds(issue.text + (proof?.auth ? "\n授权项：" + proof.auth : ""));
-    if (required.unknown) reasons.push("授权要求没有可核对的验收条目编号");
-    for (const id of required.ids) {
-      const positive = actual.find(d=>d.id === id) || auths.findLast(d=>d.id === id);
+    const targets = [plain(field(issue.header,"防复发检查")), proof?.target || "", ...sceneIds(issue.attribution),
+      ...array(run.task.proofs).map(object).filter(d=>issue.ids.includes(str(d.issue))).map(targetName)];
+    const auth = authorizationRequirements(project,issue,run,acceptance,targets,proof?.auth || "");
+    if (auth.unknown) reasons.push("授权要求没有可核对的验收条目编号");
+    if (auth.unclear.length) { reasons.push("批次授权条目与本单的关系不明确；缺验收编号或目标对应"); evidence.push(...auth.unclear); }
+    for (const [id,requirements] of auth.required) {
+      evidence.push(...requirements);
+      const positive = actual.findLast(d=>d.id === id) || auths.findLast(d=>d.id === id);
       if (!positive || positive.decision === "不授权") reasons.push(`${id} 缺本人授权或实做事实`);
       else evidence.push(positive.source);
     }

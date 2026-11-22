@@ -8,7 +8,8 @@ export interface Execution {
   checks: Check[]; ledgerOK: boolean; read: Reader;
 }
 export interface Batch { key: string; card: string; name: string; dir: string; results: string; acceptance: string; runs: Execution[] }
-export type Deployment = { at?: number; source: Ref; result: string; commit: string };
+export type Deployment = { at?: number; source: Ref; result: string; commit: string; execution: string };
+export const deployedOK = (d?: Deployment) => !!d && ["已部署","已部署（未检查）"].includes(d.result);
 export const delivered = (run: Execution) => str(object(run.loop.delivery).commit) || str(run.loop.commit);
 export const official = (check: Check) => check.step === "评审" && ["通过", "必修"].includes(check.result);
 export const roundOf = (check: Check) => Number(check.evidence.map(f => /-r(\d+)(?:-a\d+)?\.md$/.exec(f)?.[1]).find(Boolean)) || undefined;
@@ -135,39 +136,45 @@ export function mergeFacts(run: Execution, commit = delivered(run)) {
   }
   return {versions, merges};
 }
-export function deployments(project: Project, batch: Batch, run?: Execution): Deployment[] {
-  const result: Deployment[] = [];
-  const runs = run ? [run] : batch.runs;
-  for (const r of runs) {
-    const {versions} = mergeFacts(r);
-    for (const c of r.checks.filter(c => ["部署", "退回"].includes(c.step) && versions.has(c.commit) && sha(c.commit))) {
-      result.push({at: time(c.value.endedAt), source: c.source, result: c.result, commit: c.commit});
-    }
-  }
-  // 兼容收尾的「执行 / 版本 / 部署时间」段。日志中有同版本部署时优先用检查流水。
-  // 失败/退回以流水的追加顺序为准，不能因缺时间把较新的失败排到成功之前。
+export function deployments(project: Project, batch: Batch, run: Execution, history = false): Deployment[] {
+  const registered = new Set([delivered(run)]);
+  if (history) for (const c of run.checks) if (c.step === "开发" && c.result === "已交付") registered.add(c.commit);
+  const versions = new Set([...registered].flatMap(commit=>[...mergeFacts(run,commit).versions]));
+  const result = run.checks.flatMap((c): Deployment[] => ["部署", "退回"].includes(c.step) && versions.has(c.commit) && sha(c.commit) ?
+    [{at:time(c.value.endedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id}] : []);
+  // 缺时只用唯一、同执行同版的旧批次结果段补齐；已记录的退回和多次部署不由旧摘要覆盖。
   const last = result.at(-1);
-  if (last && (last.at !== undefined || !["已部署", "已部署（未检查）"].includes(last.result))) return result;
+  if (result.length > 1 || last && (last.at !== undefined || !deployedOK(last))) return result;
   const paths = basename(batch.card) === "开发卡.json" ? [batch.results] : [batch.results, join(batch.dir,"结果.md")];
   const notes: Deployment[] = [];
   for (const file of paths) {
-    const lines = (project.read.text(file) || "").split(/\r?\n/);
     let execution = "", commit = "";
-    for (const [i, line] of lines.entries()) {
+    for (const [i,line] of (project.read.text(file) || "").split(/\r?\n/).entries()) {
       if (/^##\s/.test(line)) { execution = ""; commit = ""; }
       const field = /^(执行|版本|部署时间)\s*[:：]\s*(.*?)\s*$/.exec(line);
       if (!field) continue;
       const [, key, value] = field;
       if (key === "执行") execution = value;
       if (key === "版本") commit = value;
-      if (key !== "部署时间" || !sha(commit) || !runs.some(r => r.id === execution && delivered(r) === commit)) continue;
+      if (key !== "部署时间" || execution !== run.id || !registered.has(commit) || !sha(commit)) continue;
+      if (last && !mergeFacts(run,commit).versions.has(last.commit)) continue;
       const at = time(value);
-      if (at !== undefined && (!last || last.commit === commit || runs.some(r=>mergeFacts(r).versions.has(last.commit)))) {
-        notes.push({at, source:ref(file,i+1), result:last?.result || "已部署",commit:last?.commit || commit});
-      }
+      if (at !== undefined) notes.push({at, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution});
     }
   }
-  // 有多次部署且最后一次缺时，不拿上次结果当作这次的时间。
-  if (notes.length === 1 && result.length <= 1) return notes;
-  return result;
+  return notes.length === 1 ? notes : result;
+}
+
+/** 批次视图按实际部署时间选版本，不按最后一次重试。退回只影响对应版本，不当成新部署。 */
+export function batchDeployment(project: Project, batch: Batch) {
+  const candidates = batch.runs.flatMap(run => {
+    const records = deployments(project,batch,run,true), i = records.findLastIndex(deployedOK);
+    if (i < 0) return [];
+    const success = records[i];
+    const latest = records.slice(i+1).findLast(d=>d.commit === success.commit && ["已退回","退回失败"].includes(d.result));
+    return [{run,success,latest:latest || success}];
+  });
+  // 若某执行最后的成功部署没有时间，无法证明它早于其他部署，不能拿其他版本的时间结束提醒。
+  return candidates.findLast(d=>d.success.at === undefined) ?? candidates.reduce<typeof candidates[number] | undefined>((latest,d)=>
+    !latest || (d.success.at ?? 0) >= (latest.success.at ?? 0) ? d : latest,undefined);
 }
