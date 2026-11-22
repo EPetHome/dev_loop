@@ -350,6 +350,31 @@ test("本轮必修：总结果声明串项，不能用 A 的已证明证据给 B
   assert.equal(readText(a.report),tampered);
 });
 
+test("本轮必修：原始报告实际值为 -0.0 时可登记、复用且不重复记账", async t => {
+  const f = project(t), entry = "test/negative-zero.cjs";
+  write(join(f.repo,entry),`const fs=require('node:fs'), {join}=require('node:path'), dir=process.env.LOOP_PROOF_DIR;
+const plan=JSON.parse(fs.readFileSync(join(dir,'plan.json'),'utf8'));
+const actual=require('./proof-fixture-helper.cjs').observe(), pass=actual===plan.expected;
+const header=JSON.stringify({...plan,status:pass?'通过':'失败'}).slice(0,-1);
+fs.writeFileSync(join(dir,'result.tmp'),header+ ',"actual":'+(actual===0?'-0.0':actual)+'}');
+fs.renameSync(join(dir,'result.tmp'),join(dir,'result.json'));
+process.exitCode=pass?0:76;`);
+  f.git("add",entry); f.git("commit","-m","fixture negative-zero report");
+  const task = await f.start([{...unit,test:`node ${entry}`,testFiles:[entry,...sceneFiles.slice(1)]}]);
+  f.submit(task);
+  const [first] = await f.run(task), raw = readText(join(dirname(first.report),"before/result.json"));
+  assert.match(raw,/"actual":-0\.0\}/);
+  assert.equal(first.result,"已证明");
+  assert.deepEqual([first.beforeRun.code,first.beforeRun.observation.actual,first.afterRun.code,first.afterRun.observation.actual],[76,0,0,1]);
+  const ledger = checks(task.dir), batch = readText(f.batch);
+  assert.deepEqual(ledger.map(c => [c.attempt,c.result]),[[first.attempt,"已证明"]]);
+  assert.equal(batchCount(f.batch),1);
+  const {proofs:[again],ignoredAttempts} = await f.receipt(task);
+  assert.equal(again.result,"已证明"); assert.equal(again.reused,true); assert.equal(again.attempt,first.attempt);
+  assert.equal(ignoredAttempts,undefined);
+  assert.deepEqual(checks(task.dir),ledger); assert.equal(readText(f.batch),batch);
+});
+
 test("归档报告的摘要吻合，也不能把另一用例或检查点当作本次目标", async t => {
   const f = project(t), task = await f.start([unit,scene]); f.submit(task);
   const [u,e] = await f.run(task);

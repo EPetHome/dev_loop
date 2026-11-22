@@ -1,7 +1,6 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { privateCheckout } from "../infra/checkout.ts";
 import { inside, isObject, safeRelative } from "../infra/config.ts";
 import { atomicWrite, BusyError, digest, errorText, ifPresent, readJson, span, underLock, withLock, writeJson } from "../infra/files.ts";
@@ -228,8 +227,11 @@ function loadVerifiedAttempt(t: Task, dir: string, attempt: string): Attempt {
       const origEvidence = new Set<string>();
       const plan = replayPlan({t,p:declaration,attempt,binding},commit);
       const original = readObservation(join(dir,side),plan,declaration,{code,killed:false},origEvidence);
+      // JSON 落盘会把负零写成零；归档标量与现场断言都用 === 比较。
+      const saved = run.observation, fields = ["status","actual","expected"] as const;
       requireReport(original.status === status && original.actual === actual && original.expected === declaration.expected &&
-        isDeepStrictEqual(original,run.observation),"归档报告与本次目标断言或实得不符："+side);
+        objectRecord(saved) && Object.keys(saved).length === fields.length &&
+        fields.every(key => Object.hasOwn(saved,key) && saved[key] === original[key]),"归档报告与本次目标断言或实得不符："+side);
       for (const file of origEvidence) requireReport(Object.hasOwn(hashes,relative(dir,file)),"归档报告引用了未绑定的证据："+relative(dir,file));
     }
   }
