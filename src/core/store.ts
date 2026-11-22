@@ -68,8 +68,7 @@ export function summary(dir: string, s = statusOf(dir)): void {
     const result = steps.get(label)?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
     lines.push("| " + label + " | " + result + " | " + (s.loop.durations[bucket as Bucket] / 1000).toFixed(2) + "s |");
   }
-  lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl"));
-  writeFileSync(join(dir, "summary.md"), lines.filter((s, i, a) => s || a[i - 1] !== "").join("\n") + "\n");
+  lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl")); writeFileSync(join(dir,"summary.md"),lines.filter((s,i,a)=>s || a[i-1]!=="").join("\n") + "\n");
 }
 export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑"): Status {
   return withLock(join(dir, "status.lock"), () => {
@@ -136,8 +135,7 @@ export function inputs(t: Task) {
   const prompt = readFileSync(t.prompt,"utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance,"utf8") : ""; return {prompt,acceptance,promptHash:digest(prompt),acceptanceHash:digest(acceptance)};
 }
 export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))): string[] {
-  const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
-  const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash);
+  const records = checksOf(dir).filter(c=>c.commit===commit && ["复测","评审"].includes(c.step)), same = records.filter(c=>c.promptHash===hashes.promptHash && c.acceptanceHash===hashes.acceptanceHash);
   const missing = ["复测", "评审"].filter(step => !same.some(c => c.step === step && (c.result === "通过" || step === "复测" && c.result === "没验证"))).map(step => step + "：没有通过记录");
   if (missing.length && records.length !== same.length) missing.push("提示词或验收标准已变化，原检查不再算数");
   return missing;
@@ -152,8 +150,7 @@ function stepView(dir: string, view: StepView): void {
 }
 export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
 export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash" | "acceptanceHash">, view?: StepView): void {
-  const t = taskOf(dir); let hashes = {promptHash: "", acceptanceHash: ""};
-  try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
+  const t = taskOf(dir); let hashes = {promptHash:"",acceptanceHash:""}; try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
   appendCheck(dir, {...entry, tree: gitText(t.repo, ["rev-parse", entry.commit + "^{tree}"]), promptHash: hashes.promptHash, acceptanceHash: hashes.acceptanceHash});
   if (view) stepView(dir, view); else summary(dir);
 }

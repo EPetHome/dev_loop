@@ -30,9 +30,7 @@ export async function prepare(dir: string): Promise<void> {
       if (!existsSync(join(t.worktree, ".git"))) gitText(t.repo, ["worktree", "add", "-b", t.branch, t.worktree, t.baseCommit]);
       copyLocalFiles(t); update(dir, s => { s.loop.prepared = true; });
     }
-    if (t.config.setup) {
-      update(dir, s => { s.timeLimitSec = t.limits.测试.timeoutMin * 60; }); await setup(t,"setup.log");
-    }
+    if (t.config.setup) { update(dir,s=>{s.timeLimitSec=t.limits.测试.timeoutMin*60;}); await setup(t,"setup.log"); }
     if (statusOf(dir).state === "cancelled") return;
     const {promptHash, acceptanceHash} = inputs(t);
     appendCheck(dir, {promptHash, acceptanceHash, commit: t.baseCommit, tree: gitText(t.worktree, ["rev-parse", "HEAD^{tree}"]),
@@ -43,8 +41,7 @@ export async function prepare(dir: string): Promise<void> {
 export function registerSession(dir: string, host: string, id: string, pid = process.pid, file?: string): boolean {
   let registered = false; update(dir, s => {
     if (s.state === "cancelled" || s.loop.abandoned) return;
-    const p = identity(pid), starting = s.loop.startingSession;
-    if (!p.startedAt) throw new Error("无法读取开发会话进程身份：" + pid);
+    const p = identity(pid), starting = s.loop.startingSession; if (!p.startedAt) throw new Error("无法读取开发会话进程身份：" + pid);
     if (starting && (starting.pid !== p.pid || starting.startedAt !== p.startedAt)) return;
     s.loop.session = {...p,host,id,...(file?{file}:{})}; s.loop.startingSession = null; registered = true;
   }); return registered;
@@ -65,9 +62,7 @@ export function retryReview(dir: string) {
   const same = (c: typeof last) => c?.commit === commit && c.promptHash === h.promptHash && c.acceptanceHash === h.acceptanceHash;
   if (last?.step === "评审" && last.result === "失败" && same(last)) return records.findLast(c => c.step === "复测" && ["通过","没验证"].includes(c.result) && same(c));
 }
-function requireNotReleasing({loop,executionId}: Status) {
-  if (loop.releasePending) throw new InputError("工作区释放尚未结束；可运行 bin/loop " + (loop.releasePending.auto ? "收尾 " : "释放 ") + executionId + " 补齐");
-}
+const requireNotReleasing = ({loop,executionId}: Status) => { if (loop.releasePending) throw new InputError("工作区释放尚未结束；可运行 bin/loop " + (loop.releasePending.auto ? "收尾 " : "释放 ") + executionId + " 补齐"); };
 export function resume(dir: string, text?: string, answering = false): {reused: boolean; running: boolean; reviewOnly?: boolean; status: Status} {
   if ((text !== undefined || answering) && !text?.trim()) throw new InputError("话不能为空");
   const t = taskOf(dir), s = statusOf(dir);
@@ -104,8 +99,7 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
   }, reused ? "沿用通过记录" : "续跑"); return {reused,running,...(reviewOnly ? {reviewOnly} : {}),status};
 }
 export function stop(dir: string, abandon = false): Status {
-  const t = taskOf(dir);
-  const stopped = update(dir,s=>{
+  const t = taskOf(dir), stopped = update(dir,s=>{
     requireNotReleasing(s); if (s.loop.released) throw new InputError("工作区已释放，不能停止或放弃");
     move(s,"cancelled",abandon ? "已放弃" : "已停止",abandon ? "已放弃，保留分支和证据" : "已停止；可续跑",null);
   });

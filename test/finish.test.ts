@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync, unlinkSync } from "node:fs";
+import { readFileSync, existsSync, renameSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { write, until, NODE, ROOT } from "./helpers.ts";
@@ -108,8 +108,17 @@ test("慢删除不持有状态锁；删完即崩溃后手工收尾只补登记�
   deletion.proceed(); assert.equal((await deletion.exited).code,71);
   assert.equal(existsSync(worktree),false); assert.equal(statusOf(dir).loop.released,false);
   await settle(dir); assert.equal(statusOf(dir).state,"completed");
-  const committed = f.git("rev-parse","dev"), checks = checksOf(dir);
-  const receipt = JSON.parse((await f.cli(["收尾",f.task.executionId,"--json"])).stdout);
+  const committed = f.git("rev-parse","dev"), checks = checksOf(dir), second = await f.prepare();
+  const gitDir = gitText(second.worktree,["rev-parse","--absolute-git-dir"]), link = join(gitDir,"gitdir");
+  assert.equal(gitDir,deleting.loop.releasePending?.target?.gitDir,"新任务复用原 Git 管理目录名");
+  const retry = async () => JSON.parse((await f.cli(["收尾",f.task.executionId,"--json"])).stdout);
+  renameSync(link,link+".fixture");
+  try {
+    const unknown = await retry(); assert.equal(unknown.loop.released,false);
+    assert.deepEqual(unknown.loop.releasePending,deleting.loop.releasePending); assert.deepEqual(checksOf(dir),checks);
+  } finally { renameSync(link+".fixture",link); }
+  const receipt = await retry();
+  assert.equal(readFileSync(join(second.worktree,"src/app.txt"),"utf8"),"good finish\n"); assert.equal(gitText(second.worktree,["branch","--show-current"]),second.branch);
   assert.equal(receipt.state,"completed"); assert.equal(receipt.loop.phase,"已推送"); assert.equal(receipt.loop.releasePending,null); assert.equal(receipt.loop.released,true);
   assert.equal(receipt.loop.finisher,null); assert.match(receipt.message,/工作区已释放/);
   assert.match(readFileSync(join(f.repo,"结果.md"),"utf8"),/工作区已释放/);

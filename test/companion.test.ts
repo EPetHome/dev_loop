@@ -103,7 +103,19 @@ test("手工释放拒绝未跟踪、已暂存和未暂存文件，不改文件�
   assert.equal(readFileSync(join(cwd,"src/app.txt"),"utf8"),"unstaged\n");
   assert.deepEqual(statusOf(task.dir),before); assert.equal(readFileSync(join(task.dir,"checks.jsonl"),"utf8"),records);
 });
-test("手工慢删除拒绝并发带话续跑；追加记录失败后再次释放只补登记", async t => {
+test("Git 锁定导致手工释放明确失败：原错返回，现场保留且可以带话续跑", async t => {
+  const f = await delivered(t), {dir,worktree,executionId} = f.task; reviewed(f.task,f.commit);
+  const records = checksOf(dir), index = gitText(worktree,["rev-parse","--absolute-git-dir"]);
+  f.git("worktree","lock","--reason","keep manual fixture",worktree);
+  await assert.rejects(f.cli(["释放",executionId,"--json"]),(e: {code:number;stderr:string})=>{
+    assert.equal(e.code,1); assert.match(JSON.parse(e.stderr).error.raw,/fatal: .*locked working tree.*keep manual fixture/); return true;
+  });
+  const after = statusOf(dir); assert.equal(after.state,"completed"); assert.equal(after.loop.released,false); assert.equal(after.loop.releasePending,null);
+  assert.equal(gitText(worktree,["rev-parse","--absolute-git-dir"]),index);
+  assert.equal(readFileSync(join(worktree,"src/app.txt"),"utf8"),"good delivered\n"); assert.deepEqual(checksOf(dir),records);
+  assert.equal(resume(dir,"保留现场").status.state,"working"); assert.equal(statusOf(dir).loop.pendingReturn,"保留现场");
+});
+test("手工慢删除拒绝并发带话续跑；追加失败且 Git 管理目录名复用后只补登记", async t => {
   const f = await delivered(t), {dir,worktree,executionId} = f.task; reviewed(f.task,f.commit);
   const checks = checksOf(dir), deletion = await gateRemoval(t,f,"释放","append"), deleting = statusOf(dir);
   assert.equal(deleting.state,"completed"); assert.ok(deleting.loop.releasePending?.target);
@@ -113,7 +125,10 @@ test("手工慢删除拒绝并发带话续跑；追加记录失败后再次释�
   assert.equal(failed.code,1); assert.match(failed.stderr,/simulated checks.jsonl append EACCES/);
   assert.equal(existsSync(worktree),false); assert.deepEqual(checksOf(dir),checks);
   assert.ok(statusOf(dir).loop.releasePending?.target); assert.throws(()=>resume(dir,"不得启动"),/工作区释放尚未结束/);
+  const second = await f.prepare(), secondFile = join(second.worktree,"src/app.txt");
+  assert.equal(gitText(second.worktree,["rev-parse","--absolute-git-dir"]),deleting.loop.releasePending?.target?.gitDir,"新任务复用原 Git 管理目录名");
   const released = JSON.parse((await f.cli(["释放",executionId,"--json"])).stdout), after = statusOf(dir);
+  assert.equal(readFileSync(secondFile,"utf8"),"good\n"); assert.equal(gitText(second.worktree,["branch","--show-current"]),second.branch);
   assert.deepEqual(released,{executionId,released:true}); assert.equal(after.state,"completed");
   assert.equal(after.loop.releasePending,null); assert.equal(after.loop.released,true);
   assert.throws(()=>resume(dir),/已释放/);

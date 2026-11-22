@@ -20,8 +20,8 @@ export function pendingAcceptance(card: string): number {
   }).length;
 }
 export async function finish(dir: string, automatic = false) {
-  const t = taskOf(dir), start = Date.now(), after = t.after || [], shouldRelease = !t.next && after.includes("合入"), owner = identity();
-  if (!after.length && !t.next) throw new InputError("这张卡没有约定收尾");
+  const t = taskOf(dir), after = t.after || []; if (!after.length && !t.next) throw new InputError("这张卡没有约定收尾");
+  const start = Date.now(), shouldRelease = !t.next && after.includes("合入"), owner = identity();
   let release: () => void, commit="", claimed=false, restore=false, deployed: DeployResult | undefined, before="", deploying=false;
   try { release=lock(join(dir,"finish.lock")); } catch(e) { if(e instanceof BusyError)throw new InputError("正在收尾"); throw e; }
   const record = (result: string, detail: string) => recordStep(dir,{step:"收尾",result,commit,startedAt:new Date(start).toISOString(),endedAt:new Date().toISOString(),durationMs:Date.now()-start,evidence:deployed?[deployed.evidenceDir]:[],detail});
@@ -31,9 +31,7 @@ export async function finish(dir: string, automatic = false) {
     "恢复入口：bin/loop 退回 "+t.executionId,"验收标准："+(t.acceptance || "未登记"),""].join("\n"));
   const cleanup = () => { try { releaseWorktree(dir, true); } catch (e) { console.error("释放工作区未登记：", e); } return statusOf(dir); };
   try {
-    if (statusOf(dir).loop.releasePending?.auto) {
-      if (automatic) throw new InputError("不自动重试已发起的收尾；收尾已通过，待手工接手释放"); return cleanup();
-    }
+    if (statusOf(dir).loop.releasePending?.auto) { if (automatic) throw new InputError("不自动重试已发起的收尾；收尾已通过，待手工接手释放"); return cleanup(); }
     withLock(operationPath(dir), () => update(dir,s=>{
       if(alive(s.loop.finisher))throw new InputError("正在收尾");
       const interrupted=s.state==="working" && s.loop.finisher && s.loop.afterCommit===s.loop.commit;
@@ -48,8 +46,7 @@ export async function finish(dir: string, automatic = false) {
         const prepared = prepareMerge(dir,commit);
         if (cancelled()) return;
         const marker=projectFile(dirname(dir),t.repo,"deployed");let previous: unknown;try{previous=optionalJson(marker);}catch{}
-        deploying=true; deployed = await deploy(dir,{commit:prepared,automatic:true}); deploying=false;
-        if (cancelled()) return;
+        deploying=true; deployed = await deploy(dir,{commit:prepared,automatic:true}); deploying=false; if (cancelled()) return;
         try { merge(dir,{commit,prepared,acceptUnverified:false}); }
         catch(e) {
           if(gitText(t.repo,["rev-parse","dev"])===prepared)throw e;
@@ -61,8 +58,7 @@ export async function finish(dir: string, automatic = false) {
         }
         update(dir,s=>{if(s.state==="working") s.loop.phase="已部署";});
       } else if (after.includes("合入")) merge(dir,{commit,acceptUnverified:false});
-      if (cancelled()) return;
-      if (after.includes("推送")) await push(dir);
+      if (cancelled()) return; if (after.includes("推送")) await push(dir);
       if (!cancelled() && t.next) {
         const {delivery, next: id} = statusOf(dir).loop, root = dirname(dir);
         if (delivery?.commit !== commit || !checked(dir, commit)) throw new InputError("接力须有当前交付的正式复测与评审通过记录");
@@ -79,8 +75,7 @@ export async function finish(dir: string, automatic = false) {
     if (shouldRelease) cleanup();
   } catch (e) {
     if (!claimed) throw e; if (statusOf(dir).state === "completed") return cleanup();
-    let reason = e instanceof Error ? e.message : String(e);
-    const result = e instanceof LoopError ? e.result as any : undefined;
+    let reason = e instanceof Error ? e.message : String(e); const result = e instanceof LoopError ? e.result as any : undefined;
     if (result?.evidenceDir) deployed=result;
     if (result?.log && result.result?.startsWith("部署失败")) { try { reason=readFileSync(result.log,"utf8").trimEnd().split(/\r?\n/).slice(-60).join("\n"); } catch {} }
     reason = (result?.result || "收尾失败") + "\n" + reason; record("失败",reason);
@@ -92,6 +87,5 @@ export async function finish(dir: string, automatic = false) {
     } else waitFor(dir,"收尾没走完",reason + (repairable?"\n自动返修已到上限或此宿主需手动续跑。":"") + "\n可修改后续跑开发，或运行 bin/loop 收尾 " + t.executionId + " 手工重试。");
     facts(reason);
   } finally { try { if(claimed)update(dir,s=>{if(s.loop.finisher?.pid===owner.pid && s.loop.finisher.startedAt===owner.startedAt)s.loop.finisher=null;}); } finally { release(); } }
-  if (restore && statusOf(dir).state === "working") await background(t,"resume");
-  return statusOf(dir);
+  if (restore && statusOf(dir).state === "working") await background(t,"resume"); return statusOf(dir);
 }
