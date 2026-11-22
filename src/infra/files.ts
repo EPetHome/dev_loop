@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, openSync, closeSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, openSync, closeSync, linkSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
 import { identity, alive } from "./exec.ts";
@@ -22,19 +22,23 @@ export class BusyError extends Error {}
 /** 长锁用于同任务交付/停下，短锁保护状态读改写。失去进程的锁可恢复，释放要核对 token。 */
 export function lock(path: string, waitMs = 0): () => void {
   const owner = {...identity(),token:randomUUID()}, deadline = Date.now()+waitMs, sleep = new Int32Array(new SharedArrayBuffer(4));
-  for (;;) {
-    try {
-      const fd = openSync(path, "wx");
-      try { writeFileSync(fd, JSON.stringify(owner)); } finally { closeSync(fd); }
-      return () => { if (optionalJson<typeof owner>(path)?.token === owner.token) rmSync(path, { force: true }); };
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      let previous: typeof owner | undefined; try { previous = readJson(path); } catch {}
-      if (previous?.startedAt && !alive(previous)) { rmSync(path, { force: true }); continue; }
-      if (Date.now() >= deadline) throw new BusyError("任务正在处理，请稍后重试");
-      Atomics.wait(sleep,0,0,5);
+  const pending = path + "." + owner.token + ".tmp", fd = openSync(pending,"wx");
+  try {
+    // 先写完持有者，再以不覆盖现有锁的硬链接原子发布；停止不会留下正式空锁。
+    try { writeFileSync(fd,JSON.stringify(owner)); } finally { closeSync(fd); }
+    for (;;) {
+      try {
+        linkSync(pending,path);
+        return () => { if (optionalJson<typeof owner>(path)?.token === owner.token) rmSync(path,{force:true}); };
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        let previous: typeof owner | undefined; try { previous = readJson(path); } catch {}
+        if (previous?.startedAt && !alive(previous)) { rmSync(path,{force:true}); continue; }
+        if (Date.now() >= deadline) throw new BusyError("任务正在处理，请稍后重试");
+        Atomics.wait(sleep,0,0,5);
+      }
     }
-  }
+  } finally { rmSync(pending,{force:true}); }
 }
 export function withLock<T>(path: string, action: () => T, waitMs = 2000): T { const release = lock(path,waitMs); try { return action(); } finally { release(); } }
 export async function underLock<T>(path: string, action: () => Promise<T>, waitMs = 0) {

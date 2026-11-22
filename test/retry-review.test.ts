@@ -119,9 +119,11 @@ test("评审必修：Stop 先持执行锁，当前补评审等锁后只执行一
   assert.ok(reviewRequest); write(join(dir,"retry-go"),"");
   const held = join(dir,"stop-holds-lock"), gate = join(f.base,"stop-gate"); execFileSync("mkfifo",[gate]);
   const stopCode = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
-const [path,held,gate] = process.argv.slice(1), open = fs.openSync, close = fs.closeSync; let fd;
-fs.openSync = (file,...args) => { const result = open(file,...args); if (file === path) fd=result; return result; };
-fs.closeSync = file => { close(file); if (file === fd) { fd=undefined; fs.writeFileSync(held,''); fs.readFileSync(gate); } };
+const [path,held,gate] = process.argv.slice(1), link = fs.linkSync;
+fs.linkSync = (pending,destination) => {
+  link(pending,destination);
+  if (destination === path) { fs.writeFileSync(held,''); fs.readFileSync(gate); }
+};
 syncBuiltinESMExports();
 const {handleHook} = await import(${JSON.stringify(join(ROOT,"src/hosts/hook.ts"))});
 if (await handleHook({},'Stop')) process.exitCode=71;`;
@@ -130,6 +132,7 @@ if (await handleHook({},'Stop')) process.exitCode=71;`;
   const releaseStop = () => { if (!released) { released=true; write(gate,"continue"); } };
   try {
     await until(dir,() => existsSync(held),Boolean);
+    assert.equal(JSON.parse(readFileSync(operationPath(dir),"utf8")).pid,stop.pid);
     const wait = Atomics.wait, gateWait = t.mock.method(Atomics,"wait",(...args: Parameters<typeof wait>) => {
       if (!released) { assert.equal(statusOf(dir).loop.launcher?.pid,process.pid); releaseStop(); }
       return wait(...args);

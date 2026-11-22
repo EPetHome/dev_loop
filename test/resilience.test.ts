@@ -107,6 +107,28 @@ test("两进程状态并发更新，seq 不丢增量；死进程的操作锁可�
   const path=join(f.base,"dead.lock");
   execFileSync(NODE,["--input-type=module","-e",'const {lock}=await import('+JSON.stringify(join(ROOT,"src/infra/files.ts"))+');lock(process.argv[1]);',path]);
   const release=lock(path);assert.throws(()=>lock(path),BusyError);release();assert.equal(existsSync(path),false);
+  write(path,""); // 无法确认老版本留下的空锁归属，不猜测、不强删。
+  assert.throws(()=>lock(path),BusyError); assert.equal(readFileSync(path,"utf8"),"");
+});
+test("状态锁写入持有者前进程退出，不留下阻塞后续状态更新的空锁", async t => {
+  const f = fixture(t), task = await f.prepare(), before = statusOf(task.dir), path = join(task.dir,"status.lock");
+  const cut = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const {update} = await import(${JSON.stringify(join(ROOT,"src/core/store.ts"))});
+const write = fs.writeFileSync;
+fs.writeFileSync = (file,data,...args) => {
+  if (typeof data === 'string' && data.includes('"token":') && data.includes('"pid":') && data.includes('"startedAt":')) process.exit(71);
+  return write(file,data,...args);
+};
+syncBuiltinESMExports();
+update(process.argv[1],()=>{throw new Error('未中断锁写入');});`;
+  const worker = spawn(NODE,["--input-type=module","-e",cut,task.dir],{cwd:f.repo,env:f.env,stdio:"inherit"});
+  assert.deepEqual(await once(worker,"close"),[71,null]);
+  assert.equal(existsSync(path),false,"未写完持有者时不能发布正式锁");
+  assert.deepEqual(statusOf(task.dir),before);
+  update(task.dir,s => { s.message = "可继续"; });
+  assert.equal(statusOf(task.dir).seq,before.seq+1);
+  assert.equal(statusOf(task.dir).message,"可继续");
+  assert.equal(existsSync(path),false);
 });
 test("子进程中文长输出跨块仍保留原文",async(t)=>{
   const f=fixture(t),value="错误✓".repeat(50000),exec=childExec;
