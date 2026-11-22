@@ -3,6 +3,7 @@ import { convention } from "./convention.ts";
 import { registerSession, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startFinish } from "./after-settle.ts";
+import { errorText } from "../infra/files.ts";
 import { sessionIdOf, lastAssistantMessage, type HookEvent } from "./hook-event.ts";
 /** 只有实际返回宿主的事件才确认交接；Stop 必须 block，不能只改状态冒充唤起。 */
 function takeReturn(dir: string): string {
@@ -17,34 +18,23 @@ function takeReturn(dir: string): string {
 }
 export async function handleHook(event: HookEvent, eventName = event.hook_event_name || "", env = process.env): Promise<string> {
   if (!["SessionStart", "PostToolUse", "Stop"].includes(eventName)) return "";
-  const dir = locate(event.cwd || process.cwd(), env);
-  if (!dir) return "";
+  const dir = locate(event.cwd || process.cwd(),env); if (!dir) return "";
   try {
+    let opening = "";
     if (eventName === "SessionStart") {
-      const host = event.host === "codex" || event.provider === "codex" || env.LOOP_HOST === "codex" ? "codex" : "claude";
-      const pid = Number(event.session_pid || event.pid || process.ppid);
-      if (!registerSession(dir, host, sessionIdOf(event), pid, event.transcript_path)) return "";
-      return JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:
-        convention(taskOf(dir)) + "\n聊天不改变检查结论。\n" + takeReturn(dir)}});
-    }
-    if (eventName === "PostToolUse") {
-      heartbeat(dir, Date.now(), true); const reason = takeReturn(dir);
-      return reason ? JSON.stringify({hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:reason}}) : "";
-    }
-    heartbeat(dir);
+      const host = [event.host,event.provider,env.LOOP_HOST].includes("codex") ? "codex" : "claude";
+      if (!registerSession(dir,host,sessionIdOf(event),Number(event.session_pid || event.pid || process.ppid),event.transcript_path)) return "";
+      opening = convention(taskOf(dir)) + "\n聊天不改变检查结论。\n";
+    } else heartbeat(dir,Date.now(),eventName === "PostToolUse");
     const pending = takeReturn(dir);
-    if (pending) return JSON.stringify({decision:"block",reason:pending});
-    const r = await settle(dir, lastAssistantMessage(event));
+    if (eventName !== "Stop") return opening || pending ? JSON.stringify({hookSpecificOutput:{hookEventName:eventName,additionalContext:opening+pending}}) : "";
+    const r = pending ? {continue:true,reason:pending} : await settle(dir,lastAssistantMessage(event));
     if (!r.continue) await startFinish(dir,env);
     return r.continue ? JSON.stringify({decision:"block",reason:r.reason}) : "";
-  } catch (e) {
-    fail(dir, e);
-    return JSON.stringify({systemMessage:"dev-loop 自身失败：" + (e instanceof Error ? e.message : String(e))});
-  }
+  } catch (e) { fail(dir,e); return JSON.stringify({systemMessage:"dev-loop 自身失败："+errorText(e)}); }
 }
 export async function hookMain(args = process.argv.slice(2)): Promise<void> {
   let raw = "";
   for await (const chunk of process.stdin) raw += chunk;
-  const result = await handleHook(JSON.parse(raw || "{}"), args[0]);
-  if (result) process.stdout.write(result + "\n");
+  const result = await handleHook(JSON.parse(raw || "{}"),args[0]); if (result) process.stdout.write(result+"\n");
 }

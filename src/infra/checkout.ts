@@ -21,8 +21,7 @@ function copySnapshot(repo: string, dest: string, commit: string, source: string
   source = realpathSync(source);
   gitText(repo,["worktree","add","--detach","--no-checkout",dest,commit]); gitText(dest,["read-tree",commit]);
   cpSync(source,dest,{recursive:true,mode:constants.COPYFILE_FICLONE,filter(from,to) {
-    if (basename(from).toLowerCase() === ".git") return false;
-    if (!lstatSync(from).isSymbolicLink()) return true;
+    if (basename(from).toLowerCase() === ".git") return false; if (!lstatSync(from).isSymbolicLink()) return true;
     const path = relative(source,realpathSync(from));
     if (!safeRelative(path.toLowerCase() || ".")) throw new Error("留痕链接越出副本范围：" + relative(source,from));
     symlinkSync(relative(dirname(to),join(dest,path)) || ".",to); return false;
@@ -30,6 +29,6 @@ function copySnapshot(repo: string, dest: string, commit: string, source: string
 }
 export const checkoutWorker = fileURLToPath(import.meta.url);
 if (process.argv[1] && resolve(process.argv[1]) === checkoutWorker) {
-  const [mode, repo, root, commit, source] = process.argv.slice(2);
+  const [, ,mode,repo,root,commit,source] = process.argv;
   if (mode === "--snapshot-copy") copySnapshot(repo,join(root,"src"),commit,source); else if (mode === "--snapshot-clean") removeScratch(repo,root);
 }

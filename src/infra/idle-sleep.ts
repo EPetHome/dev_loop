@@ -11,15 +11,12 @@ export function idleSleep(dir: string, working: boolean, now = Date.now(), env =
   const warn = (e: unknown) => { try { appendFileSync(join(dir, "idle-sleep.log"), String(e) + "\n"); } catch {} };
   const release = (lease?: Lease) => { if (alive(lease)) { try { process.kill(lease!.pid, "SIGTERM"); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ESRCH") warn(e); } } };
   try {
-    const previous = optionalJson<Lease>(file);
-    if (!working) { release(previous); if (previous) rmSync(file, {force: true}); return; }
+    const previous = optionalJson<Lease>(file); if (!working) { release(previous); if (previous) rmSync(file,{force:true}); return; }
     const attached = alive(owner) ? owner : undefined;
     const sameOwner = previous?.owner?.pid === attached?.pid && previous?.owner?.startedAt === attached?.startedAt;
     if (previous && sameOwner && ((attached && alive(previous)) || (now < previous.renewAt && now >= previous.renewAt - 60000))) return;
     const args = attached ? ["-i", "-w", String(attached.pid)] : ["-i", "-t", "120"];
-    const child = spawn(env.LOOP_CAFFEINATE_CMD || "/usr/bin/caffeinate", args, {
-      env: {...env, LOOP_TASK_DIR: dir}, detached: true, stdio: "ignore",
-    });
+    const child = spawn(env.LOOP_CAFFEINATE_CMD || "/usr/bin/caffeinate",args,{env:{...env,LOOP_TASK_DIR:dir},detached:true,stdio:"ignore"});
     child.once("error", warn); child.unref();
     writeJson(file, {...(child.pid ? identity(child.pid) : {pid: 0, startedAt: ""}), renewAt: now + 60000, ...(attached ? {owner: attached} : {})});
     release(previous);
