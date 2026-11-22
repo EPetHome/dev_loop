@@ -1,5 +1,5 @@
 import { days, ref, time } from "./files.ts";
-import { batchDeployment, deployedOK, statusRef, taskRef, type Project } from "./history.ts";
+import { batchDeployment, deployedOK, deploymentReadyBy, statusRef, taskRef, type Project } from "./history.ts";
 import { authorizationFor, decisionsIn, issueFeedback, type Issue } from "./issues.ts";
 import { plain, sections } from "./markdown.ts";
 
@@ -40,7 +40,8 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
     });
     // 下批必须是不同卡、同项目，且确实在上一批就绪后；没有部署时间时不造七日到期。
     const review = readyRun?.checks.findLast(c=>c.step === "评审" && c.result === "通过");
-    const readyAt = success ? success.at : deployment.orderUnknown ? undefined : available?.event.at ?? time(review?.value.endedAt) ?? readyRun?.started;
+    const readyBound = success && deployment.current && deploymentReadyBy(deployment.current.run,success);
+    const readyAt = success ? readyBound?.at : deployment.orderUnknown ? undefined : available?.event.at ?? time(review?.value.endedAt) ?? readyRun?.started;
     const next = readyAt === undefined ? undefined : project.runs.find(r=>r.batch && r.batch !== batch && r.started !== undefined && r.started > readyAt && r.started <= now);
     // 来访的开工本身可确认是下一次；部署时间不明时不从历史里猜哪次开工发生在它之后。
     const prospective = opening && (!card || batch.card !== card) && (readyAt === undefined ? Boolean(success || available) : readyAt < now);
@@ -50,6 +51,7 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
     const deploymentSources = deployment.events.map(d=>d.source);
     if (available && !deploymentSources.includes(available.event.source)) deploymentSources.push(available.event.source);
     if (deployment.restored) deploymentSources.push(deployment.restored.marker);
+    if (readyBound && !deploymentSources.includes(readyBound.source)) deploymentSources.push(readyBound.source);
     const sources = [ref(file,1), ...(observed ? [taskRef(observed), statusRef(observed)] : []), ...deploymentSources, ...(next ? [taskRef(next)] : [])];
     const state = contacts.length && !["通过","不通过","不验"].includes(status) ? "有反馈" : settled.has(status) || pending.has(status) ? status : "未知";
     const eligible = pending.has(status) && !contacts.length && due;

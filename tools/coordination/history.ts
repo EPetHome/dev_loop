@@ -138,7 +138,7 @@ export function mergeFacts(run: Execution, commit = delivered(run)) {
   for (const c of merges) { const after = mergedVersion(c); if (after) versions.add(after); }
   return {versions, merges};
 }
-export function deployments(project: Project, batch: Batch, run: Execution, history = false): Deployment[] {
+export function deployments(project: Project, batch: Batch | undefined, run: Execution, history = false): Deployment[] {
   const registered = new Set([delivered(run)]);
   if (history) for (const c of run.checks) if (c.step === "开发" && c.result === "已交付") registered.add(c.commit);
   const versions = new Set([...registered].flatMap(commit=>[...mergeFacts(run,commit).versions]));
@@ -154,7 +154,7 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
   });
   // 缺时只用唯一、同执行同版的旧批次结果段补齐；已记录的退回和多次部署不由旧摘要覆盖。
   const last = result.at(-1);
-  if (result.length > 1 || last && (last.at !== undefined || !deployedOK(last))) return result;
+  if (!batch || result.length > 1 || last && (last.at !== undefined || !deployedOK(last))) return result;
   const paths = basename(batch.card) === "开发卡.json" ? [batch.results] : [batch.results, join(batch.dir,"结果.md")];
   const notes: Deployment[] = [];
   for (const file of paths) {
@@ -178,47 +178,78 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
 const affectsLive = (d: Deployment) => deployedOK(d) || ["已退回","退回失败"].includes(d.result) ||
   (d.result.startsWith("部署失败") && d.result !== "部署失败，已回退");
 type DeploymentLedger = {run: Execution; records: Deployment[]};
-function restoredDeployment(project: Project, ledgers: DeploymentLedger[], current: {run: Execution; event: Deployment}) {
-  const {run,event:rollback} = current, dir = rollback.evidenceDir;
+type DeploymentPoint = {run: Execution; event: Deployment; index: number; earliest?: number; latest?: number};
+function deploymentPoint({run,records}: DeploymentLedger, index: number): DeploymentPoint {
+  const event = records[index];
+  const earliest = event.at ?? event.began ?? records.slice(0,index).findLast(d=>d.at !== undefined)?.at ?? run.started;
+  const next = records.slice(index+1).find(d=>d.began !== undefined || d.at !== undefined);
+  const latest = event.at ?? next?.began ?? next?.at ?? (deployedOK(event) ? deploymentReadyBy(run,event)?.at : undefined);
+  return {run,event,index,earliest,latest};
+}
+function earlier(a: DeploymentPoint, b: DeploymentPoint) {
+  return a.run === b.run ? a.index < b.index : a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest;
+}
+
+function compensatedDeployment(project: Project, ledgers: DeploymentLedger[], current: DeploymentPoint) {
+  const {run,event:rollback,index} = current, dir = rollback.evidenceDir;
   if (!run.ledgerOK || rollback.result !== "已退回" || !dir) return;
   const attempt = run.checks.findLast(c=>c.step === "退回" && c.source.line === rollback.source.line);
   if (!attempt?.evidence.includes(join(dir,"merge-rollback.log"))) return;
-  const records = ledgers.find(l=>l.run === run)?.records ?? [], i = records.indexOf(rollback);
-  const trial = records.slice(0,i).findLast(affectsLive);
-  if (!trial || !deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== rollback.evidenceDir) return;
+  const tried = ledgers.find(l=>l.run === run);
+  const trialIndex = tried?.records.slice(0,index).findLastIndex(affectsLive) ?? -1;
+  if (!tried || trialIndex < 0) return;
+  const trialPoint = deploymentPoint(tried,trialIndex), trial = trialPoint.event;
+  if (!deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== dir) return;
+  const evidence = [trial,rollback];
 
-  // 只有收尾的 merge 补偿会把之前的 deployed 登记写回。仅凭成功退回或“以前部署过”不能认定恢复目标。
+  // merge 补偿写回的是旧登记，失败的部署却不会更新它。先辨认登记，再用项目内流水验证真实前序。
   const repo = str(run.task.repo), file = join(project.tasks,`.deployed-${hash(repo).slice(0,20)}.json`);
   const marker = new Reader(project.tasks,project.read.warnings).doc(file);
-  if (!sha(marker?.commit) || !isAbsolute(str(marker?.evidenceDir))) return;
+  if (!sha(marker?.commit) || !isAbsolute(str(marker?.evidenceDir))) return {evidence};
   const owner = ledgers.find(l=>l.run.id === marker.executionId);
-  if (!owner?.run.ledgerOK) return;
-  const event = owner.records.find(d=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir);
-  if (!event || event === trial || event.at === undefined || trial.began === undefined || event.at > trial.began) return;
-  if (owner.records.slice(owner.records.indexOf(event)+1).some(d=>d.result === "已退回" && d.evidenceDir === event.evidenceDir)) return;
-  return {run:owner.run,event,trial,rollback,marker:ref(file)};
+  if (!owner?.run.ledgerOK) return {evidence};
+  const priorIndex = owner.records.findIndex(d=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir);
+  if (priorIndex < 0) return {evidence};
+  const prior = deploymentPoint(owner,priorIndex), event = prior.event;
+  if (event === trial || event.at === undefined || trial.began === undefined || event.at > trial.began) return {evidence};
+  // 同项目的其它卡也可能改过线上。已成功回退的失败尝试不改前序；其余影响或先后不清不能被登记抹掉。
+  const otherRuns = project.runs.filter(r=>r.batch !== run.batch).map(r=>({run:r,records:deployments(project,r.batch,r,true)}));
+  const conflicting = [...ledgers,...otherRuns].flatMap(l=>l.records.flatMap((d,i)=>{
+    if (!affectsLive(d) || [trial,rollback,event].includes(d)) return [];
+    return earlier(deploymentPoint(l,i),prior) ? [] : [d];
+  }));
+  if (conflicting.length) return {evidence:[...evidence,event,...conflicting]};
+  return {evidence:[...evidence,event],restored:{run:owner.run,event,trial,rollback,marker:ref(file)}};
+}
+
+/** 完成时间缺失时，后续同执行的正式收尾只能证明部署不晚于此时，不能用来计算七天。 */
+export function deploymentReadyBy(run: Execution, event: Deployment) {
+  if (event.at !== undefined) return {at:event.at,source:event.source};
+  if (!run.ledgerOK) return;
+  const index = run.checks.findIndex(c=>c.step === "部署" && c.source.file === event.source.file && c.source.line === event.source.line);
+  if (index < 0) return;
+  for (const check of run.checks.slice(index+1)) {
+    const at = time(check.value.endedAt);
+    if (check.step === "收尾" && check.result === "通过" && at !== undefined && at >= (event.began ?? run.started ?? -Infinity)) {
+      return {at,source:check.source};
+    }
+  }
 }
 
 /** 同执行按流水；跨执行只在实际时间或可核对的上下界能排出先后时认定最新。 */
 export function batchDeployment(project: Project, batch: Batch) {
   let firstAvailable: {run:Execution; event:Deployment} | undefined;
   const ledgers = batch.runs.map(run=>({run,records:deployments(project,batch,run,true)}));
-  const candidates = ledgers.flatMap(({run,records}) => {
-    const i = records.findLastIndex(affectsLive);
+  const candidates = ledgers.flatMap(ledger => {
+    const {run,records} = ledger, i = records.findLastIndex(affectsLive);
     for (const event of records) if (event.bound && deployedOK(event) &&
       (!firstAvailable || (event.at ?? Infinity) < (firstAvailable.event.at ?? Infinity))) firstAvailable = {run,event};
-    if (i < 0) return [];
-    const event = records[i];
     // 退回本身也是事件。就算当初部署没写时间，退回时间也足以给那次部署排序。
-    const earliest = event.at ?? event.began ?? records.slice(0,i).findLast(d=>d.at !== undefined)?.at ?? run.started;
-    const nextDated = records.slice(i+1).find(d=>d.began !== undefined || d.at !== undefined);
-    const latest = event.at ?? nextDated?.began ?? nextDated?.at;
-    return [{run,event,earliest,latest}];
+    return i < 0 ? [] : [deploymentPoint(ledger,i)];
   });
-  const possibleLatest = candidates.filter(a=>!candidates.some(b=>a !== b && a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest));
+  const possibleLatest = candidates.filter(a=>!candidates.some(b=>a !== b && earlier(a,b)));
   const current = possibleLatest.length === 1 ? possibleLatest[0] : undefined;
-  const restored = current && restoredDeployment(project,ledgers,current);
-  const events = candidates.map(d=>d.event);
-  if (restored) for (const event of [restored.event,restored.trial]) if (!events.includes(event)) events.push(event);
+  const compensation = current && compensatedDeployment(project,ledgers,current), restored = compensation?.restored;
+  const events = [...new Set([...candidates.map(d=>d.event),...(compensation?.evidence ?? [])])];
   return {current:restored || current, restored, firstAvailable, events, orderUnknown:possibleLatest.length > 1};
 }

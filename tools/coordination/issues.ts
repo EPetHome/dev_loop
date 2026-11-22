@@ -164,13 +164,18 @@ function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets:
   const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
   const scopeOf = (text: string) => {
     const issueIds = issueIdsIn(text), mentionedScenes = sceneIds(text);
-    if (issueIds.some(id=>issue.ids.includes(id))) return "本单";
-    if (issueIds.some(id=>batchIssueIds.has(id))) return "其他单";
-    if (mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name))) return "本单";
+    const thisIssue = issueIds.some(id=>issue.ids.includes(id));
+    const otherIssues = new Set(issueIds.filter(id=>batchIssueIds.has(id) && !issue.ids.includes(id)));
+    const thisTarget = mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name));
+    const exclusive = /(?:仅|只)(?:用于|针对|适用于|限于)\s*(?:问题单\s*)?([A-Z]{2,}\d{2,})\b(?!\s*(?:和|与|及|、|[+,，/])\s*(?:问题单\s*)?[A-Z]{2,}\d{2,}\b)/.exec(text)?.[1];
+    if ((thisIssue || thisTarget) && exclusive && otherIssues.has(exclusive)) return "归属冲突";
+    // 一条标准可以指向多张单。另一个编号不能覆盖已经匹配的本单编号或目标。
+    if (thisIssue || thisTarget) return "本单";
+    if (otherIssues.size) return "其他单";
     return mentionedScenes.length && scenes.size ? "其他场景" : "未知";
   };
   const scoped = rows.map(row=>({row, scope:scopeOf(row.text)}));
-  const associated = new Set([...explicit.ids, ...scoped.flatMap(({row,scope})=>row.id && scope === "本单" ? [row.id] : [])]);
+  const associated = new Set([...explicit.ids, ...scoped.flatMap(({row,scope})=>row.id && ["本单","归属冲突"].includes(scope) ? [row.id] : [])]);
   const other = new Set(scoped.flatMap(({row,scope})=>row.id && ["其他单","其他场景"].includes(scope) ? [row.id] : []));
   const required = new Map<string,Ref[]>(), conflicts: {id:string; sources:Ref[]}[] = [], missing: string[] = [];
   const issueSource = ref(issue.file);
@@ -180,7 +185,7 @@ function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets:
   for (const id of associated) {
     const definitions = scoped.filter(({row})=>row.id === id);
     if (explicit.references.has(id) && !definitions.length) missing.push(id);
-    if (definitions.some(({scope})=>scope === "其他单")) conflicts.push({id,sources:[issueSource,...definitions.map(({row})=>row.source)]});
+    if (definitions.some(({scope})=>scope === "其他单" || scope === "归属冲突")) conflicts.push({id,sources:[issueSource,...definitions.map(({row})=>row.source)]});
     for (const {row} of definitions) if (row.authorized) addRequirement(id,row.source);
   }
   const unclear: Ref[] = [];
