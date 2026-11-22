@@ -1,10 +1,10 @@
-import { appendFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { lock, withLock, BusyError, optionalJson, writeJson, iso, span, readText, errorText } from "../infra/files.ts";
 import { projectFile } from "../infra/project.ts";
 import { alive, identity } from "../infra/exec.ts";
 import { gitText } from "../infra/git.ts";
-import { taskOf, statusOf, update, move, waitFor, recordStep, checked, checksOf, lastTest, createTask, launchStarted, LoopError } from "../core/store.ts";
+import { taskOf, statusOf, update, move, waitFor, recordStep, checked, checksOf, lastTest, createTask, launchStarted, LoopError, batchResult } from "../core/store.ts";
 import { InputError } from "../core/card.ts";
 import { operationPath } from "../core/run.ts";
 import { merge, prepareMerge } from "../steps/merge.ts";
@@ -25,11 +25,11 @@ export async function finish(dir: string, automatic = false) {
   let release: () => void, commit="", claimed=false, restore=false, deployed: DeployResult | undefined, before="", deploying=false;
   try { release=lock(join(dir,"finish.lock")); } catch(e) { if(e instanceof BusyError)throw new InputError("正在收尾"); throw e; }
   const record = (result: string, detail: string) => recordStep(dir,{step:"收尾",result,commit,...span(start),evidence:deployed ? [deployed.evidenceDir] : [],detail});
-  const facts = (result: string) => appendFileSync(join(dirname(t.card),"结果.md"), ["", "## " + iso(), "执行："+t.executionId,"版本："+commit,"结果："+result,
+  const facts = (result: string) => batchResult(t, ["", "## " + iso(), "执行："+t.executionId,"版本："+commit,"结果："+result,
     "dev："+before+" → "+gitText(t.repo,["rev-parse","dev"]),"部署时间："+(deployed?.result.startsWith("已部署")?iso():"未成功部署"),"证据："+(deployed?.evidenceDir || join(dir,"checks.jsonl")),
     ...[lastTest(checksOf(dir),commit)].flatMap(c => !c?.attempt ? [] :  `复测：${c.result} / ${c.attempt}\n原文：${c.evidence.slice(0,3).join("；")}\n检查记录：${join(dir,"checks.jsonl")}`),
     "退回次数："+(statusOf(dir).loop.deployReturns || 0),...checksOf(dir).filter(c=>c.step==="收尾" && c.result==="退回开发方").map(c=>"退回原因："+c.detail),
-    "恢复入口：bin/loop 退回 "+t.executionId,"验收标准："+(t.acceptance || "未登记"),""].join("\n"));
+    "恢复入口：bin/loop 退回 "+t.executionId,"验收标准："+(t.acceptance || "未登记"),""]);
   const cleanup = () => { try { releaseWorktree(dir, true); } catch (e) { console.error("释放工作区未登记：", e); } return statusOf(dir); };
   try {
     if (statusOf(dir).loop.releasePending?.auto) { if (automatic) throw new InputError("不自动重试已发起的收尾；收尾已通过，待手工接手释放"); return cleanup(); }

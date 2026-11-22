@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { gitText, head, changes } from "../infra/git.ts";
@@ -8,7 +8,7 @@ import { onTaskBranch } from "./deliver.ts";
 import { InputError } from "./card.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
 import { taskOf, statusOf, answersOf, update, move, appendCheck, recordStep, checksOf, inputs, checked, qualifiedTest, sameInputs, lastTest, matchesReviewRequest, ENV_WAIT, type Check, type Status, type Task } from "./store.ts";
-import { clearCheck, operationPath, run } from "./run.ts";
+import { clearCheck, operationPath, projectCommand } from "./run.ts";
 export function copyLocalFiles(t: Task, cwd = t.worktree) {
   for (const path of t.config.localFiles) {
     const source = resolve(t.repo,path), dest = resolve(cwd,path); if (!existsSync(source)) throw new Error("localFiles 不存在："+source);
@@ -16,12 +16,6 @@ export function copyLocalFiles(t: Task, cwd = t.worktree) {
     if (!inside(realpathSync(cwd), realpathSync(dirname(dest)))) throw new Error("localFiles 目标越出 worktree：" + path);
     cpSync(source, dest, {recursive: true, dereference: false, force: true});
   }
-}
-export async function setup(t: Task, log: string, signal?: AbortSignal, timeoutMs = t.limits.测试.timeoutMin * 60000) {
-  if (!t.config.setup) return;
-  const result = await run(t, "sh", ["-c", t.config.setup], timeoutMs, signal);
-  writeFileSync(join(t.dir, log), result.output);
-  if ((result.code || result.killed) && statusOf(t.dir).state !== "cancelled") throw new Error("setup 失败"+(result.killed?"（超时或取消）":"（可修正环境后续跑）")+"\n"+result.output);
 }
 export async function prepare(dir: string): Promise<void> {
   const release = lock(operationPath(dir),2000), start = Date.now();
@@ -31,7 +25,7 @@ export async function prepare(dir: string): Promise<void> {
       if (!existsSync(join(t.worktree, ".git"))) gitText(t.repo, ["worktree", "add", "-b", t.branch, t.worktree, t.baseCommit]);
       copyLocalFiles(t); update(dir, s => { s.loop.prepared = true; });
     }
-    if (t.config.setup) { update(dir,s=>{s.timeLimitSec=t.limits.测试.timeoutMin*60;}); await setup(t,"setup.log"); }
+    if (t.config.setup) { update(dir,s=>{s.timeLimitSec=t.limits.测试.timeoutMin*60;}); await projectCommand(t,"setup",join(dir,"setup.log")); }
     if (statusOf(dir).state === "cancelled") return;
     recordStep(dir,{...span(start),commit:t.baseCommit,step:"dev-loop 自身",result:"就绪",evidence:t.config.setup ? [join(dir,"setup.log")] : []});
     update(dir, s => { if (move(s,"working","开发中","工作区已就绪，等待开发会话","developmentMs")) s.loop.ready = true; });

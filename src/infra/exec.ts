@@ -20,11 +20,12 @@ export async function retireGroup(p: Identity) {
     if (Date.now() >= deadline) throw new Error("旧检查进程组仍未退出："+p.pid);
 }
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
-export interface ExecOptions { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal; onSpawn?: (p: Identity) => void }
+export interface ExecOptions { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; replaceEnv?: boolean; signal?: AbortSignal; onSpawn?: (p: Identity) => void }
 export function childExec(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
   return new Promise((accept) => {
     const result: ExecResult = {code:0,stdout:"",stderr:"",output:"",killed:false}; let done = false, reap: ReturnType<typeof setTimeout> | undefined;
-    const {cwd,timeoutMs,signal,onSpawn} = options, child = spawn(command,args,{cwd,env:{...process.env,...options.env},detached:true,stdio:["ignore","pipe","pipe"]});
+    const {cwd,timeoutMs,signal,onSpawn,env,replaceEnv} = options, child = spawn(command,args,
+      {cwd,env:replaceEnv ? env || {} : {...process.env,...env},detached:true,stdio:["ignore","pipe","pipe"]});
     const collect = (stream: "stdout"|"stderr", text: string) => { result[stream] += text; result.output += text; };
     const finish = (code: number) => {
       if (done) return; done = true; clearTimeout(timer); clearTimeout(reap);

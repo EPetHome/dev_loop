@@ -4,18 +4,18 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { safeRelative } from "./config.ts";
 import { gitText, gitTry } from "./git.ts";
-export function removeCheckout(repo: string, cwd: string, warning = console.error) {
-  const r = existsSync(cwd) && gitTry(repo,["worktree","remove","--force",cwd]);
+export function removeCheckout(repo: string, cwd: string, warning = console.error, env?: NodeJS.ProcessEnv) {
+  const r = existsSync(cwd) && gitTry(repo,["worktree","remove","--force",cwd],env);
   if (r && r.code) warning("临时检出移除失败："+r.stdout+r.stderr);
 }
-function removeScratch(repo: string, root: string, warning = console.error) {
-  removeCheckout(repo,join(root,"src"),warning);
+function removeScratch(repo: string, root: string, warning = console.error, env?: NodeJS.ProcessEnv) {
+  removeCheckout(repo,join(root,"src"),warning,env);
   try { rmSync(root,{recursive:true,force:true}); } catch(e) { warning("临时目录删除失败："+String(e)); }
 }
-export async function checkout<T>(repo: string, commit: string, run: (cwd: string) => Promise<T>, warning?: (text: string) => void) {
+export async function checkout<T>(repo: string, commit: string, run: (cwd: string) => Promise<T>, warning?: (text: string) => void, env?: NodeJS.ProcessEnv) {
   const root = mkdtempSync(join(tmpdir(),"dev-loop-check-")), cwd = join(root,"src");
-  try { gitText(repo,["worktree","add","--detach",cwd,commit]); return await run(cwd); }
-  finally { removeScratch(repo,root,warning); }
+  try { gitText(repo,["worktree","add","--detach",cwd,commit],env); return await run(cwd); }
+  finally { removeScratch(repo,root,warning,env); }
 }
 function copySnapshot(repo: string, dest: string, commit: string, source: string) {
   source = realpathSync(source);

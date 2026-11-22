@@ -1,14 +1,13 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { atomicWrite, lock, BusyError, digest, optionalJson, writeJson, span, withLock, errorText, iso } from "../infra/files.ts";
+import { lock, BusyError, digest, optionalJson, writeJson, span, withLock, errorText, iso } from "../infra/files.ts";
 import { APP_ROOT } from "../infra/paths.ts";
 import { alive, retireGroup } from "../infra/exec.ts";
-import { git, gitText, changes } from "../infra/git.ts";
+import { git, gitText, changes, checkPin } from "../infra/git.ts";
 import { taskOf, statusOf, update, move, waitFor, waiting, inputs, sameInputs, checked, reviewFor, matchesReviewRequest, appendCheck, checksOf, answersOf, fail, PHASES, ENV_WAIT, type Check, type Hashes, type Task, type WaitReason } from "./store.ts";
-import { checkAttempt, checkWorktree, clearCheck, operationPath, run } from "./run.ts";
-import { copyLocalFiles, heartbeat, retryReview, setup, recordedAttempt, environmentMessage, environmentAcceptable } from "./lifecycle.ts";
-import { noTest } from "./card.ts";
+import { checkAttempt, checkWorktree, clearCheck, operationPath, projectCommand } from "./run.ts";
+import { copyLocalFiles, heartbeat, retryReview, recordedAttempt, environmentMessage, environmentAcceptable } from "./lifecycle.ts";
 import { planE2e, e2eResult } from "./e2e.ts";
 import { executeStaticReview } from "./review-call.ts";
 import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
@@ -35,7 +34,8 @@ function backToDevelopment(dir: string, problem: string | Check, test = false, r
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
 export async function settle(dir: string, lastReply = "", {signal, reviewRequest, confirmedCommit, retest, ending}: SettleOptions = {}): Promise<SettleResult> {
   let release: (() => void) | undefined, clean = () => {}, pulse: ReturnType<typeof setInterval> | undefined;
-  let started: {at:number; selfMs:number; task:Task} | undefined, hashes: Hashes = {promptHash:"",acceptanceHash:""}; const reviewOnly = reviewRequest !== undefined;
+  let started: {at:number; selfMs:number; task:Task} | undefined, hashes: Hashes = {promptHash:"",acceptanceHash:""};
+  const reviewOnly = reviewRequest !== undefined;
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
   try {
     if (reviewOnly && !matchesReviewRequest(statusOf(dir),reviewRequest)) return quiet();
@@ -91,29 +91,26 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
     const record = (step: string, start: number, data: Pick<Check,"result"|"detail"|"evidence"|"attempt"|"missingScenarios"|"unit">) => withLock(join(dir,"status.lock"), () => {
       const c: Check = {commit,tree:delivery.tree,step,...span(start),...hashes,...data,result:statusOf(dir).state === "cancelled" ? "已停止" : data.result}; appendCheck(dir,c); return c;
     });
-    const cwd = checkWorktree(dir), marker = checkAttempt(dir), timeout = t.limits.测试.timeoutMin*60, pinned = {...t,worktree:cwd}, deadline = ownStart+timeout*1000;
+    const cwd = checkWorktree(t.dir), marker = checkAttempt(t.dir), timeout = t.limits.测试.timeoutMin*60, pinned = {...t,worktree:cwd}, deadline = ownStart+timeout*1000;
     const attemptKey = (c: Pick<Check,"attempt"|"startedAt">) => c.attempt || digest(JSON.stringify([commit,hashes,c.startedAt]));
     const reuse = test && existsSync(join(cwd,".git")) && optionalJson<string>(marker) === attemptKey(test);
     let keep = false; clean = () => { if (!keep) clearCheck(t); };
     const sendBack = (review: Check) => backToDevelopment(dir,review,false,!!(retest || reviewOnly || confirmedCommit)), restored = retest && test ? reviewFor(records,test) : undefined;
     if (restored?.result === "必修") return sendBack(restored);
-    const verifyPin = () => {
-      const state = git(cwd,["--no-optional-locks","status","--porcelain=v2","--branch","--untracked-files=no"]);
-      if (!state.startsWith(`# branch.oid ${commit}\n`) || /^[^#\r\n]/m.test(state)) throw new Error(`隔离检出偏离交付 ${commit}；未登记本步骤通过`);
-    };
+    const verifyPin = () => checkPin(cwd,commit);
     const currentInputs = () => sameInputs(hashes,inputs(t)), changed = () => backToDevelopment(dir,"提示词、验收标准或 E2E 清单在检查期间变化，请重新交付后检查。");
     const attempt = !test && e2e ? retest && !existsSync(join(dir,"e2e",retest)) ? retest : randomUUID() : undefined;
     if (!test) update(dir,s => { if (move(s,"working","复测中","正在复测："+t.test,"testMs",timeout)) s.loop.retestAttempt = attempt; });
     if (statusOf(dir).state === "cancelled") return quiet("已停止"); const plan = e2e && attempt ? planE2e(t,commit,attempt,hashes,e2e) : undefined;
     if (!reuse && !["环境未验证","失败"].includes(test?.result || "")) {
       clearCheck(t); gitText(t.repo,["worktree","add","--detach","--force",cwd,commit]); copyLocalFiles(pinned); verifyPin();
-      if (t.config.setup) await setup(pinned,plan ? join("e2e",plan.plan.attempt,"setup.log") : "check-setup-"+commit+".log",signal,deadline-Date.now());
+      await projectCommand(pinned,"setup",plan ? join(plan.dir,"setup.log") : join(dir,"check-setup-"+commit+".log"),{deadline,signal});
     }
     if (!test) {
-      const start = Date.now(), log = plan ? join(plan.dir,"test.log") : join(dir,"test-"+commit+".log"); verifyPin();
-      const result = noTest(t.test) ? undefined : await run(pinned,"sh",["-c",t.test],deadline-Date.now(),signal,{LOOP_E2E_DIR:plan?.dir});
-      if (plan && realpathSync(plan.dir) !== plan.dir) throw new Error("本次尝试目录已改变：" + plan.dir);
-      selfTime(); atomicWrite(log,result ? result.output + (result.killed ? "\n复测超时或取消\n" : "") : t.test + "\n");
+      const start = Date.now(), log = plan ? join(plan.dir,"test.log") : join(dir,"test-"+commit+".log");
+      verifyPin();
+      const result = await projectCommand(pinned,"test",log,{deadline,signal,planEnv:{LOOP_E2E_DIR:plan?.dir}});
+      selfTime();
       if (statusOf(dir).state === "cancelled") { record("复测",start,{result:"已停止",attempt,evidence:[log,...(plan ? [join(plan.dir,"plan.json")] : [])]}); return quiet("已停止"); }
       if (plan && signal?.aborted) throw new Error("复测执行器已中断；可续跑本次交付。原文：" + log);
       const data = plan ? e2eResult(plan,t.test,result) : legacyResult(t.test,log,result);

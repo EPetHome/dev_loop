@@ -9,8 +9,9 @@ export const readText = (path: string) => readFileSync(path,"utf8");
 export const readJson = <T>(path: string): T => JSON.parse(readText(path));
 export function ifPresent<T>(read: () => T): T | undefined { try { return read(); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; } }
 export const optionalJson = <T>(path: string) => ifPresent(() => readJson<T>(path));
+export const maybe = <T>(read: () => T) => { try { return read(); } catch { return undefined; } };
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
-export function atomicWrite(path: string, text: string): void {
+export function atomicWrite(path: string, text: string | Buffer): void {
   const temp = path + "." + randomUUID() + ".tmp";
   try { mkdirSync(dirname(path),{recursive:true}); writeFileSync(temp,text); renameSync(temp,path); } finally { rmSync(temp,{force:true}); }
 }
@@ -36,3 +37,8 @@ export function lock(path: string, waitMs = 0): () => void {
   }
 }
 export function withLock<T>(path: string, action: () => T, waitMs = 2000): T { const release = lock(path,waitMs); try { return action(); } finally { release(); } }
+export async function underLock<T>(path: string, action: () => Promise<T>, waitMs = 0) {
+  const release = lock(path,waitMs);
+  try { return await action(); }
+  finally { release(); }
+}

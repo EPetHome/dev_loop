@@ -1,12 +1,12 @@
-import { readdirSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
-import { join, basename, resolve } from "node:path";
+import { readdirSync, mkdirSync, writeFileSync, realpathSync, constants, openSync, fstatSync, closeSync, readFileSync, appendFileSync } from "node:fs";
+import { join, basename, dirname, resolve } from "node:path";
 import { hostname } from "node:os";
 import { randomBytes } from "node:crypto";
-import { readCard, parseE2e, noTest, noE2eCommand, InputError, type Card, type Scenario } from "./card.ts";
+import { readCard, parseE2e, noTest, noE2eCommand, InputError, type Card, type Proof, type Scenario } from "./card.ts";
 import { clip } from "./test-summary.ts";
 import { loadConfig, inside, type Config } from "../infra/config.ts";
 import { digest, readJson, writeJson, withLock, jsonLines, appendJson, iso, span, ifPresent, errorText, readText } from "../infra/files.ts";
-import { gitText } from "../infra/git.ts";
+import { commitOf, tree, historyEnv } from "../infra/git.ts";
 import { tasksRoot } from "../infra/paths.ts";
 import type { Identity } from "../infra/exec.ts";
 import { idleSleep } from "../infra/idle-sleep.ts";
@@ -27,7 +27,8 @@ interface Facts {
 const newFacts = (t: Task): Facts => ({name: t.name, startedAt: t.createdAt, resumes: 0, stops: []});
 const labels = {developmentMs:"开发", testMs:"复测", reviewMs:"评审", inputMs:"等你", selfMs:"dev-loop 自身"};
 export type Bucket = keyof typeof labels;
-export type Task = Card["tasks"][number] & {
+export type Task = Omit<Card["tasks"][number],"proofs"> & {
+  proofs?: (Proof & {before: string})[];
   executionId: string; dir: string; repo: string; card: string; cardHash: string; acceptance?: string;
   host: Card["host"]; limits: Card["limits"]; config: Config;
   baseCommit: string; branch: string; worktree: string; createdAt: string; dispatchId: string | null; after?: string[]; next?: string;
@@ -110,15 +111,29 @@ export function fail(dir: string, error: unknown, category?: string, when?: (s: 
   const raw = errorText(error), kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
   update(dir,s => { if (!s.loop.releasePending && !s.loop.released && move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; },undefined,when);
 }
+export function batchResult(t: Task, lines: string[], marker?: string) {
+  const batch = dirname(t.card), file = join(batch,"结果.md");
+  if (!marker) return appendFileSync(file,lines.join("\n"));
+  if (realpathSync.native(batch) !== batch || !inside(t.repo,batch)) throw new InputError("批次目录已移动或越界："+batch);
+  const fd = openSync(file,constants.O_CREAT|constants.O_APPEND|constants.O_RDWR|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o644);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.nlink !== 1) throw new InputError("结果.md 不是批次独有的普通文件："+file);
+    if (!readFileSync(fd,"utf8").split("\n").includes(marker)) appendFileSync(fd,[...lines,marker,""].join("\n"));
+  } finally { closeSync(fd); }
+}
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
 export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {
-  const {repo,card,file:source,cardHash} = readCard(file), task = card.tasks[0]; let config: Config;
-  try { config = loadConfig(repo); } catch (e) { throw new InputError(errorText(e)); }
+  const {repo,card,file:source,cardHash} = readCard(file), task = card.tasks[0];
+  let config: Config;
+  try { config = loadConfig(repo,Boolean(task.proofs?.length)); } catch (e) { throw new InputError(errorText(e)); }
+  const startCommit = !task.proofs?.length && baseCommit || commitOf(repo,baseCommit || "refs/heads/"+card.base,task.proofs?.length ? historyEnv() : undefined);
+  const proofs = task.proofs?.map(p => ({...p,before:p.before ?? startCommit}));
   mkdirSync(root, { recursive: true }); root = realpathSync(root);
   const executionId = [...[basename(repo),card.name,task.name].map(ascii),randomBytes(3).toString("hex")].join("-");
   const dir = join(root,executionId), createdAt = iso(), {acceptance,host,limits,after,next} = card;
-  const t: Task = {...task, executionId,dir,repo,card:source,cardHash,acceptance,host,limits,config,after,next,createdAt,dispatchId,
-    baseCommit:baseCommit || gitText(repo,["rev-parse","refs/heads/"+card.base]), branch:"dev-loop/"+executionId, worktree:join(dir,"worktree")};
+  const t: Task = {...task,proofs,executionId,dir,repo,card:source,cardHash,acceptance,host,limits,config,after,next,createdAt,dispatchId,
+    baseCommit:startCommit,branch:"dev-loop/"+executionId,worktree:join(dir,"worktree")};
   mkdirSync(dir); writeJson(join(dir, "task.json"), t); // 编号碰撞时 mkdir 拒绝覆盖。
   const s = initialStatus(t); writeJson(join(dir,"status.json"),s); idleSleep(dir,true);
   for (const file of ["checks.jsonl","instructions.jsonl"]) writeFileSync(join(dir,file),""); summary(dir,s); return t;
@@ -157,8 +172,10 @@ const stepView = (dir: string, {phase,message,complete}: StepView) => update(dir
   else if (s.state === "working" && s.loop.finisher) move(s,"working",phase,message,s.loop.bucket);
 }, "合入（接受未验证）");
 export const annotate = (dir: string, phase: Phase, message: string) => stepView(dir,{phase,message});
-export function recordStep(dir: string, entry: Omit<Check, keyof Hashes | "tree">, view?: StepView): void {
-  const t = taskOf(dir); let hashes: Hashes = {promptHash:"",acceptanceHash:""};
-  try { const {prompt,acceptance,e2e,...bound} = inputs(t); hashes = bound; } catch {} // 附加步骤仍可单独记录结果。
-  appendCheck(dir,{...entry,...hashes,tree:gitText(t.repo,["rev-parse",entry.commit+"^{tree}"])}); if (view) stepView(dir,view); else summary(dir);
+export function recordStep(dir: string, entry: Omit<Check, keyof Hashes | "tree"> & Partial<Hashes & {tree:string}>, view?: StepView): void {
+  const t = taskOf(dir);
+  let hashes: Hashes = {promptHash:"",acceptanceHash:""};
+  if (entry.promptHash === undefined) try { const {prompt,acceptance,e2e,...bound} = inputs(t); hashes = bound; } catch {} // 附加步骤可单独记录。
+  appendCheck(dir,{...hashes,...entry,tree:entry.tree ?? tree(t.repo,entry.commit)});
+  if (view) stepView(dir,view); else summary(dir);
 }

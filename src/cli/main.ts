@@ -1,7 +1,7 @@
 import { mkdirSync, existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { APP_ROOT, tasksRoot } from "../infra/paths.ts";
-import { appendJson, jsonLines, withLock, readText, errorText } from "../infra/files.ts";
+import { appendJson, ifPresent, jsonLines, withLock, readText, errorText } from "../infra/files.ts";
 import { createTask, taskOf, statusOf, allTasks, locate, LoopError, type Task } from "../core/store.ts";
 import { InputError, UnsupportedError } from "../core/card.ts";
 import { confirmDelivery, deliver } from "../core/deliver.ts";
@@ -9,6 +9,7 @@ import { resume, stop } from "../core/lifecycle.ts";
 import { merge } from "../steps/merge.ts";
 import { push, type PushResult } from "../steps/push.ts";
 import { deploy, rollback } from "../steps/deploy.ts";
+import { prove } from "../steps/proof.ts";
 import { validateStart } from "./start.ts";
 import { finish } from "./finish.ts";
 import { queued } from "./queue.ts";
@@ -93,6 +94,13 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   if(o.command==="陪跑") { const dir=select(o); await companion(dir); return {executionId:taskOf(dir).executionId}; }
   if(o.command==="释放") return releaseWorktree(select(o));
   if(o.command==="收尾") return finish(select(o),o.automatic);
+  if (o.command === "证明") {
+    const id = o.target;
+    if (!id || !/^[a-zA-Z0-9_-]+$/.test(id) || o.all) throw new InputError("证明须指定一个执行编号");
+    const t = ifPresent(() => taskOf(join(root,id)));
+    if (t?.executionId !== id || o.task && o.task !== t.name) throw new InputError("找不到该执行或任务名不符");
+    return prove(t);
+  }
   if (["合入","退回","部署"].includes(o.command)) {
     const dir = select(o); return queued(dir,async () => {
       if (o.command === "部署") return deploy(dir,o);

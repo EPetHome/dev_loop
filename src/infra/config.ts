@@ -20,16 +20,18 @@ export function loadSnapshot(repo: string): string | undefined {
   const path = projectConfig(repo)?.snapshot;
   if (path !== undefined && !safeRelative(path)) throw new Error("snapshot 须为仓库内可执行文件的相对路径"); return path;
 }
-export interface Config { reviewerModel: string; reviewerThinking: string; reviewerCmd: string; localFiles: string[]; setup: string }
+export interface Config { reviewerModel: string; reviewerThinking: string; reviewerCmd: string; localFiles: string[]; setup: string; proofTestDirs?: string[] }
 export const safeRelative = (path: unknown): path is string => typeof path === "string" && !!path && !isAbsolute(path) &&
   !path.split(/[\\/]/).some(p => p === ".." || p === ".git") && !/[\0\r\n]/.test(path);
 export const pathPatterns = (v: unknown): v is string[] => Array.isArray(v) && v.every(p => safeRelative(p) && p !== ".");
 export const inside = (root: string, file: string) => { const r = relative(root, file); return r !== ".." && !r.startsWith("../") && !isAbsolute(r); };
-export function loadConfig(repo: string): Config {
+export function loadConfig(repo: string, proofs = false): Config {
   const config = projectConfig(repo), raw = config === undefined ? {} : config; if (!isObject(raw)) throw new Error(".autoreview.json 须为对象");
+  const proofTestDirs = proofs ? raw.proofTestDirs : undefined;
+  if (proofTestDirs !== undefined && (!Array.isArray(proofTestDirs) || !proofTestDirs.every(d => typeof d === "string" && d.trim()))) throw new Error("proofTestDirs 须为测试目录数组");
   for (const key of ["reviewerModel", "reviewerThinking", "reviewerCmd", "setup"])
     if (raw[key] !== undefined && (typeof raw[key] !== "string" || raw[key].includes("\0"))) throw new Error(key + " 须为字符串");
   const localFiles = raw.localFiles ?? []; if (!pathPatterns(localFiles)) throw new Error("localFiles 须为仓库内相对路径数组");
   return { reviewerModel: raw.reviewerModel || "openai-codex/gpt-6.2-astra", reviewerThinking: raw.reviewerThinking || "xhigh",
-    reviewerCmd: raw.reviewerCmd || "", setup: raw.setup || "", localFiles };
+    reviewerCmd: raw.reviewerCmd || "", setup: raw.setup || "", localFiles, proofTestDirs };
 }

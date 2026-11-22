@@ -1,6 +1,6 @@
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { gitText, repoRoot } from "../infra/git.ts";
+import { commitOf, gitText, repoRoot, historyEnv } from "../infra/git.ts";
 import { digest, errorText, readText } from "../infra/files.ts";
 import { inside, isObject, pathPatterns } from "../infra/config.ts";
 import { HOOK_TIMEOUT_SEC, HOOK_OVERHEAD_SEC } from "../infra/host-limits.ts";
@@ -11,11 +11,14 @@ export interface Limit { maxRepairs: number; timeoutMin: number }
 export type Observation = string | number | boolean | null;
 type Checkpoint = string | {id: string; expected: Observation};
 export interface Scenario { id: string; paths?: string[]; checks: Checkpoint[]; dependencies?: string[] }
+export type Proof = {
+  issue: string; before?: string; testFiles: string[]; test: string; expected: Observation; beforeActual: Observation;
+} & ({scenario: string; checkpoint: string; testName?: never} | {testName: string; scenario?: never; checkpoint?: never});
 export const noTest = (test: string) => /^无\s*[:：]/.test(test);
 export const noE2eCommand = "声明了 E2E 场景，却没有执行命令";
 export interface Card {
   version: 1; name: string; base: string; target: "dev"; host: "pi" | "claude" | "codex"; flow: string[]; after: string[]; next?: string;
-  tasks: { name: string; prompt: string; scope: Scope; test: string; e2e?: Scenario[] }[]; acceptance?: string;
+  tasks: { name: string; prompt: string; scope: Scope; test: string; e2e?: Scenario[]; proofs?: Proof[] }[]; acceptance?: string;
   limits: { 测试: Limit; 开发评审: Limit; 部署: Limit };
 }
 const object = (v: any, label: string, keys?: string) => {
@@ -44,6 +47,20 @@ export const parseE2e = (value: unknown): Scenario[] => list(value,"e2e",v => {
   if (!steps.length) throw new InputError("e2e.checks 不能为空");
   return {id:text(id,"场景 id"),paths,checks:steps,dependencies:dependencies === undefined ? undefined : list(dependencies,"e2e.dependencies",d => text(d,"外部依赖"),d => d)};
 },s => s.id);
+const parseProofs = (value: unknown, repo: string) => list<Proof>(value,"proofs", entry => {
+  const {issue,before,testFiles,test,expected,beforeActual,scenario,checkpoint,testName} = object(entry,"proofs 项",
+    "issue before testFiles test expected beforeActual scenario checkpoint testName");
+  if (!observed(expected) || !observed(beforeActual) || expected === beforeActual) throw new InputError("proofs 须声明不同的 JSON 标量 expected 和 beforeActual");
+  const files = list(testFiles,"proofs.testFiles",path => text(path,"测试材料路径"),path => path);
+  if (!files.length) throw new InputError("proofs.testFiles 不能为空");
+  const command = text(test,"proofs.test"); if (noTest(command)) throw new InputError("proofs.test 须为实际执行命令");
+  const old = before === undefined ? undefined : commitOf(repo,text(before,"旧版提交"),historyEnv());
+  const common = {issue:text(issue,"问题单标识"),before:old,
+    testFiles:files.sort((a,b) => a < b ? -1 : Number(a > b)),test:command,expected,beforeActual};
+  if (testName === undefined) return {...common,scenario:text(scenario,"proofs.scenario"),checkpoint:text(checkpoint,"proofs.checkpoint")};
+  if (scenario !== undefined || checkpoint !== undefined) throw new InputError("proofs 每项只选场景及检查点，或定向测试名");
+  return {...common,testName:text(testName,"proofs.testName")};
+}, p => JSON.stringify(p));
 function reference(value: any, file: string, repo: string, label: string): string {
   const raw = text(value,label); if (isAbsolute(raw)) throw new InputError(label+" 须相对卡所在目录");
   const path = realpathSync(resolve(dirname(file),raw)), info = statSync(path);
@@ -87,7 +104,7 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
   gitText(repo, ["check-ref-format", "--branch", base]);
   gitText(repo, ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + base + "^{commit}"]);
   const host = raw.host ?? "pi"; if (!["pi","claude","codex"].includes(host)) throw new InputError("host 须为 pi/claude/codex");
-  const task = object(raw.tasks[0],"任务","name prompt scope test limits e2e"), name = text(task.name,"任务名");
+  const task = object(raw.tasks[0],"任务","name prompt scope test limits e2e proofs"), name = text(task.name,"任务名");
   const test = task.test === undefined ? "无：卡未选择测试" : text(task.test, "test"), e2e = task.e2e === undefined ? undefined : parseE2e(task.e2e);
   if (raw.flow.includes("测试") && task.test === undefined && !e2e) throw new InputError("测试 flow 要求填写 test 或「无：原因」");
   if (noTest(test) && !/^无\s*[:：]\s*\S/.test(test)) throw new InputError("无测试须写原因");
@@ -98,7 +115,8 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
     `${host} Stop hook 外层时限为 ${HOOK_TIMEOUT_SEC} 秒；复测和评审合计加 ${HOOK_OVERHEAD_SEC} 秒余量需要 ${hookBudgetSec} 秒，不支持此配置。`+
     `请降低两项 timeoutMin 合计至 ${(HOOK_TIMEOUT_SEC-HOOK_OVERHEAD_SEC)/60} 分钟以内，或改用 pi。`);
   return { version: 1, name: text(raw.name, "name"), base, target: "dev", host, flow: raw.flow, after: raw.flow.filter((s: string) => order.indexOf(s) >= 2),
-    tasks:[{name,prompt:reference(task.prompt,file,repo,"prompt"),scope:parseScope(task.scope),test,e2e}], limits:effectiveLimits,
+    tasks:[{name,prompt:reference(task.prompt,file,repo,"prompt"),scope:parseScope(task.scope),test,e2e,
+      proofs:task.proofs === undefined ? undefined : parseProofs(task.proofs,repo)}], limits:effectiveLimits,
     next:raw.next === undefined ? undefined : reference(raw.next,file,repo,"next"),
     acceptance:raw.acceptance ? reference(raw.acceptance,file,repo,"acceptance") : undefined};
 }

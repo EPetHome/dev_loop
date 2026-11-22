@@ -1,10 +1,10 @@
-import { appendFileSync, lstatSync, writeFileSync } from "node:fs";
+import { lstatSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { checkout } from "../infra/checkout.ts";
 import { changes, gitText, gitTry, head, releaseChanges, worktreeOf } from "../infra/git.ts";
 import { withLock, iso, span, readText, errorText } from "../infra/files.ts";
 import { APP_ROOT } from "../infra/paths.ts";
-import { taskOf, statusOf, checksOf, lastTest, update, recordStep, inputs, sameInputs, ENV_WAIT, type ReleasePending, type Status, type Task } from "../core/store.ts";
+import { taskOf, statusOf, checksOf, lastTest, update, recordStep, inputs, sameInputs, ENV_WAIT, batchResult, type ReleasePending, type Status, type Task } from "../core/store.ts";
 import { InputError } from "../core/card.ts";
 import { onTaskBranch, undeliveredCommit, waitingForDelivery } from "../core/deliver.ts";
 import { snapshot, differences } from "../core/snapshot.ts";
@@ -83,7 +83,7 @@ export const releaseWorktree = (dir: string, fromFinish = false) => withLock(ope
   if (!saved || saved.result !== result) recordStep(dir,{step:"释放",result,commit,...span(start),startedAt:pending?.at || iso(start),evidence:[],detail});
   const released = result === "已释放", note = released ? "工作区已释放" : result === "保留" ? "工作区有未提交文件，已保留" : "";
   if (pending?.auto && note) try {
-    const report = join(dirname(t.card),"结果.md"), line = `${note}（${t.executionId}，${pending.at}）\n`; if (!readText(report).includes(line)) appendFileSync(report,line);
+    batchResult(t,[],`${note}（${t.executionId}，${pending.at}）`);
   } catch (e) { console.error("写入释放说明失败：", e); }
   finishRelease(released,note); return {executionId:t.executionId,released};
 });
