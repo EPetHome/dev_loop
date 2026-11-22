@@ -50,7 +50,8 @@ function indexed(rows: unknown, expected: string[], label: string) {
   return found;
 }
 export interface Measurement {status:string; actual:Observation}
-export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: string, run?: ExecResult, witness?: (target: Measurement) => void) {
+export type ReportExit = Pick<ExecResult,"code"|"killed">;
+export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: string, run?: ReportExit, witness?: (target: Measurement) => void) {
   const files = ["test.log","plan.json","result.json"].map(p => join(dir,p)), evidence = new Set(files.slice(0,2));
   const ids = plan.scenarios.map(s => s.id), missing = new Set(ids), notes: string[] = [], failures: string[] = [];
   const statuses = ["通过","失败","未验证"];

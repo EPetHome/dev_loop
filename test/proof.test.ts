@@ -47,8 +47,8 @@ test('原单重投',t=>{
   t.diagnostic('observation:'+JSON.stringify({actual,expected})); assert.equal(actual,expected,'原单重投');
 });
 test('未选中的其他用例',()=>{ assert.fail('不应执行'); });`;
-function project(t: TestContext, {old = "bug", dep = "old", earlierFailure = false, buildError = false}: {
-  old?: "bug" | "fixed"; dep?: string | null; earlierFailure?: boolean; buildError?: boolean;
+function project(t: TestContext, {old = "bug", dep = "old", earlierFailure = false, buildError = false, caseSource = cases}: {
+  old?: "bug" | "fixed"; dep?: string | null; earlierFailure?: boolean; buildError?: boolean; caseSource?: string;
 } = {}) {
   const f = fixture(t,{test:"true",config:{proofTestDirs:["test"],setup:"node src/build.cjs"}});
   write(join(f.repo,"src/inbox.cjs"),inbox(old)); write(join(f.repo,"src/build.cjs"),build);
@@ -64,7 +64,7 @@ function project(t: TestContext, {old = "bug", dep = "old", earlierFailure = fal
     const w = task.worktree;
     write(join(w,"src/inbox.cjs"),inbox(kind,extraStarts)); write(join(w,"src/lock.json"),'{"dep":"fixed"}'); write(join(w,"src/compile.cjs"),"// valid\n");
     for (const name of ["proof-scenario.cjs","proof-unit.cjs"]) write(join(w,"test",name),readText(join(ROOT,"test",name)));
-    write(join(w,"test/proof-fixture-helper.cjs"),helper); write(join(w,"test/proof-cases.cjs"),cases);
+    write(join(w,"test/proof-fixture-helper.cjs"),helper); write(join(w,"test/proof-cases.cjs"),caseSource);
     mkdirSync(join(w,testDir),{recursive:true}); writeFileSync(join(w,testDir,"order.bin"),seed);
     return deliver(task.dir).commit;
   };
@@ -324,6 +324,50 @@ test("必修 3：未发布的归档串入其他步骤或结论时，不能写入
   assert.ok(old.every((r: any,i: number) => readText(r.report) === tampered[i] && !readText(f.batch).includes(r.attempt)));
   assert.deepEqual(checks(task.dir).map(c => c.result),["已证明","已证明"]);
   assert.equal(checked(task.dir,commit),false); assert.equal(batchCount(f.batch),2);
+});
+
+test("本轮必修：总结果声明串项，不能用 A 的已证明证据给 B 补登记或复用", async t => {
+  const testName = "另一个目标", testLabel = JSON.stringify(testName);
+  const f = project(t,{caseSource:cases+`\ntest(${testLabel},t=>{
+  const actual=1,expected=1;
+  t.diagnostic('observation:'+JSON.stringify({actual,expected})); assert.equal(actual,expected,${testLabel});
+});`});
+  const task = await f.start([{...unit,issue:"A"},{...unit,issue:"B",testName,test:unit.test+` '^${testName}$'`}]);
+  f.submit(task);
+  const ledger = join(task.dir,"checks.jsonl"), before = readText(ledger), [a,b] = await f.run(task);
+  assert.equal(a.result,"已证明"); assert.equal(b.result,"未证明");
+  assert.deepEqual([a.proof.before,a.proof.expected,a.proof.beforeActual],[b.proof.before,b.proof.expected,b.proof.beforeActual]);
+  write(ledger,before); rmSync(f.batch); // 模拟总结果已落盘，但尚未登记。
+  const tampered = JSON.stringify({...getJson(a.report),proof:b.proof});
+  write(a.report,tampered);
+  const {proofs:[newA,newB],ignoredAttempts} = await f.receipt(task);
+  assert.equal(newB.result,"未证明"); assert.equal(newB.reused,false);
+  assert.deepEqual([newB.beforeRun.observation.actual,newB.afterRun.observation.actual],[1,1]);
+  assert.equal(newA.result,"已证明"); assert.notEqual(newA.attempt,a.attempt);
+  assert.match(ignoredAttempts.find((entry: any) => entry.attempt === a.attempt).reason,/总计划.*声明/);
+  assert.ok(!checks(task.dir).some(c => c.attempt === a.attempt));
+  assert.ok(!readText(f.batch).includes(`<!-- dev-loop-proof:${a.attempt} -->`));
+  assert.equal(readText(a.report),tampered);
+});
+
+test("归档报告的摘要吻合，也不能把另一用例或检查点当作本次目标", async t => {
+  const f = project(t), task = await f.start([unit,scene]); f.submit(task);
+  const [u,e] = await f.run(task);
+  const substitute = (r: any, path: string, update: (report: any) => void) => {
+    assert.equal(r.result,"已证明");
+    const file = join(dirname(r.report),path), report = getJson(file);
+    update(report);
+    const bytes = JSON.stringify(report);
+    write(file,bytes);
+    write(r.report,JSON.stringify({...getJson(r.report),evidenceHashes:{...r.evidenceHashes,[path]:digest(bytes)}}));
+  };
+  substitute(u,"before/result.json",report => { report.testName = "另一用例"; });
+  substitute(e,"after/result.json",report => { report.scenarios[0].steps[0].id = "另一检查点"; });
+  const {proofs,ignoredAttempts} = await f.receipt(task);
+  assert.deepEqual(proofs.map((r: any) => [r.result,r.reused]),[["已证明",false],["已证明",false]]);
+  const rejected = (id: string) => ignoredAttempts.find((entry: any) => entry.attempt === id).reason;
+  assert.match(rejected(u.attempt),/未命中定向测试名/);
+  assert.match(rejected(e.attempt),/多报编号.*另一检查点/);
 });
 
 test("证明只接受执行号；未交付拒绝，未声明不建证明目录；不存在的旧 SHA 不开工", async t => {

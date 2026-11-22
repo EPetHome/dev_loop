@@ -1,12 +1,13 @@
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { privateCheckout } from "../infra/checkout.ts";
 import { inside, isObject, safeRelative } from "../infra/config.ts";
 import { atomicWrite, BusyError, digest, errorText, ifPresent, readJson, span, underLock, withLock, writeJson } from "../infra/files.ts";
 import { checkPin, git, gitBytes, historyEnv } from "../infra/git.ts";
 import { InputError, observed, type Observation } from "../core/card.ts";
-import { boundReport, e2eResult, evidenceFile, planIn, requireReport, type Measurement } from "../core/e2e.ts";
+import { boundReport, e2eResult, evidenceFile, planIn, requireReport, type Measurement, type ReportExit } from "../core/e2e.ts";
 import { batchResult, checksOf, recordStep, statusOf, type Check, type Hashes, type Task } from "../core/store.ts";
 import { clip } from "../core/test-summary.ts";
 import { projectCommand } from "../core/run.ts";
@@ -97,10 +98,28 @@ function sandbox(cwd: string, {t,env}: Pair) {
   return {...env,PATH:PATH || "/usr/bin:/bin",HOME,TMPDIR,XDG_CONFIG_HOME:join(HOME,"config"),XDG_CACHE_HOME:join(HOME,"cache"),
     XDG_DATA_HOME:join(HOME,"data"),GIT_ALLOW_PROTOCOL:"file",GIT_LITERAL_PATHSPECS:undefined};
 }
-async function replay(pair: Pair, commit: string, dir: string) {
-  const {t,p,attempt,binding,env,signal} = pair, ids = {executionId:t.executionId,attempt,commit}, {expected} = p;
-  const plan = p.scenario === undefined ? {...ids,testName:p.testName,expected}
+function attemptPlan(t: Task, p: Proof, binding: Binding, attempt: string) {
+  return {executionId:t.executionId,attempt,proof:p,setup:t.config.setup,timeoutMin:t.limits.测试.timeoutMin,...binding};
+}
+function replayPlan({t,p,attempt,binding}: Pick<Pair,"t"|"p"|"attempt"|"binding">, commit: string) {
+  const ids = {executionId:t.executionId,attempt,commit}, {expected} = p;
+  return p.scenario === undefined ? {...ids,testName:p.testName,expected}
     : {...binding,...ids,scenarios:[{id:p.scenario,checks:[{id:p.checkpoint,expected}]}]};
+}
+function readObservation(dir: string, plan: ReturnType<typeof replayPlan>, p: Proof, run: ReportExit, evidence: Set<string>): Target {
+  if ("scenarios" in plan) {
+    let witness: Measurement | undefined;
+    const result = e2eResult({dir,plan},p.test,run,o => { witness = o; });
+    for (const file of result.evidence) evidence.add(file);
+    requireReport(witness,result.detail);
+    return {...witness,expected:p.expected};
+  }
+  const {actual,status,testName,expected} = boundReport<Target & {testName:string}>(dir,plan,evidence);
+  requireReport(testName === plan.testName && observed(actual) && observed(expected),"未命中定向测试名或缺少有效预期/实得："+plan.testName);
+  return {actual,status,expected};
+}
+async function replay(pair: Pair, commit: string, dir: string) {
+  const {t,p,env,signal} = pair, {expected} = p, plan = replayPlan(pair,commit);
   planIn(dir,plan);
   const scene = "scenarios" in plan, evidence = new Set([join(dir,"plan.json")]), warnings: string[] = [];
   const deadline = Date.now()+t.limits.测试.timeoutMin*60000;
@@ -117,15 +136,7 @@ async function replay(pair: Pair, commit: string, dir: string) {
       requireReport(run,"证明命令没有执行");
       code = run.code;
       verify();
-      if (scene) {
-        const result = e2eResult({dir,plan},p.test,run,o => { observation = {...o,expected}; });
-        for (const f of result.evidence) evidence.add(f);
-        requireReport(observation,result.detail);
-      } else {
-        const {actual,status,testName,expected:want} = boundReport<Target & {testName:string}>(dir,plan,evidence);
-        requireReport(testName === p.testName && observed(actual) && observed(want),"未命中定向测试名或缺少有效预期/实得："+p.testName);
-        observation = {actual,status,expected:want};
-      }
+      observation = readObservation(dir,plan,p,run,evidence);
       const pass = observation.actual === expected, red = scene ? 1 : 76;
       requireReport(!run.killed && observation.expected === expected && observation.status === (pass ? "通过" : "失败") && run.code === (pass ? 0 : red),"目标断言的预期、实得、状态或命令退出码不一致");
     },warning => warnings.push(warning));
@@ -149,7 +160,7 @@ function hashEvidence(dir: string, evidence: string[]) {
 }
 async function advance(t: Task, p: Proof, binding: Binding, root: string, signal: AbortSignal) {
   const attempt = randomUUID(), start = Date.now(), dir = join(root,attempt), report = join(dir,"result.json");
-  const plan = {executionId:t.executionId,attempt,proof:p,setup:t.config.setup,timeoutMin:t.limits.测试.timeoutMin,...binding};
+  const plan = attemptPlan(t,p,binding,attempt);
   planIn(dir,plan);
   const evidence = [report,join(dir,"plan.json")];
   let beforeRun: Awaited<ReturnType<typeof replay>> | undefined, afterRun: typeof beforeRun, reason: string | undefined;
@@ -185,7 +196,7 @@ type Attempt = Awaited<ReturnType<typeof advance>>;
 type Verdict = "已证明" | "未证明";
 const proofVerdict = (value: unknown): value is Verdict => value === "已证明" || value === "未证明";
 const objectRecord = (value: unknown): value is Record<string,unknown> => isObject(value);
-function recoverAttempt(t: Task, dir: string, attempt: string): Attempt {
+function loadVerifiedAttempt(t: Task, dir: string, attempt: string): Attempt {
   requireReport(realpathSync.native(dir) === dir,"证明尝试目录已改变："+dir);
   const report = evidenceFile(dir,"result.json"), r = readJson<unknown>(report);
   requireReport(objectRecord(r) && r.executionId === t.executionId && r.attempt === attempt && r.report === report,"证明归档与执行或尝试不符");
@@ -200,18 +211,26 @@ function recoverAttempt(t: Task, dir: string, attempt: string): Attempt {
   const hashes = hashEvidence(dir,r.evidence);
   requireReport(Object.keys(hashes).length === Object.keys(r.evidenceHashes).length,"证明证据摘要清单不完整");
   for (const [path,sha256] of Object.entries(hashes)) requireReport(r.evidenceHashes[path] === sha256,"证明证据摘要不符："+path);
+  const binding = {commit:r.commit,tree:r.tree,promptHash:r.promptHash,acceptanceHash:r.acceptanceHash,e2eHash:r.e2eHash};
+  const recorded = readJson<unknown>(evidenceFile(dir,"plan.json"));
+  requireReport(JSON.stringify(recorded) === JSON.stringify(attemptPlan(t,declaration,binding,attempt)),"总计划与证明归档的声明或版本不符");
   if (r.result === "已证明") {
     const red = declaration.scenario === undefined ? 76 : 1;
     for (const [side,run,commit,code,status,actual] of [
       ["before",r.beforeRun,declaration.before,red,"失败",declaration.beforeActual],
       ["after",r.afterRun,r.commit,0,"通过",declaration.expected],
     ] as const) {
-      requireReport(objectRecord(run) && run.commit === commit && run.code === code && !run.reason && objectRecord(run.observation) &&
-        run.observation.status === status && run.observation.actual === actual && run.observation.expected === declaration.expected,"已证明的尝试两端实得或结论不符："+side);
+      requireReport(objectRecord(run) && run.commit === commit && run.code === code && !run.reason,"已证明的尝试两端实得或结论不符："+side);
       for (const name of ["plan.json","result.json","test.log"]) {
         const path = side+"/"+name;
         requireReport(Object.hasOwn(hashes,path),"已证明的尝试缺少两端原始证据："+path);
       }
+      const origEvidence = new Set<string>();
+      const plan = replayPlan({t,p:declaration,attempt,binding},commit);
+      const original = readObservation(join(dir,side),plan,declaration,{code,killed:false},origEvidence);
+      requireReport(original.status === status && original.actual === actual && original.expected === declaration.expected &&
+        isDeepStrictEqual(original,run.observation),"归档报告与本次目标断言或实得不符："+side);
+      for (const file of origEvidence) requireReport(Object.hasOwn(hashes,relative(dir,file)),"归档报告引用了未绑定的证据："+relative(dir,file));
     }
   }
   return r as Attempt;
@@ -242,7 +261,7 @@ export async function prove(t: Task) {
     const ignoredAttempts: {attempt:string; report:string; reason:string}[] = [];
     const readSaved = (attempt: string) => {
       const parent = join(root,attempt);
-      try { return recoverAttempt(t,parent,attempt); }
+      try { return loadVerifiedAttempt(t,parent,attempt); }
       catch (error) { ignoredAttempts.push({attempt,report:join(parent,"result.json"),reason:errorText(error)}); }
     };
     const saved = readdirSync(root,{withFileTypes:true}).flatMap(e => {
@@ -259,8 +278,12 @@ export async function prove(t: Task) {
         const matches = (r: Attempt) => r.result === "已证明" && r.commit === binding.commit && r.tree === binding.tree && JSON.stringify(r.proof) === JSON.stringify(p);
         const matching = saved.find(matches), current = matching && readSaved(matching.attempt);
         const old = current && matches(current) ? current : undefined;
-        const r = old || await advance(t,p,binding,root,controller.signal);
-        if (!old) publish(t,r);
+        let r = old;
+        if (!r) {
+          const fresh = await advance(t,p,binding,root,controller.signal);
+          r = loadVerifiedAttempt(t,dirname(fresh.report),fresh.attempt);
+          publish(t,r);
+        }
         proofs.push({...r,reused:Boolean(old)});
       }
       return {executionId,commit:binding.commit,proofs,...(ignoredAttempts.length ? {ignoredAttempts} : {})};
