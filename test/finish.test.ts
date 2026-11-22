@@ -87,6 +87,28 @@ test("Git 拒绝删除时记释放失败及原始错误，不影响已通过的�
   assert.doesNotMatch(done.message,/工作区已释放/);
   assert.doesNotMatch(readFileSync(join(f.repo,"结果.md"),"utf8"),/工作区已释放/);
 });
+test("自动释放中断遇 Git 锁：手工释放不消费意图，由收尾补记一次失败", async t => {
+  const f = await delivered(t,{card:{flow:flow.slice(0,3)}}), {dir,worktree,executionId} = f.task;
+  reviewed(f.task,f.commit); transition(dir,"working","收尾中","待收尾",null);
+  f.git("worktree","lock","--reason","keep interrupted fixture",worktree);
+  const deletion = await gateRemoval(t,f,"收尾","before");
+  deletion.proceed(); assert.equal((await deletion.exited).code,71);
+  const pending = statusOf(dir), checks = checksOf(dir), merged = f.git("rev-parse","dev");
+  assert.equal(pending.loop.releasePending?.auto,true);
+  await assert.rejects(f.cli(["释放",executionId,"--json"]),(e: {code:number; stderr:string})=>{
+    assert.equal(e.code,1); assert.ok(JSON.parse(e.stderr).error.raw.includes("bin/loop 收尾 " + executionId)); return true;
+  });
+  assert.deepEqual(statusOf(dir),pending); assert.deepEqual(checksOf(dir),checks);
+  const done = JSON.parse((await f.cli(["收尾",executionId,"--json"])).stdout);
+  assert.equal(done.state,"completed"); assert.equal(done.loop.phase,"已合入"); assert.equal(done.loop.released,false);
+  assert.equal(done.loop.releasePending,null); assert.equal(f.git("rev-parse","dev"),merged);
+  assert.equal(readFileSync(join(worktree,"src/app.txt"),"utf8"),"good delivered\n");
+  const after = checksOf(dir); assert.deepEqual(after.slice(0,-1),checks);
+  const failed = after.at(-1)!; assert.equal(failed.step,"释放"); assert.equal(failed.result,"失败");
+  assert.match(failed.detail!,/fatal: .*locked working tree.*keep interrupted fixture/);
+  await assert.rejects(f.cli(["收尾",executionId,"--json"]),/当前不在待收尾/);
+  assert.deepEqual(checksOf(dir),after);
+});
 test("慢删除不持有状态锁；删完即崩溃后手工收尾只补登记，不重放已成功的步骤", async t => {
   const f = await finishingFixture(t,{flow}), {dir,worktree} = f.task;
   f.git("init","--bare",join(f.base,"origin.git")); f.git("remote","add","origin",join(f.base,"origin.git")); f.git("push","origin","dev");

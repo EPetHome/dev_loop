@@ -47,6 +47,7 @@ function releaseTarget({repo,branch,worktree}: Task, expected?: ReleasePending["
 export const releaseWorktree = (dir: string, fromFinish = false) => withLock(operationPath(dir), () => {
   const t = taskOf(dir), s = statusOf(dir), commit = s.loop.commit || t.baseCommit, start = Date.now(); let pending = s.loop.releasePending;
   if (fromFinish && !pending?.auto) return {executionId:t.executionId,released:Boolean(s.loop.released)};
+  if (!fromFinish && pending?.auto) throw new InputError("自动释放尚未结束；请运行 bin/loop 收尾 " + t.executionId + " 补齐");
   const requireCompleted = (s: Status) => { if (s.state !== "completed" || s.loop.released) throw new InputError(s.loop.released ? "工作区已释放" : "未完成，无法释放工作区"); }; requireCompleted(s);
   const finishRelease = (released = false, note = "") => update(dir,current=>{
     requireCompleted(current); current.loop.releasePending = null; if (released) current.loop.released = true;
@@ -64,9 +65,8 @@ export const releaseWorktree = (dir: string, fromFinish = false) => withLock(ope
       update(dir,current=>{ requireCompleted(current); current.loop.releasePending = pending; }); clearCheck(t);
       if (releaseTarget(t,target)) {
         const {code,stderr,stdout} = gitTry(t.repo,["-c","status.showUntrackedFiles=all","-c","core.fsmonitor=false","worktree","remove",t.worktree]);
-        if (code && !fromFinish) try {
-          if (releaseTarget(t,target)) finishRelease();
-        } catch {} // 无法核实时保留意图，不覆盖 Git 原错。
+        if (code && !pending.auto) try { if (releaseTarget(t,target)) finishRelease(); }
+        catch {} // 无法核实时保留意图，不覆盖 Git 原错。
         if (code) throw new Error(stderr || stdout);
       }
     }
