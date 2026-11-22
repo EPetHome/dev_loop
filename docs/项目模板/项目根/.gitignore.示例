@@ -2,3 +2,5 @@
 .autoreview.json
 # 只在本机存在、不进仓库的文件；.autoreview.json 的 localFiles 要列出同样的路径。
 .env.local
+# 协调工具的本机报告、决定回执和恢复原件，不进仓库。
+/.dev-loop-coord/
