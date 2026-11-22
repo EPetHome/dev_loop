@@ -20,7 +20,7 @@ export const PASS = "## 结论：通过\n## 必修\n无\n## 小问题\n- 建议�
 export const MUST = "## 结论：需返修\n## 必修\n1. 位置：src/app.txt:1\n   触发：输入 bad 时\n   问题：返回错误结果\n   依据：需求 A1\n   建议：修正结果\n## 小问题\n- 不要退回此建议\n## 需求疑问\n- 不要退回此疑问\n## 上轮必修复查\n无\n";
 export const getJson = <T = any>(p: string): T => JSON.parse(readFileSync(p, "utf8"));
 export const write = (p: string, s: string) => { mkdirSync(resolve(p, ".."), { recursive: true }); writeFileSync(p, s); };
-export function fixture(t: {after: (f: () => any) => any}, options: {test?: string; reviewer?: string; config?: any; card?: any} = {}) {
+export function fixture(t: {after: (f: () => any) => any}, options: {test?: string; reviewer?: string; config?: any; card?: any; cliTimeoutMs?: number} = {}) {
   const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, "tasks");
   mkdirSync(repo); mkdirSync(root);
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
@@ -57,7 +57,7 @@ export function fixture(t: {after: (f: () => any) => any}, options: {test?: stri
   return {base, repo, root, card, raw, git, env,
     async prepare() { task = createTask(card, root); await prepare(task.dir); return task; },
     async cli(args: string[], cwd = repo, extraEnv: NodeJS.ProcessEnv = {}) {
-      return promisify(execFile)(join(ROOT, "bin/loop"), args, {cwd, env: {...env, ...extraEnv}, timeout: 15000});
+      return promisify(execFile)(join(ROOT, "bin/loop"), args, {cwd, env: {...env, ...extraEnv}, timeout: options.cliTimeoutMs ?? 15000});
     }
   };
 }
