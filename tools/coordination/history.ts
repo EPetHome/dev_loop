@@ -8,7 +8,7 @@ export interface Execution {
   checks: Check[]; ledgerOK: boolean; read: Reader;
 }
 export interface Batch { key: string; card: string; name: string; dir: string; results: string; acceptance: string; runs: Execution[] }
-export type Deployment = { at?: number; began?: number; source: Ref; result: string; commit: string; execution: string; bound: boolean };
+export type Deployment = { at?: number; began?: number; source: Ref; result: string; commit: string; execution: string; bound: boolean; evidenceDir?: string };
 export const deployedOK = (d?: Deployment) => !!d && ["已部署","已部署（未检查）"].includes(d.result);
 export const delivered = (run: Execution) => str(object(run.loop.delivery).commit) || str(run.loop.commit);
 export const official = (check: Check) => check.step === "评审" && ["通过", "必修"].includes(check.result);
@@ -147,7 +147,10 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
     const bound = versions.has(c.commit);
     // 自动部署可能在试合并版本上失败、尚未留下合入记录。它仍是本执行确实改动过线上的尝试。
     if (!history && !bound) return [];
-    return [{at:time(c.value.endedAt), began:time(c.value.startedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id,bound}];
+    const evidence = c.evidence[c.step === "部署" ? 1 : 0];
+    const evidenceDir = evidence && run.read.get(c.source.file,()=>taskFile(run,evidence));
+    return [{at:time(c.value.endedAt), began:time(c.value.startedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id,bound,
+      evidenceDir:evidenceDir || undefined}];
   });
   // 缺时只用唯一、同执行同版的旧批次结果段补齐；已记录的退回和多次部署不由旧摘要覆盖。
   const last = result.at(-1);
@@ -166,7 +169,7 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
       if (key !== "部署时间" || execution !== run.id || !registered.has(commit) || !sha(commit)) continue;
       if (last && !mergeFacts(run,commit).versions.has(last.commit)) continue;
       const at = time(value);
-      if (at !== undefined) notes.push({at, began:last?.began, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution,bound:true});
+      if (at !== undefined) notes.push({at, began:last?.began, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution,bound:true,evidenceDir:last?.evidenceDir});
     }
   }
   return notes.length === 1 ? notes : result;
@@ -174,12 +177,34 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
 
 const affectsLive = (d: Deployment) => deployedOK(d) || ["已退回","退回失败"].includes(d.result) ||
   (d.result.startsWith("部署失败") && d.result !== "部署失败，已回退");
+type DeploymentLedger = {run: Execution; records: Deployment[]};
+function restoredDeployment(project: Project, ledgers: DeploymentLedger[], current: {run: Execution; event: Deployment}) {
+  const {run,event:rollback} = current, dir = rollback.evidenceDir;
+  if (!run.ledgerOK || rollback.result !== "已退回" || !dir) return;
+  const attempt = run.checks.findLast(c=>c.step === "退回" && c.source.line === rollback.source.line);
+  if (!attempt?.evidence.includes(join(dir,"merge-rollback.log"))) return;
+  const records = ledgers.find(l=>l.run === run)?.records ?? [], i = records.indexOf(rollback);
+  const trial = records.slice(0,i).findLast(affectsLive);
+  if (!trial || !deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== rollback.evidenceDir) return;
+
+  // 只有收尾的 merge 补偿会把之前的 deployed 登记写回。仅凭成功退回或“以前部署过”不能认定恢复目标。
+  const repo = str(run.task.repo), file = join(project.tasks,`.deployed-${hash(repo).slice(0,20)}.json`);
+  const marker = new Reader(project.tasks,project.read.warnings).doc(file);
+  if (!sha(marker?.commit) || !isAbsolute(str(marker?.evidenceDir))) return;
+  const owner = ledgers.find(l=>l.run.id === marker.executionId);
+  if (!owner?.run.ledgerOK) return;
+  const event = owner.records.find(d=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir);
+  if (!event || event === trial || event.at === undefined || trial.began === undefined || event.at > trial.began) return;
+  if (owner.records.slice(owner.records.indexOf(event)+1).some(d=>d.result === "已退回" && d.evidenceDir === event.evidenceDir)) return;
+  return {run:owner.run,event,trial,rollback,marker:ref(file)};
+}
 
 /** 同执行按流水；跨执行只在实际时间或可核对的上下界能排出先后时认定最新。 */
 export function batchDeployment(project: Project, batch: Batch) {
   let firstAvailable: {run:Execution; event:Deployment} | undefined;
-  const candidates = batch.runs.flatMap(run => {
-    const records = deployments(project,batch,run,true), i = records.findLastIndex(affectsLive);
+  const ledgers = batch.runs.map(run=>({run,records:deployments(project,batch,run,true)}));
+  const candidates = ledgers.flatMap(({run,records}) => {
+    const i = records.findLastIndex(affectsLive);
     for (const event of records) if (event.bound && deployedOK(event) &&
       (!firstAvailable || (event.at ?? Infinity) < (firstAvailable.event.at ?? Infinity))) firstAvailable = {run,event};
     if (i < 0) return [];
@@ -192,5 +217,8 @@ export function batchDeployment(project: Project, batch: Batch) {
   });
   const possibleLatest = candidates.filter(a=>!candidates.some(b=>a !== b && a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest));
   const current = possibleLatest.length === 1 ? possibleLatest[0] : undefined;
-  return {current, firstAvailable, events:candidates.map(d=>d.event), orderUnknown:possibleLatest.length > 1};
+  const restored = current && restoredDeployment(project,ledgers,current);
+  const events = candidates.map(d=>d.event);
+  if (restored) for (const event of [restored.event,restored.trial]) if (!events.includes(event)) events.push(event);
+  return {current:restored || current, restored, firstAvailable, events, orderUnknown:possibleLatest.length > 1};
 }

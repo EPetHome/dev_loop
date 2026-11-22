@@ -40,20 +40,23 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
     });
     // 下批必须是不同卡、同项目，且确实在上一批就绪后；没有部署时间时不造七日到期。
     const review = readyRun?.checks.findLast(c=>c.step === "评审" && c.result === "通过");
-    const readyAt = available?.event.at ?? time(review?.value.endedAt) ?? readyRun?.started;
+    const readyAt = success ? success.at : deployment.orderUnknown ? undefined : available?.event.at ?? time(review?.value.endedAt) ?? readyRun?.started;
     const next = readyAt === undefined ? undefined : project.runs.find(r=>r.batch && r.batch !== batch && r.started !== undefined && r.started > readyAt && r.started <= now);
-    const prospective = opening && (!card || batch.card !== card) && readyAt !== undefined && readyAt < now;
+    // 来访的开工本身可确认是下一次；部署时间不明时不从历史里猜哪次开工发生在它之后。
+    const prospective = opening && (!card || batch.card !== card) && (readyAt === undefined ? Boolean(success || available) : readyAt < now);
     const nextAt = next?.started ?? (prospective ? now : undefined), sevenAt = success?.at === undefined ? undefined : success.at + days(7);
     const expires = Math.min(nextAt ?? Infinity,sevenAt ?? Infinity);
     const due = expires <= now, reason = due ? (nextAt === expires ? "同项目下次开工" : "部署满七天") : null;
     const deploymentSources = deployment.events.map(d=>d.source);
     if (available && !deploymentSources.includes(available.event.source)) deploymentSources.push(available.event.source);
+    if (deployment.restored) deploymentSources.push(deployment.restored.marker);
     const sources = [ref(file,1), ...(observed ? [taskRef(observed), statusRef(observed)] : []), ...deploymentSources, ...(next ? [taskRef(next)] : [])];
     const state = contacts.length && !["通过","不通过","不验"].includes(status) ? "有反馈" : settled.has(status) || pending.has(status) ? status : "未知";
     const eligible = pending.has(status) && !contacts.length && due;
     const view = {batch:batch.key, file, storedStatus:status || null, state, entries, feedback:contacts, deploymentAt:renderTime(success?.at),
       deployment:deployed && !deployed.bound && deployedOK(deployed) ? "部署版本未关联" : deployed?.result ?? (deployment.orderUnknown ? "部署先后不明" : null), deploymentExecution:deployed?.execution ?? null, deploymentCommit:deployed?.commit ?? null,
       deploymentFacts:deployment.events,
+      ...(deployment.restored && {deploymentRestored:{trial:deployment.restored.trial.source, rollback:deployment.restored.rollback.source, marker:deployment.restored.marker}}),
       nextStartAt:renderTime(nextAt), sevenDaysAt:renderTime(sevenAt), due:eligible, reason:eligible ? reason : null, sources,
       reminder:state === "待验" || state === "待验收", writable:eligible && readerReady};
     const eol = text.includes("\r\n") ? "\r\n" : "\n";

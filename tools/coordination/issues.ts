@@ -164,22 +164,29 @@ function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets:
   const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
   const scopeOf = (text: string) => {
     const issueIds = issueIdsIn(text), mentionedScenes = sceneIds(text);
-    if (issueIds.some(id=>issue.ids.includes(id)) || mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name))) return "本单";
+    if (issueIds.some(id=>issue.ids.includes(id))) return "本单";
     if (issueIds.some(id=>batchIssueIds.has(id))) return "其他单";
-    return mentionedScenes.length && scenes.size ? "其他单" : "未知";
+    if (mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name))) return "本单";
+    return mentionedScenes.length && scenes.size ? "其他场景" : "未知";
   };
   const scoped = rows.map(row=>({row, scope:scopeOf(row.text)}));
   const associated = new Set([...explicit.ids, ...scoped.flatMap(({row,scope})=>row.id && scope === "本单" ? [row.id] : [])]);
-  const other = new Set(scoped.flatMap(({row,scope})=>row.id && scope === "其他单" ? [row.id] : []));
-  const required = new Map<string,Ref[]>();
-  for (const id of explicit.required) required.set(id,[ref(issue.file)]);
-  const unclear: Ref[] = [];
-  for (const {row,scope} of scoped) if (row.authorized && scope !== "其他单") {
-    if (row.id && associated.has(row.id)) required.set(row.id,[...(required.get(row.id) || []),row.source]);
-    else if (!row.id || !other.has(row.id)) unclear.push(row.source);
+  const other = new Set(scoped.flatMap(({row,scope})=>row.id && ["其他单","其他场景"].includes(scope) ? [row.id] : []));
+  const required = new Map<string,Ref[]>(), conflicts: {id:string; sources:Ref[]}[] = [], missing: string[] = [];
+  const issueSource = ref(issue.file);
+  const addRequirement = (id: string, source: Ref) => required.set(id,[...(required.get(id) || []),source]);
+  for (const id of explicit.required) addRequirement(id,issueSource);
+  // 先合并显式引用的同号条目。不同的防复发场景不是归属冲突，简写也不能抵消正式授权。
+  for (const id of associated) {
+    const definitions = scoped.filter(({row})=>row.id === id);
+    if (explicit.references.has(id) && !definitions.length) missing.push(id);
+    if (definitions.some(({scope})=>scope === "其他单")) conflicts.push({id,sources:[issueSource,...definitions.map(({row})=>row.source)]});
+    for (const {row} of definitions) if (row.authorized) addRequirement(id,row.source);
   }
-  const missing = [...explicit.references].filter(id=>!scoped.some(({row,scope})=>row.id === id && scope !== "其他单"));
-  return {required, unclear, missing, references:[...explicit.references], unknown:explicit.unknown};
+  const unclear: Ref[] = [];
+  for (const {row,scope} of scoped) if (row.authorized && scope !== "其他单" && scope !== "其他场景" &&
+      (!row.id || !associated.has(row.id) && !other.has(row.id))) unclear.push(row.source);
+  return {required, conflicts, unclear, missing, references:[...explicit.references], unknown:explicit.unknown};
 }
 
 function localLink(root: string, file: string, link: string) {
@@ -295,6 +302,10 @@ export function issueViews(project: Project, list: Issue[], originals?: Readonly
     const auth = authorizationRequirements(issue,criteria.rows,targets,proof?.auth || "",batchIssues.get(run.batch) ?? new Set());
     if (auth.unknown) reasons.push("授权要求没有可核对的验收条目编号");
     if (auth.missing.length) reasons.push(`批次验收材料缺本单明确引用的条目：${auth.missing.join("、")}`);
+    for (const conflict of auth.conflicts) {
+      reasons.push(`${conflict.id} 与批次验收条目归属冲突`);
+      evidence.push(...conflict.sources);
+    }
     if (criteria.unreadable.length) {
       reasons.push(`授权要求来源不可读${auth.references.length ? `，无法核对 ${auth.references.join("、")}` : ""}`);
       evidence.push(...criteria.unreadable);

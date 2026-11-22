@@ -58,13 +58,13 @@ function mustFind<T>(values:T[], hit:(item:T)=>boolean) { const found = values.f
 const tool = resolve(import.meta.dirname,"../tools/coordinate.ts");
 type Fixture = ReturnType<typeof fixture>;
 type Run = ReturnType<Fixture["execution"]>;
-function recordProof(run: Run, sha = before) {
+function recordProof(run: Run, sha = before, acceptanceHash = hash("")) {
   const old = write(join(run.dir,"red.log"),"旧版走到原单重投，0 != 1\n");
   write(join(run.dir,"green.log"),"新版目标通过\n");
   const report = {issue:"PA046",target:"S3 / 原单重投",executionId:run.id,result:"已证明",materialsHash:"a".repeat(64),
     before:{commit:sha,result:"目标断言失败",expected:1,actual:0,log:"red.log"},after:{commit,result:"通过",expected:1,actual:1,log:"green.log"}};
   const file = doc(join(run.dir,"proof.json"),report);
-  run.check("防复发证明","已证明",{evidence:[file]});
+  run.check("防复发证明","已证明",{evidence:[file],acceptanceHash});
   return {old,file,report};
 }
 async function interruptApply(f: Fixture, cmd: string, id: string, source: string, clock: number, collide?: string) {
@@ -208,6 +208,34 @@ test("显式验收项读取独立标准的子节；缺项或材料不可读时�
   assert.equal(read(issue),original);
 });
 
+test("显式 A2 跨验证场景仍需授权，简写不抵消；明确属另一单时两处证据都保留",t=>{
+  const f=fixture(t), b=f.batch("跨场景验收"), criteria=join(b.d,"标准.md"), summary="状态：待验\n\nA2. 核对结果\n";
+  const r=f.execution(b,"scoped-authorization",now-days(2),{task:{acceptance:criteria}});
+  const issue=f.issue("明确引用",b.name,"编号：PA046\n验收项：A2\n防复发检查：S3 / 原单重投","功能地图，S3");
+  const other=f.issue("另一张单",b.name,"编号：PA099");
+  const original=read(issue), originalIndex=r.index;
+  const setCriteria = (line:string)=>{
+    const text=`## 验收标准\n\n${line}\n`, acceptanceHash=hash(text);
+    write(criteria,text); write(originalIndex,"");
+    r.check("复测","通过",{acceptanceHash}); r.check("评审","通过",{acceptanceHash});
+    const proof=recordProof(r,undefined,acceptanceHash);
+    assert(existsSync(proof.file));
+  };
+  write(b.acceptance,summary);
+  setCriteria("A2. [授权] 用正式账号检查 S5");
+  const view=()=>mustFind(f.run("查询").issues,v=>v.file===issue);
+  assert.match(view().reasons.join("\n"),/A2 缺本人/);
+  assert(view().evidence.some(s=>s.file===criteria && s.line===3));
+  assert(!f.run("查询").changes.some(c=>c.from===issue));
+  jsonl(join(r.dir,"answers.jsonl"),[{at:at(now-days(1)),text:"同意授权：A2"}]);
+  assert(view().ready,"明确编号优先于防复发场景的推断");
+  setCriteria("A2. [授权] 仅用于 PA099 的正式账号检查 S5");
+  const conflicted=view();
+  assert(!conflicted.ready); assert.match(conflicted.reasons.join("\n"),/A2 .*归属冲突/);
+  assert([issue,criteria,b.acceptance].every(file=>conflicted.evidence.some(s=>s.file===file)));
+  assert(existsSync(other)); assert.equal(read(issue),original);
+});
+
 test("同批两单中只需取得本单的明确授权；无归属仍保守保留",t=>{
   const f=fixture(t), b=f.batch("同批两单"), r=f.execution(b,"same-fix",now-days(1)); r.pass();
   const plainIssue=f.issue("自动定向验证",b.name,"编号：PA046\n防复发检查：S3 / 原单重投","功能地图，场景 S3");
@@ -336,6 +364,55 @@ test("旧部署无时间但退回有时间；更晚已部署版照常计算七�
   assert.equal(v.deploymentAt,at(now-days(8))); assert.equal(v.reason,"部署满七天");
   assert(v.sources.some(s=>s.file===older.index && s.line===4));
   f.apply("查询",p,args);
+  assert.match(read(b.acceptance),/^状态：未确认（无反馈）/);
+});
+
+test("A 首版后开的 B 不能结束 A 新版的待验提醒",t=>{
+  const f=fixture(t), a=f.batch("A 双版本"), first=f.execution(a,"first-A",now-days(10)); first.pass();
+  first.check("部署","已部署",{endedAt:at(now-days(9))});
+  const b=f.batch("B"); f.execution(b,"next-after-first",now-days(8)).pass();
+  const content="状态：待验\n\nA1. [人工] 看新版\n";
+  write(a.acceptance,content);
+  const args=["--acceptance-ready"], get=()=>f.run("查询",args);
+  assert.equal(get().acceptances[0].reason,"同项目下次开工");
+  const newer=f.execution(a,"second-A",now-days(2),{loop:{commit:merged,delivery:{commit:merged}}});
+  newer.check("部署","已部署",{commit:merged,endedAt:at(now-days(1))});
+  const p=get(), v=p.acceptances[0];
+  assert.equal(v.deploymentExecution,newer.id); assert.equal(v.deploymentAt,at(now-days(1)));
+  assert.equal(v.nextStartAt,null); assert.equal(v.sevenDaysAt,at(now+days(6))); assert(!v.due);
+  assert(!p.changes.some(c=>c.to===a.acceptance)); f.apply("查询",p,args); assert.equal(read(a.acceptance),content);
+  const c=f.batch("C"); f.execution(c,"next-after-second",now-days(0.5));
+  assert.equal(get().acceptances[0].reason,"同项目下次开工");
+});
+
+test("试部署合入失败后凭恢复登记沿用上一版；无登记、不同尝试或手工退回不推断",t=>{
+  const f=fixture(t), b=f.batch("补偿后的待验"), old=f.execution(b,"old-deployed",now-days(10)); old.pass();
+  const oldAt=at(now-days(8)), oldEvidence=join(old.dir,"deploy-old"), marker=join(f.tasks,`.deployed-${hash(f.repo).slice(0,20)}.json`);
+  old.check("部署","已部署",{endedAt:oldAt,evidence:[oldEvidence+".log",oldEvidence]});
+  const retry=f.execution(b,"merge-failed",now-days(2),{state:"input_required",loop:{wait:"收尾没走完"}});
+  const trial=join(retry.dir,"deploy-trial"), trialAt=at(now-days(1)), restoredAt=at(now-days(0.95));
+  retry.check("部署","已部署",{commit:merged,endedAt:trialAt,evidence:[trial+".log",trial]});
+  retry.check("合入","合入失败");
+  retry.check("退回","已退回",{commit:merged,endedAt:restoredAt,evidence:[trial,join(trial,"merge-rollback.log")]});
+  retry.check("收尾","失败",{detail:"合入失败，线上已回退",evidence:[trial]});
+  const original="状态：待验\n\nA1. [人工] 核对旧版\n";
+  write(b.acceptance,original);
+  const args=["--acceptance-ready"], get=()=>f.run("查询",args);
+  assert.equal(get().acceptances[0].deployment,"已退回"); assert(!get().acceptances[0].due);
+  doc(marker,{executionId:old.id,commit,evidenceDir:join(old.dir,"deploy-another"),rollback:"scripts/rollback"});
+  assert(!get().acceptances[0].due,"同执行同提交但不是原部署尝试");
+  doc(marker,{executionId:old.id,commit,evidenceDir:oldEvidence,rollback:"scripts/rollback"});
+  const preview=get(), view=preview.acceptances[0];
+  assert.equal(view.deploymentExecution,old.id); assert.equal(view.deploymentAt,oldAt);
+  assert.equal(view.reason,"部署满七天"); assert.equal(view.sevenDaysAt,at(now-days(1)));
+  assert.deepEqual(view.deploymentFacts.map(d=>d.result).sort(),["已部署","已部署","已退回"].sort());
+  assert.deepEqual(view.deploymentRestored?.marker,{file:marker});
+  assert.equal(view.deploymentRestored?.trial.line,1); assert.equal(view.deploymentRestored?.rollback.line,3);
+  const ledger=read(retry.index); write(retry.index,ledger.replace("merge-rollback.log","manual-rollback.log"));
+  assert.equal(get().acceptances[0].deployment,"已退回"); assert(!get().acceptances[0].due);
+  assert.equal(read(b.acceptance),original);
+  write(retry.index,ledger);
+  f.apply("查询",preview,args);
   assert.match(read(b.acceptance),/^状态：未确认（无反馈）/);
 });
 
