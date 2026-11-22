@@ -8,15 +8,14 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, waitFor, waiting, update, fail, inputs, launchStarted } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, waiting, update, fail, inputs, launchStarted, matchesReviewRequest } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startCompanion, startFinish } from "./after-settle.ts";
 import { convention } from "./convention.ts";
 interface LaunchOptions {
-  openTerminal?: (script: string) => Promise<void>;
-  startupTimeoutMs?: number; env?: NodeJS.ProcessEnv;
-  reviewOnly?: boolean; confirmedCommit?: string; handoff?: boolean; retest?: string;
+  openTerminal?: (script: string) => Promise<void>; startupTimeoutMs?: number; env?: NodeJS.ProcessEnv;
+  reviewRequest?: string; confirmedCommit?: string; handoff?: boolean; retest?: string;
 }
 function launchFiles(dir: string, id: string) {
   const base = join(dir,`launch-${id}`); return {request:base+".json",pid:base+"-pid.json",exit:base+"-exit.json",log:base+".log"};
@@ -37,8 +36,7 @@ export async function terminalSession(dir: string, id: string): Promise<number> 
       else { raw += "无法读取待登记会话进程身份"; child.kill("SIGKILL"); }
     });
   } catch (e) { child?.kill("SIGKILL"); throw e; }
-  if (!child) raw = "会话启动请求已过期或任务已停止";
-  else {
+  if (!child) raw = "会话启动请求已过期或任务已停止"; else {
     try { code = (await once(child,"close"))[0] ?? 1; }
     catch (e) { note(String(e)); code = 127; }
     update(dir,s => { if (s.loop.startingSession?.launchId === id) s.loop.startingSession = null; });
@@ -97,19 +95,19 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   update(dir, (s) => { if (s.state === "working") { s.message = "pi 开发会话已登记"; s.loop.bucket = "developmentMs"; s.timeLimitSec = null; } });
 }
 export async function launchMain(dir: string, resuming: boolean, options: LaunchOptions = {}): Promise<void> {
-  let claimed = false; const s = update(dir,s => {
-    if (s.state !== "working" || options.handoff && launchStarted(s) ||
-        options.retest && (s.loop.phase !== "复测中" || s.loop.retestAttempt !== options.retest || alive(s.loop.launcher))) return;
-    s.loop.launcher = identity(); s.loop.launchStarted = claimed = true;
-  });
-  if (options.handoff && launchStarted(s)) process.send?.("started", () => {}); // 持久领取之后才应答。
+  const {handoff,reviewRequest,retest,confirmedCommit} = options; let claimed = false;
+  const s = update(dir,s => { s.loop.launcher = identity(); s.loop.launchStarted = claimed = true; },undefined,s =>
+    s.state === "working" && (!handoff || !launchStarted(s)) &&
+    (reviewRequest === undefined || matchesReviewRequest(s,reviewRequest) && !alive(s.loop.launcher)) &&
+    (!retest || s.loop.phase === "复测中" && s.loop.retestAttempt === retest && !alive(s.loop.launcher)));
+  if (handoff && launchStarted(s)) process.send?.("started", () => {}); // 持久领取之后才应答。
   if (!claimed) return;
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
-    if (options.reviewOnly || options.confirmedCommit || options.retest) {
+    if (reviewRequest || confirmedCommit || retest) {
       const result = await settle(dir, "", options);
       if (!result.continue || statusOf(dir).state !== "working") { await startFinish(dir, options.env || process.env); return; }
-      const manual = taskOf(dir).host !== "pi", source = options.reviewOnly ? "补评审" : options.retest ? "后台复测" : "确认交付后检查";
+      const manual = taskOf(dir).host !== "pi", source = reviewRequest ? "补评审" : retest ? "后台复测" : "确认交付后检查";
       if (manual || !result.retained) update(dir,s => {
         if (s.state !== "working" || s.loop.phase !== "开发中") return;
         if (manual && (!result.retained || s.loop.pendingReturn === result.reason)) waiting(s,"需手动接入会话",`${source}需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n${result.reason}`,result.reason);
@@ -122,11 +120,10 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
     if (!statusOf(dir).loop.ready) await prepare(dir);
     if (statusOf(dir).state !== "cancelled") { await startCompanion(dir,options.env || process.env); await launchSession(dir,resuming,options); }
   } catch (e) { fail(dir,e); throw e; }
-  finally { clearInterval(timer); update(dir,s => { if (s.loop.launcher?.pid === process.pid) s.loop.launcher = null; }); }
+  finally { clearInterval(timer); update(dir,s => { s.loop.launcher = null; },undefined,s => s.loop.launcher?.pid === process.pid); }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [target, mode, value] = process.argv.slice(2);
-  const main = target === "--terminal" ? terminalSession(resolve(mode), value).then(code => { process.exitCode = code; })
-    : launchMain(resolve(target), mode === "--resume", {reviewOnly: mode === "--review", confirmedCommit: mode === "--delivery" ? value : undefined, retest: mode === "--retest" ? value : undefined, handoff: mode === "--handoff"});
+  const main = target === "--terminal" ? terminalSession(resolve(mode),value).then(code => { process.exitCode = code; }) : launchMain(resolve(target), mode === "--resume", {reviewRequest: mode === "--review" ? value ?? "" : undefined, confirmedCommit: mode === "--delivery" ? value : undefined, retest: mode === "--retest" ? value : undefined, handoff: mode === "--handoff"});
   main.catch((e)=>{console.error(e);process.exitCode=1;});
 }

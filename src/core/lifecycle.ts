@@ -82,7 +82,7 @@ function claimRetest(t: Task, s: Status, text: string | undefined, accept: strin
   const reusable = current && (!waiting || previous.result !== "环境未验证" || accept) ? previous : undefined;
   const attempt = reusable?.attempt || (working && !previous && loop.phase === "复测中" && loop.retestAttempt) || randomUUID(), accepted = accept || reusable?.result === "本人接受环境缺项";
   const status = update(t.dir,next => {
-    if (next.state !== state || next.loop.retestAttempt !== loop.retestAttempt || next.loop.delivery?.at !== loop.delivery?.at) throw new InputError("现场已变化；请重新查询执行");
+    if (next.state !== state || next.loop.retestAttempt !== loop.retestAttempt || next.loop.delivery?.at !== loop.delivery?.at || alive(next.loop.launcher)) throw new InputError("现场已变化；请重新查询执行");
     if (accept && (!sameInputs(previous!,inputs(t)) || !deliveryMatches(t,next))) throw new InputError("提交或输入已变化；请重新查询执行");
     if (accept) { const now = Date.now(); appendCheck(t.dir,{...previous!,result:"本人接受环境缺项",...span(now,now)}); }
     next.state = "working"; next.loop.retestAttempt = attempt; // 只允许显式续跑解开已停止。
@@ -94,9 +94,8 @@ function claimRetest(t: Task, s: Status, text: string | undefined, accept: strin
 const requireNotReleasing = ({loop,executionId}: Status) => { if (loop.releasePending) throw new InputError(`工作区释放尚未结束；可运行 bin/loop ${loop.releasePending.auto ? "收尾" : "释放"} ${executionId} 补齐`); };
 interface Resumed {reused: boolean; running: boolean; reviewOnly?: boolean; retest?: string; status: Status}
 export function resume(dir: string, text?: string, answering = false, accept?: string): Resumed {
-  const t = taskOf(dir), action = () => resumeLocked(t,text,answering,accept);
-  if (!t.e2e && accept !== undefined) throw new InputError("当前没有待处理的复测环境缺项");
-  return t.e2e ? withLock(operationPath(dir),action,0) : action();
+  const t = taskOf(dir); if (!t.e2e && accept !== undefined) throw new InputError("当前没有待处理的复测环境缺项");
+  const action = () => resumeLocked(t,text,answering,accept); return t.e2e ? withLock(operationPath(dir),action,0) : action();
 }
 function resumeLocked(t: Task, text?: string, answering = false, accept?: string): Resumed {
   if ((text !== undefined || answering) && !text?.trim()) throw new InputError("话不能为空");
@@ -113,13 +112,13 @@ function resumeLocked(t: Task, text?: string, answering = false, accept?: string
   const reused = text === undefined && loop.wait !== "收尾没走完" && (!after || state === "completed" || pending) && !!(commit && deliveryMatches(t,s) && checked(dir,commit));
   const reviewOnly = !reused && text === undefined && state === "failed" && s.error?.category === "临时故障" && !!retryReview(dir);
   if (!reused && !reviewOnly && running && state !== "input_required") throw new Error("开发会话仍在运行；请在原会话继续或先停止");
-  const status = update(dir, s => {
+  const status = update(dir,s => {
     requireResumable(s); s.loop.reused = reused; s.loop.facts!.resumes++;
     if (reused) {
       s.state = "working"; if (pending) s.loop.afterCommit = commit!;
       move(s,pending ? "working" : "completed",pending ? "收尾中" : ["等你","已停止"].includes(s.loop.phase) ? "完成" : s.loop.phase,"沿用此 commit 的复测与评审通过记录",pending ? "selfMs" : null); return;
     }
-    if (reviewOnly) { move(s,"working","评审中","已续跑，后台只重做评审","selfMs"); return; }
+    if (reviewOnly) { if (move(s,"working","评审中","已续跑，后台只重做评审","selfMs")) s.loop.reviewRequest = randomUUID(); return; }
     if (s.state === "input_required") {
       const {prompt,acceptance,e2e,...hashes} = inputs(t);
       appendCheck(dir,{commit:s.loop.commit || t.baseCommit,tree:s.loop.delivery?.tree || "",step:"等你",result:"已续跑",evidence:[],...hashes,...span(s.loop.stepStartedAt)});
@@ -129,7 +128,7 @@ function resumeLocked(t: Task, text?: string, answering = false, accept?: string
     s.loop.testAllowance = Math.max(t.limits.测试.maxRepairs,s.loop.testReturns+1); s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs,s.loop.reviewReturns+1); s.state = "working";
     const note = text !== undefined ? (t.host === "pi" ? "；话已写入待送" : "；未送达，需在窗口里说；下一次 hook 交接") : running ? "，请在原开发会话继续" : "";
     move(s,"working",s.loop.ready ? "开发中" : "准备中","已续跑" + note + "；到上限的步骤再给一轮","developmentMs");
-  }, reused ? "沿用通过记录" : "续跑"); return {reused,running,...(reviewOnly ? {reviewOnly} : {}),status};
+  }, reused ? "沿用通过记录" : "续跑"); return {reused,running,...(status.loop.reviewRequest ? {reviewOnly:true} : {}),status};
 }
 export function stop(dir: string, abandon = false): Status {
   const t = taskOf(dir), stopped = update(dir,s=>{

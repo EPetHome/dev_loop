@@ -230,6 +230,29 @@ test("A9：挪走已通过证据不改资格；正式改清单后查询提示过
   assert.equal(existsSync(join(g.dir,"opened.json")),false);
 });
 
+for (const entry of ["launcher","执行锁内"] as const) test("评审必修：迟到补评审不得抢占新清单复测 · " + entry, async t => {
+  const g = await scene(t,{reviewer:`if [ ! -e "$LOOP_TASK_DIR/reviewer-ready" ]; then exit 7; fi; printf %s ${sq(PASS)}`});
+  const {commit} = g.submit(); await settle(g.dir); assert.equal(g.status().error?.category,"临时故障");
+  const a = resume(g.dir); assert.equal(a.reviewOnly,true); assert.equal(a.status.loop.launcher,null);
+  const card = getJson(g.card); card.tasks[0].e2e[0].checks.push("新清单的检查点"); write(g.card,JSON.stringify(card));
+  const b = resume(g.dir); assert.ok(b.retest); assert.equal(b.status.loop.phase,"复测中");
+  const oldRequest = a.status.loop.reviewRequest; assert.ok(oldRequest);
+  if (entry === "launcher") {
+    const worker = spawn(NODE,[join(ROOT,"src/hosts/launch.ts"),g.dir,"--review",oldRequest],{cwd:g.repo,env:g.env,stdio:"inherit"});
+    assert.deepEqual(await once(worker,"close"),[0,null]);
+  } else {
+    assert.equal((await settle(g.dir,"",{reviewRequest:oldRequest})).continue,false,"旧进程已拿到执行锁仍不能推进");
+  }
+  assert.deepEqual(g.status(),b.status,"过期派发不改状态、launcher 或 B 的编号");
+  assert.equal(existsSync(join(g.dir,"opened.json")),false);
+  write(join(g.dir,"reviewer-ready"),""); const receipt = JSON.parse((await g.run("续跑")).stdout);
+  assert.equal(receipt.retest,b.retest); assert.equal((await g.finished()).state,"completed");
+  const [before,after] = g.tests(); assert.equal(g.tests().length,2); assert.equal(after.attempt,b.retest); assert.equal(after.commit,commit);
+  assert.notEqual(after.e2eHash,before.e2eHash); assert.match(after.detail!,/新清单的检查点：通过/);
+  assert.equal(readFileSync(join(g.dir,"order"),"utf8"),"test\nreview\nreview\ntest\nreview\n");
+  assert.equal(existsSync(join(g.dir,"opened.json")),false);
+});
+
 test("接力等复测与对应评审：同输入有旧通过也不跳过本次等待", async t => {
   const g = e2e(t);
   const next = join(g.repo,"second.json"), nextCard = {...g.raw, name:"second", tasks:[defaults]};

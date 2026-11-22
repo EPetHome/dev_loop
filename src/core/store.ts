@@ -40,7 +40,7 @@ export interface Check extends Hashes, ReturnType<typeof span> {
 export interface ReleasePending { at: string; auto?: true; target?: {gitDir: string; id: string} }
 export type Status = ReturnType<typeof initialStatus> & {loop: {
   pendingOpening?: boolean; launchStarted?: boolean; next?: string; releasePending?: ReleasePending | null;
-  remindedCandidates?: string[]; retestAttempt?: string;
+  remindedCandidates?: string[]; retestAttempt?: string; reviewRequest?: string;
 }};
 function initialStatus(t: Task) {
   const {dir,executionId,dispatchId,createdAt,prompt,card,limits} = t, now = Date.now();
@@ -75,9 +75,10 @@ export function summary(dir: string, s = statusOf(dir)): void {
     ...(loop.reused ? ["结论：沿用此 commit 的已有检查。"] : []),"","| 步骤 | 结论 | 累计耗时 |","|---|---|---|",...rows,...e2e,
     "","commit："+(loop.commit || "未交付"),"详情："+join(dir,"checks.jsonl"),""].join("\n"));
 }
-export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑"): Status {
-  return withLock(join(dir, "status.lock"), () => {
-    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase}; s.loop.facts ||= newFacts(taskOf(dir));
+export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑", when = (_: Status) => true): Status {
+  return withLock(join(dir,"status.lock"), () => {
+    const s = statusOf(dir); if (!when(s)) return s;
+    const now = Date.now(), previousBucket = s.loop.bucket, before = {state:s.state,phase:s.loop.phase}; s.loop.facts ||= newFacts(taskOf(dir));
     if (s.loop.bucket) s.loop.durations[s.loop.bucket] += Math.max(0, now - s.loop.clockAt);
     s.loop.clockAt = now; action(s);
     const stopped = ["input_required", "failed", "cancelled"].includes(s.state), at = iso(now);
@@ -96,16 +97,18 @@ export function update(dir: string, action: (s: Status) => void, resolvedBy: Res
 export function move(s: Status, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null) {
   if (s.state === "cancelled" && state !== "cancelled") return false;
   Object.assign(s,{state,message,error:null,timeLimitSec}); Object.assign(s.loop,{phase,bucket,wait:null});
+  if (state !== "working" || phase !== "评审中") delete s.loop.reviewRequest;
   if (state === "completed" || ["准备中","开发中","收尾中"].includes(phase)) delete s.loop.retestAttempt; return true;
 }
+export const matchesReviewRequest = ({state,loop}: Status, request: string) => !!request && state === "working" && loop.phase === "评审中" && loop.reviewRequest === request;
 export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) => update(dir, s => { move(s,state,phase,message,bucket,timeout); });
 export function waiting(s: Status, reason: WaitReason, message: string, pendingReturn?: string) {
   if (move(s,"input_required","等你",message,"inputMs")) Object.assign(s.loop,{wait:reason,...(pendingReturn === undefined ? {} : {pendingReturn})});
 }
 export const waitFor = (dir: string, reason: WaitReason, message: string, pendingReturn?: string) => update(dir, s => waiting(s,reason,message,pendingReturn));
-export function fail(dir: string, error: unknown, category?: string): void {
+export function fail(dir: string, error: unknown, category?: string, when?: (s: Status) => boolean): void {
   const raw = errorText(error), kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
-  update(dir,s => { if (!s.loop.releasePending && !s.loop.released && move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; });
+  update(dir,s => { if (!s.loop.releasePending && !s.loop.released && move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; },undefined,when);
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
 export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {

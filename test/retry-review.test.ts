@@ -149,10 +149,22 @@ for (const live of [false, true]) test("补评审给出必修后照常返修，�
 });
 test("回执后提示词再变化，后台重核资格回开发，不补评审也不复测", async t => {
   const f = await failed(t), {task} = f;
-  assert.equal(resume(task.dir).reviewOnly, true); write(join(f.repo, "prompt.md"), "后台启动前需求又变化");
-  await launchMain(task.dir, false, {env: f.env, reviewOnly: true});
+  const request = resume(task.dir); assert.equal(request.reviewOnly,true); assert.ok(request.status.loop.reviewRequest);
+  write(join(f.repo,"prompt.md"),"后台启动前需求又变化");
+  await launchMain(task.dir,false,{env:f.env,reviewRequest:request.status.loop.reviewRequest});
   assert.equal(statusOf(task.dir).loop.phase, "开发中"); assert.ok(existsSync(join(task.dir, "opened.json")));
   assert.equal(checksOf(task.dir).filter(c => c.step === "复测").length, 1); assert.equal(statusOf(task.dir).loop.reviewRounds, 1);
+});
+test("同为评审中，旧补评审请求也不能代替新请求", async t => {
+  const f = await failed(t), {dir} = f.task, a = resume(dir).status.loop.reviewRequest; assert.ok(a);
+  await launchMain(dir,false,{env:f.env,reviewRequest:a}); assert.equal(statusOf(dir).state,"failed");
+  const b = resume(dir).status; assert.equal(b.loop.phase,"评审中");
+  assert.ok(b.loop.reviewRequest); assert.notEqual(b.loop.reviewRequest,a);
+  const checks = checksOf(dir); await launchMain(dir,false,{env:f.env,reviewRequest:a});
+  assert.deepEqual(statusOf(dir),b); assert.deepEqual(checksOf(dir),checks);
+  write(join(dir,"retry-go"),""); await launchMain(dir,false,{env:f.env,reviewRequest:b.loop.reviewRequest});
+  assert.equal(statusOf(dir).state,"completed"); assert.equal(checksOf(dir).filter(c => c.step === "复测").length,1);
+  assert.equal(existsSync(join(dir,"opened.json")),false);
 });
 test("补评审的必修仍遵守原退回上限", async t => {
   const f = await failed(t, {reviewer: 'if [ ! -e "$LOOP_TASK_DIR/retry-go" ]; then exit 7; fi; printf %s ' + sq(MUST), card: {limits: {开发评审: {maxRepairs: 1, timeoutMin: 1}}}}), {task} = f;

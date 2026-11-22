@@ -83,8 +83,8 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
       if(receipt.status.loop.phase==="已交付")await background(t,{delivery:receipt.commit});
       return {executionId:t.executionId,...receipt};
     }
-    const result=resume(dir,o.words,o.command==="答复",o.acceptEnvironment);
-    const mode = result.retest ? {retest:result.retest} : result.reviewOnly ? "review" : result.status.loop.phase === "收尾中" ? "finish"
+    const result = resume(dir,o.words,o.command === "答复",o.acceptEnvironment), {reviewRequest,phase} = result.status.loop;
+    const mode = result.retest ? {retest:result.retest} : reviewRequest ? {review:reviewRequest} : phase === "收尾中" ? "finish"
       : !result.reused && !result.running ? "resume" : undefined;
     if (mode) await background(t,mode); return {executionId:t.executionId,...result};
   }

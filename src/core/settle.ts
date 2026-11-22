@@ -5,7 +5,7 @@ import { atomicWrite, lock, BusyError, digest, optionalJson, writeJson, span, wi
 import { APP_ROOT } from "../infra/paths.ts";
 import { alive, signalProcess } from "../infra/exec.ts";
 import { git, gitText, changes } from "../infra/git.ts";
-import { taskOf, statusOf, update, move, waitFor, waiting, inputs, sameInputs, checked, reviewFor, appendCheck, checksOf, answersOf, fail, PHASES, ENV_WAIT, type Check, type Hashes, type Task, type WaitReason } from "./store.ts";
+import { taskOf, statusOf, update, move, waitFor, waiting, inputs, sameInputs, checked, reviewFor, matchesReviewRequest, appendCheck, checksOf, answersOf, fail, PHASES, ENV_WAIT, type Check, type Hashes, type Task, type WaitReason } from "./store.ts";
 import { checkAttempt, checkWorktree, clearCheck, operationPath, run } from "./run.ts";
 import { copyLocalFiles, heartbeat, retryReview, setup, recordedAttempt, environmentMessage, environmentAcceptable } from "./lifecycle.ts";
 import { noTest } from "./card.ts";
@@ -15,7 +15,7 @@ import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
 import { reviewTestSummary, clip, legacyResult } from "./test-summary.ts";
 import { snapshot, differences } from "./snapshot.ts";
 export interface SettleResult { continue: boolean; reason: string; retained?: boolean }
-interface SettleOptions { signal?: AbortSignal; reviewOnly?: boolean; confirmedCommit?: string; retest?: string; ending?: {stopReason?: string; errorMessage?: string} }
+interface SettleOptions { signal?: AbortSignal; reviewRequest?: string; confirmedCommit?: string; retest?: string; ending?: {stopReason?: string; errorMessage?: string} }
 const quiet = (reason = ""): SettleResult => ({continue:false,reason});
 const park = (dir: string, cause: WaitReason, reason: string) => { waitFor(dir,cause,reason); return quiet(reason); };
 function backToDevelopment(dir: string, problem: string | Check, test = false, retained = false): SettleResult {
@@ -33,19 +33,18 @@ function backToDevelopment(dir: string, problem: string | Check, test = false, r
   return {continue:s.state === "working",reason,retained};
 }
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
-export async function settle(dir: string, lastReply = "", {signal, reviewOnly, confirmedCommit, retest, ending}: SettleOptions = {}): Promise<SettleResult> {
+export async function settle(dir: string, lastReply = "", {signal, reviewRequest, confirmedCommit, retest, ending}: SettleOptions = {}): Promise<SettleResult> {
   let release: (() => void) | undefined, clean = () => {}, pulse: ReturnType<typeof setInterval> | undefined;
   let started: {at:number; selfMs:number; task:Task} | undefined, hashes: Hashes = {promptHash:"",acceptanceHash:""};
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
   try {
     try { release = lock(operationPath(dir), confirmedCommit || retest ? 2000 : 0); }
     catch (e) { if (e instanceof BusyError) return quiet("该任务的交付/检查正在处理中"); throw e; }
-    const t = taskOf(dir), initial = statusOf(dir), {loop,state,message} = initial;
+    const t = taskOf(dir), initial = statusOf(dir), {loop,state,message} = initial, reviewOnly = reviewRequest !== undefined;
     if (confirmedCommit && (state !== "working" || loop.phase !== "已交付" || loop.delivery?.commit !== confirmedCommit)) return quiet();
-    if (retest ? state !== "working" || loop.phase !== "复测中" || loop.retestAttempt !== retest
-      : !reviewOnly && loop.retestAttempt && ["复测中","评审中"].includes(loop.phase)) return quiet();
-    if (loop.released || loop.releasePending) return quiet(loop.released ? "工作区已释放" : "等待释放工作区");
-    if (alive(loop.finisher)) return quiet("正在收尾");
+    if (reviewOnly ? !matchesReviewRequest(initial,reviewRequest) : retest ? state !== "working" || loop.phase !== "复测中" || loop.retestAttempt !== retest
+      : loop.reviewRequest || loop.retestAttempt && ["复测中","评审中"].includes(loop.phase)) return quiet();
+    if (loop.released || loop.releasePending) return quiet(loop.released ? "工作区已释放" : "等待释放工作区"); if (alive(loop.finisher)) return quiet("正在收尾");
     if (state === "working" && loop.finisher) return park(dir,"收尾没走完",`收尾进程已退出，可运行 bin/loop 收尾 ${t.executionId} 手工接手。`);
     if (["cancelled","input_required","failed"].includes(state)) return quiet(message); if (!loop.ready) return quiet("工作区正在准备");
     pulse = setInterval(() => heartbeat(dir),60000); pulse.unref();
@@ -86,8 +85,8 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
     const saved = retest && recordedAttempt(initial,records); let test = reviewOnly ? retryReview(dir) : saved && sameInputs(saved,hashes) ? saved : undefined;
     if (reviewOnly && !test) return backToDevelopment(dir,"评审续跑条件已变化，请重新交付。");
     const record = (step: string, start: number, data: Pick<Check,"result"|"detail"|"evidence"|"attempt"|"missingScenarios"|"unit">) => withLock(join(dir,"status.lock"), () => {
-      const c: Check = {commit,tree:delivery.tree,step,...span(start),...hashes,...data};
-      if (statusOf(dir).state === "cancelled") c.result = "已停止"; appendCheck(dir,c); return c;
+      const c: Check = {commit,tree:delivery.tree,step,...span(start),...hashes,...data,result:statusOf(dir).state === "cancelled" ? "已停止" : data.result};
+      appendCheck(dir,c); return c;
     });
     const cwd = checkWorktree(dir), marker = checkAttempt(dir), timeout = t.limits.测试.timeoutMin*60, pinned = {...t,worktree:cwd}, deadline = ownStart+timeout*1000;
     const attemptKey = (c: Pick<Check,"attempt"|"startedAt">) => c.attempt || digest(JSON.stringify([commit,hashes,c.startedAt]));
