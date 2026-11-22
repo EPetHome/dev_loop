@@ -46,6 +46,6 @@ syncBuiltinESMExports();
   let stderr = ""; child.stderr!.setEncoding("utf8"); child.stderr!.on("data", chunk=>{stderr += chunk;});
   const exited = new Promise<{code:number|null;stderr:string}>((ok,no)=>{child.once("error",no);child.once("close",code=>ok({code,stderr}));});
   t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill("SIGKILL");});
-  await until(dir,()=>existsSync(marker),Boolean);
+  await until(dir,()=>existsSync(marker),Boolean,marker);
   return { proceed:()=>write(gate,"remove\n"), exited };
 }
