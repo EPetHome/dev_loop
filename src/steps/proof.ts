@@ -1,10 +1,10 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { checkout } from "../infra/checkout.ts";
-import { inside, safeRelative } from "../infra/config.ts";
-import { atomicWrite, BusyError, digest, errorText, ifPresent, maybe, readJson, span, underLock, withLock, writeJson } from "../infra/files.ts";
-import { checkPin, git, gitBytes, gitTry, historyEnv } from "../infra/git.ts";
+import { privateCheckout } from "../infra/checkout.ts";
+import { inside, isObject, safeRelative } from "../infra/config.ts";
+import { atomicWrite, BusyError, digest, errorText, ifPresent, readJson, span, underLock, withLock, writeJson } from "../infra/files.ts";
+import { checkPin, git, gitBytes, historyEnv } from "../infra/git.ts";
 import { InputError, observed, type Observation } from "../core/card.ts";
 import { boundReport, e2eResult, evidenceFile, planIn, requireReport, type Measurement } from "../core/e2e.ts";
 import { batchResult, checksOf, recordStep, statusOf, type Check, type Hashes, type Task } from "../core/store.ts";
@@ -21,13 +21,10 @@ const treeFiles = (repo: string, commit: string, env: NodeJS.ProcessEnv, paths: 
     const [,mode,oid,path] = /^(\d+) \w+ (\w+)\t([\s\S]+)$/.exec(line)!;
     return {path,mode,oid};
   });
-function isolatedGit(repo: string) {
-  const env = historyEnv(), fixed = new Map(Object.entries({"core.hooksPath":"/dev/null","core.fsmonitor":"false","core.ignoreStat":"false",
-    "core.sparseCheckout":"false","core.symlinks":"true","submodule.recurse":"false"}));
-  const keys = gitTry(repo,["config","--null","--name-only","--get-regexp","^filter\\..*\\.(clean|smudge|process|required)$"],env);
-  requireReport(keys.code <= 1,keys.stderr || keys.stdout);
-  for (const key of keys.stdout.split("\0").filter(Boolean)) fixed.set(key,key.endsWith(".required") ? "false" : "");
-  return Object.assign(env,{GIT_CONFIG_COUNT:String(fixed.size)},...[...fixed].map(([k,v],i) => ({[`GIT_CONFIG_KEY_${i}`]:k,[`GIT_CONFIG_VALUE_${i}`]:v})));
+function isolatedGit() {
+  const fixed = Object.entries({"core.hooksPath":"/dev/null","core.fsmonitor":"false","core.ignoreStat":"false",
+    "core.sparseCheckout":"false","core.symlinks":"true","submodule.recurse":"false"});
+  return Object.assign(historyEnv(),{GIT_CONFIG_COUNT:String(fixed.length)},...fixed.map(([k,v],i) => ({[`GIT_CONFIG_KEY_${i}`]:k,[`GIT_CONFIG_VALUE_${i}`]:v})));
 }
 function extract(t: Task, p: Proof, commit: string, env: NodeJS.ProcessEnv) {
   const dirs = t.config.proofTestDirs || [];
@@ -44,22 +41,48 @@ function extract(t: Task, p: Proof, commit: string, env: NodeJS.ProcessEnv) {
   });
 }
 interface Pair {t:Task; p:Proof; binding:Binding; attempt:string; files:ReturnType<typeof extract>; env:NodeJS.ProcessEnv; signal:AbortSignal}
-function mount(cwd: string, commit: string, {env,p,files}: Pair) {
-  for (const {path,mode} of treeFiles(cwd,commit,env)) {
+function originalDir(path: string) {
+  const stat = lstatSync(path,{throwIfNoEntry:false});
+  if (!stat) return false;
+  requireReport(stat.isDirectory() && realpathSync.native(path) === path,"测试材料目录非原名普通目录："+path);
+  return true;
+}
+function mount(cwd: string, commit: string, {t,env,p,files}: Pair) {
+  const dirs = t.config.proofTestDirs || [], roots = dirs.filter(d => !dirs.some(other => d.startsWith(other+"/")));
+  const entries = treeFiles(cwd,commit,env), allowed = [...p.testFiles];
+  for (const {path,mode} of entries) {
+    if (roots.some(d => path === d || path.startsWith(d+"/"))) allowed.push(path);
     if (mode === "160000" && p.testFiles.some(name => name === path || name.startsWith(path+"/"))) throw new Error("测试材料不能覆盖子模块："+path);
     if (mode !== "120000") continue;
     const link = join(cwd,path), target = resolve(dirname(link),readlinkSync(link));
     requireReport(inside(cwd,target) && inside(cwd,ifPresent(() => realpathSync(link)) || target),"临时检出中的链接越出本版本："+path);
   }
+  // 清空两端历史测试目录（含空子目录），只挂载交付版本明确列出的字节。
+  for (const root of roots.map(d => join(cwd,d))) if (originalDir(root)) rmSync(root,{recursive:true});
+  const selected = new Set(p.testFiles), parents = new Set<string>();
   for (const f of files) {
-    const name = join(cwd,f.path), parent = dirname(name), stat = lstatSync(name,{throwIfNoEntry:false});
+    const name = join(cwd,f.path), parent = dirname(name);
+    let existing = parent;
+    while (!originalDir(existing)) existing = dirname(existing);
+    for (let dir = dirname(f.path); dir !== "."; dir = dirname(dir)) parents.add(dir);
     mkdirSync(parent,{recursive:true});
-    requireReport(realpathSync.native(parent) === parent && (!stat || evidenceFile(cwd,f.path) === name && realpathSync.native(name) === name),"测试材料路径非原名普通文件："+f.path);
+    requireReport(!lstatSync(name,{throwIfNoEntry:false}),"测试材料路径重名："+f.path);
     atomicWrite(name,f.bytes);
     chmodSync(name,f.mode === "100755" ? 0o755 : 0o644);
   }
+  const verifyView = (path: string) => {
+    const dir = join(cwd,path);
+    if (!originalDir(dir)) return;
+    requireReport(parents.has(path),"出现未登记的测试材料："+path);
+    for (const item of readdirSync(dir,{withFileTypes:true})) {
+      const file = path+"/"+item.name;
+      if (item.isDirectory() && parents.has(file)) verifyView(file);
+      else requireReport(item.isFile() && selected.has(file),"出现未登记的测试材料："+file);
+    }
+  };
   return () => {
-    checkPin(cwd,commit,p.testFiles,env);
+    checkPin(cwd,commit,allowed,env);
+    roots.forEach(verifyView);
     for (const f of files) {
       const name = evidenceFile(cwd,f.path), mode = lstatSync(name).mode & 0o111;
       requireReport(realpathSync.native(name) === join(cwd,f.path) && Boolean(mode) === (f.mode === "100755") && digest(readFileSync(name)) === f.sha256,"运行时测试材料偏离交付内容："+f.path);
@@ -84,8 +107,8 @@ async function replay(pair: Pair, commit: string, dir: string) {
   let observation: Target | undefined, code: number | undefined, reason: string | undefined;
   try {
     requireReport(!signal.aborted,"证明已中断，未执行本端");
-    await checkout(t.repo,commit,async path => {
-      const cwd = realpathSync(path), verify = mount(cwd,commit,pair);
+    await privateCheckout(t.repo,commit,[dirname(t.dir),t.worktree],env,async cwd => {
+      const verify = mount(cwd,commit,pair);
       const work = {...t,worktree:cwd}, opts = {deadline,signal,isolated:sandbox(cwd,pair),sealed:true};
       verify();
       await projectCommand(work,"setup",join(dir,"setup.log"),opts);
@@ -105,7 +128,7 @@ async function replay(pair: Pair, commit: string, dir: string) {
       }
       const pass = observation.actual === expected, red = scene ? 1 : 76;
       requireReport(!run.killed && observation.expected === expected && observation.status === (pass ? "通过" : "失败") && run.code === (pass ? 0 : red),"目标断言的预期、实得、状态或命令退出码不一致");
-    },warning => warnings.push(warning),env);
+    },warning => warnings.push(warning));
   } catch (e) { reason = errorText(e); }
   requireReport(realpathSync(dir) === dir,"证明证据目录已改变："+dir);
   const log = ["test.log","setup.log"].map(f => join(dir,f)).find(existsSync) || join(dir,"error.log");
@@ -113,6 +136,16 @@ async function replay(pair: Pair, commit: string, dir: string) {
   for (const name of ["setup.log",relative(dir,log)]) if (existsSync(join(dir,name))) evidence.add(evidenceFile(dir,name));
   if (reason && code !== undefined) reason += `（退出码 ${code}）\n${clip(readFileSync(log,"utf8").trimEnd(),2048,true)}`;
   return {commit,observation,code,log,reason,warnings,evidence:[...evidence]};
+}
+function hashEvidence(dir: string, evidence: string[]) {
+  const report = join(dir,"result.json"), names = new Set(evidence);
+  requireReport(names.size === evidence.length && names.has(report) && names.has(join(dir,"plan.json")),"证明证据清单不完整或有重复项");
+  // 总结果本身不自哈希；其余文件均按首次归档的原始字节绑定。
+  return Object.fromEntries(evidence.filter(file => file !== report).map(file => {
+    const path = relative(dir,file);
+    requireReport(evidenceFile(dir,path) === file,"证据不是本次尝试的原名文件："+path);
+    return [path,digest(readFileSync(file))];
+  }));
 }
 async function advance(t: Task, p: Proof, binding: Binding, root: string, signal: AbortSignal) {
   const attempt = randomUUID(), start = Date.now(), dir = join(root,attempt), report = join(dir,"result.json");
@@ -122,7 +155,7 @@ async function advance(t: Task, p: Proof, binding: Binding, root: string, signal
   let beforeRun: Awaited<ReturnType<typeof replay>> | undefined, afterRun: typeof beforeRun, reason: string | undefined;
   let materials: Omit<Pair["files"][number],"bytes">[] = [];
   try {
-    const env = isolatedGit(t.repo), files = extract(t,p,binding.commit,env), pair = {t,p,binding,attempt,files,env,signal};
+    const env = isolatedGit(), files = extract(t,p,binding.commit,env), pair = {t,p,binding,attempt,files,env,signal};
     materials = files.map(({bytes,...entry}) => entry);
     beforeRun = await replay(pair,p.before,join(dir,"before"));
     afterRun = await replay(pair,binding.commit,join(dir,"after"));
@@ -142,19 +175,56 @@ async function advance(t: Task, p: Proof, binding: Binding, root: string, signal
   const detail = [`问题单：${p.issue}；目标断言：${p.testName ?? `${p.scenario} / ${p.checkpoint}`}；预期：${show(p.expected)}`,
     `旧版 ${p.before} 实得：${show(beforeRun?.observation?.actual)}；修复版 ${binding.commit} 实得：${show(afterRun?.observation?.actual)}`,
     reason && "原因："+clip(reason.replaceAll("\n","；"),600)].filter(Boolean).join("\n");
-  const r = {...plan,...span(start),step,result:reason ? "未证明" : "已证明",detail,evidence,report,materials,
-    materialDigest:materials.length ? digest(JSON.stringify(materials)) : undefined,beforeRun,afterRun,reason} satisfies Check & Record<string,unknown>;
+  const result: Verdict = reason ? "未证明" : "已证明";
+  const r = {...plan,...span(start),step,result,detail,evidence,report,materials,
+    evidenceHashes:hashEvidence(dir,evidence),materialDigest:materials.length ? digest(JSON.stringify(materials)) : undefined,beforeRun,afterRun,reason} satisfies Check & Record<string,unknown>;
   writeJson(report,r);
   return r;
 }
 type Attempt = Awaited<ReturnType<typeof advance>>;
+type Verdict = "已证明" | "未证明";
+const proofVerdict = (value: unknown): value is Verdict => value === "已证明" || value === "未证明";
+const objectRecord = (value: unknown): value is Record<string,unknown> => isObject(value);
+function recoverAttempt(t: Task, dir: string, attempt: string): Attempt {
+  requireReport(realpathSync.native(dir) === dir,"证明尝试目录已改变："+dir);
+  const report = evidenceFile(dir,"result.json"), r = readJson<unknown>(report);
+  requireReport(objectRecord(r) && r.executionId === t.executionId && r.attempt === attempt && r.report === report,"证明归档与执行或尝试不符");
+  requireReport(r.step === step && proofVerdict(r.result),"证明归档的步骤或结论不合法");
+  requireReport(typeof r.commit === "string" && fullSHA.test(r.commit) && typeof r.tree === "string" && fullSHA.test(r.tree),"证明归档缺少完整版本");
+  requireReport(typeof r.promptHash === "string" && typeof r.acceptanceHash === "string" && (r.e2eHash === undefined || typeof r.e2eHash === "string") &&
+    typeof r.detail === "string" && typeof r.startedAt === "string" && typeof r.endedAt === "string" &&
+    typeof r.durationMs === "number" && Number.isFinite(r.durationMs) && r.durationMs >= 0,"证明归档的检查字段不合法");
+  const declaration = t.proofs?.find(p => JSON.stringify(p) === JSON.stringify(r.proof));
+  requireReport(declaration && r.setup === t.config.setup && r.timeoutMin === t.limits.测试.timeoutMin,"证明归档与开工声明不符");
+  requireReport(Array.isArray(r.evidence) && r.evidence.every(f => typeof f === "string") && objectRecord(r.evidenceHashes),"证明归档缺少证据摘要");
+  const hashes = hashEvidence(dir,r.evidence);
+  requireReport(Object.keys(hashes).length === Object.keys(r.evidenceHashes).length,"证明证据摘要清单不完整");
+  for (const [path,sha256] of Object.entries(hashes)) requireReport(r.evidenceHashes[path] === sha256,"证明证据摘要不符："+path);
+  if (r.result === "已证明") {
+    const red = declaration.scenario === undefined ? 76 : 1;
+    for (const [side,run,commit,code,status,actual] of [
+      ["before",r.beforeRun,declaration.before,red,"失败",declaration.beforeActual],
+      ["after",r.afterRun,r.commit,0,"通过",declaration.expected],
+    ] as const) {
+      requireReport(objectRecord(run) && run.commit === commit && run.code === code && !run.reason && objectRecord(run.observation) &&
+        run.observation.status === status && run.observation.actual === actual && run.observation.expected === declaration.expected,"已证明的尝试两端实得或结论不符："+side);
+      for (const name of ["plan.json","result.json","test.log"]) {
+        const path = side+"/"+name;
+        requireReport(Object.hasOwn(hashes,path),"已证明的尝试缺少两端原始证据："+path);
+      }
+    }
+  }
+  return r as Attempt;
+}
 function publish(t: Task, r: Attempt) {
-  const {proof,executionId,setup,timeoutMin,materialDigest,materials,beforeRun,afterRun,reason,report,...fact} = r;
+  const {attempt,result,commit,tree,promptHash,acceptanceHash,e2eHash,startedAt,endedAt,durationMs,detail,evidence,report} = r;
+  requireReport(proofVerdict(result),"证明归档的结论不合法");
   withLock(join(t.dir,"status.lock"),() => {
-    if (!checksOf(t.dir).some(c => c.step === step && c.attempt === r.attempt)) recordStep(t.dir,fact);
+    if (!checksOf(t.dir).some(c => c.step === step && c.attempt === attempt))
+      recordStep(t.dir,{step,result,commit,tree,promptHash,acceptanceHash,e2eHash,startedAt,endedAt,durationMs,attempt,detail,evidence});
   });
-  batchResult(t,["",`## ${r.endedAt} · ${step}`,`执行：${executionId}`,`结果：${r.result}`,r.detail,
-    `证据：[本次记录](${report.split("/").map(encodeURIComponent).join("/")})`],`<!-- dev-loop-proof:${r.attempt} -->`);
+  batchResult(t,["",`## ${endedAt} · ${step}`,`执行：${t.executionId}`,`结果：${result}`,detail,
+    `证据：[本次记录](${report.split("/").map(encodeURIComponent).join("/")})`],`<!-- dev-loop-proof:${attempt} -->`);
 }
 export async function prove(t: Task) {
   const {dir,executionId} = t, proofs: (Attempt & {reused:boolean})[] = [];
@@ -169,12 +239,15 @@ export async function prove(t: Task) {
     const root = join(dir,"proofs");
     mkdirSync(root,{recursive:true,mode:0o700});
     requireReport(realpathSync(root) === root,"证明目录越界："+root);
+    const ignoredAttempts: {attempt:string; report:string; reason:string}[] = [];
+    const readSaved = (attempt: string) => {
+      const parent = join(root,attempt);
+      try { return recoverAttempt(t,parent,attempt); }
+      catch (error) { ignoredAttempts.push({attempt,report:join(parent,"result.json"),reason:errorText(error)}); }
+    };
     const saved = readdirSync(root,{withFileTypes:true}).flatMap(e => {
-      if (!e.isDirectory()) return [];
-      const parent = join(root,e.name), file = join(parent,"result.json");
-      if (!lstatSync(file,{throwIfNoEntry:false})?.isFile()) return [];
-      const r = readJson<Attempt>(evidenceFile(parent,"result.json"));
-      if (r.executionId !== executionId || r.attempt !== e.name || r.report !== file) return [];
+      const r = e.isDirectory() ? readSaved(e.name) : undefined;
+      if (!r) return [];
       publish(t,r);
       return [r];
     });
@@ -183,13 +256,14 @@ export async function prove(t: Task) {
     try {
       for (const p of t.proofs || []) {
         if (controller.signal.aborted) break;
-        const old = saved.find(r => r.result === "已证明" && r.commit === binding.commit && r.tree === binding.tree && JSON.stringify(r.proof) === JSON.stringify(p) &&
-          r.setup === t.config.setup && r.timeoutMin === t.limits.测试.timeoutMin && maybe(() => r.evidence.every(f => evidenceFile(dirname(r.report),relative(dirname(r.report),f)) === f)));
+        const matches = (r: Attempt) => r.result === "已证明" && r.commit === binding.commit && r.tree === binding.tree && JSON.stringify(r.proof) === JSON.stringify(p);
+        const matching = saved.find(matches), current = matching && readSaved(matching.attempt);
+        const old = current && matches(current) ? current : undefined;
         const r = old || await advance(t,p,binding,root,controller.signal);
         if (!old) publish(t,r);
         proofs.push({...r,reused:Boolean(old)});
       }
-      return {executionId,commit:binding.commit,proofs};
+      return {executionId,commit:binding.commit,proofs,...(ignoredAttempts.length ? {ignoredAttempts} : {})};
     } finally { process.off("SIGINT",cancel).off("SIGTERM",cancel); }
   }).catch(e => { throw e instanceof BusyError ? new InputError("本执行正在跑证明，请稍后重试") : e; });
 }

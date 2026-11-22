@@ -68,9 +68,10 @@ function project(t: TestContext, {old = "bug", dep = "old", earlierFailure = fal
     mkdirSync(join(w,testDir),{recursive:true}); writeFileSync(join(w,testDir,"order.bin"),seed);
     return deliver(task.dir).commit;
   };
-  const run = async (task: ReturnType<typeof taskOf>, extraEnv?: NodeJS.ProcessEnv) =>
-    getOutput(await f.cli(["证明",task.executionId,"--json"],f.repo,extraEnv)).proofs;
-  return {...f,oldCommit,batch,start,submit,run};
+  const receipt = async (task: ReturnType<typeof taskOf>, extraEnv?: NodeJS.ProcessEnv) =>
+    getOutput(await f.cli(["证明",task.executionId,"--json"],f.repo,extraEnv));
+  const run = async (task: ReturnType<typeof taskOf>, extraEnv?: NodeJS.ProcessEnv) => (await receipt(task,extraEnv)).proofs;
+  return {...f,oldCommit,batch,start,submit,receipt,run};
 }
 const getOutput = ({stdout}: {stdout: string}) => JSON.parse(stdout);
 const checks = (dir: string) => checksOf(dir).filter(c => c.step === "防复发证明");
@@ -107,6 +108,32 @@ test("A8：实际原单重投及定向单元测试；两版隔离、开工快照
   const reused = await f.run(task);
   assert.deepEqual(reused.map((r: any) => [r.attempt,r.reused]),results.map((r: any) => [r.attempt,true]));
   assert.equal(checks(task.dir).length,2); assert.equal(batchCount(f.batch),2);
+});
+
+test("必修 1：产品不变、只改漏列的种子，不能产生防复发证明", async t => {
+  const f = project(t), entry = "test/read-seed.cjs", input = "test/seed.txt";
+  write(join(f.repo,entry),`const fs=require('node:fs'), {join}=require('node:path'), dir=process.env.LOOP_PROOF_DIR;
+const plan=JSON.parse(fs.readFileSync(join(dir,'plan.json'),'utf8'));
+const actual=Number(fs.readFileSync(join(__dirname,'seed.txt'),'utf8'));
+const pass=actual===plan.expected;
+fs.writeFileSync(join(dir,'result.json'),JSON.stringify({...plan,actual,status:pass?'通过':'失败'}));
+process.exitCode=pass?0:76;`);
+  write(join(f.repo,input),"0\n");
+  f.git("add","test"); f.git("commit","-m","fixture with old seed");
+  const declaration = {...unit,testName:"读取种子",test:`node ${entry}`,testFiles:[entry]};
+  const task = await f.start([{...declaration,issue:"漏列种子"},{...declaration,issue:"列全种子",testFiles:[entry,input]}]);
+  write(join(task.worktree,input),"1\n");
+  const {commit} = deliver(task.dir);
+  assert.equal(f.git("rev-parse",`${task.baseCommit}:src`),f.git("rev-parse",`${commit}:src`));
+  const [omitted,listed] = await f.run(task);
+  assert.equal(omitted.result,"未证明");
+  for (const side of [omitted.beforeRun,omitted.afterRun]) {
+    assert.equal(side.observation,undefined);
+    assert.match(readText(side.log),/ENOENT.*seed\.txt/);
+  }
+  assert.equal(listed.result,"未证明");
+  assert.deepEqual([listed.beforeRun.observation.actual,listed.afterRun.observation.actual],[1,1]);
+  assert.match(listed.reason,/旧版也通过/);
 });
 
 test("A9：定向名未选中、编译失败、前置断言失败都没有红证据", async t => {
@@ -186,6 +213,47 @@ test("历史构建目录指向用户目录时，不运行 setup；不执行外�
   assert.equal(attempt.afterRun.observation.actual,1); assert.equal(readText(sentinel),"原用户产物\n"); assert.equal(existsSync(ran),false);
 });
 
+test("必修 4：两端 setup 写本地 Git 配置，不触碰原仓库配置", async t => {
+  const f = project(t), cfg = join(f.repo,".autoreview.json");
+  write(cfg,JSON.stringify({...getJson(cfg),setup:`node src/build.cjs &&
+if ! git symbolic-ref -q HEAD >/dev/null; then
+  git config --local core.hooksPath .proof-fixture-hooks &&
+  git config --local --get core.hooksPath && git rev-parse --absolute-git-dir
+fi`}));
+  const task = await f.start([scene]); f.submit(task);
+  f.git("config","--local","core.hooksPath",".user-fixture-hooks");
+  const source = f.git("rev-parse","--absolute-git-dir"), config = join(source,"config"), original = readFileSync(config);
+  const [r] = await f.run(task);
+  assert.equal(r.result,"已证明");
+  assert.deepEqual(readFileSync(config),original);
+  const privateDirs = [r.beforeRun,r.afterRun].map(side => {
+    const log = readText(join(dirname(side.log),"setup.log"));
+    assert.match(log,/^\.proof-fixture-hooks$/m);
+    const gitDir = log.trimEnd().split("\n").at(-1)!;
+    assert.notEqual(gitDir,source);
+    assert.ok(!gitDir.startsWith(source+"/"));
+    assert.equal(existsSync(gitDir),false);
+    return gitDir;
+  });
+  assert.notEqual(privateDirs[0],privateDirs[1]);
+});
+
+test("必修 5：TMPDIR 指向用户仓库时，不能沿父目录加载用户依赖", async t => {
+  const f = project(t), dep = "proof-fixture-parent-only", sentinel = join(f.repo,"node_modules",dep,"index.js");
+  const task = await f.start([{...scene,test:`node -e "require('${dep}')" && ${scene.test}`}]); f.submit(task);
+  write(sentinel,"module.exports = 1;\n");
+  const temp = join(f.repo,"temp-for-proof"), alias = join(f.base,"alias-temp");
+  mkdirSync(temp); symlinkSync(temp,alias);
+  for (const TMPDIR of [temp,alias]) {
+    const [r] = await f.run(task,{TMPDIR});
+    assert.equal(r.result,"未证明");
+    assert.equal(r.beforeRun.observation,undefined);
+    assert.match(readText(r.beforeRun.log),new RegExp(`Cannot find module '${dep}'`));
+  }
+  assert.deepEqual(readdirSync(temp),[]);
+  assert.equal(readText(sentinel),"module.exports = 1;\n");
+});
+
 test("A5：并发只跑一次，快照绑定原交付且不阻塞新交付", async t => {
   const f = project(t), task = await f.start([{...scene,test:scene.test+" hold"}]);
   const commit = f.submit(task), root = join(task.dir,"proofs"), running = f.run(task);
@@ -211,6 +279,51 @@ test("批次摘要登记中断后补写同一尝试，不覆盖原文件或重�
   const [result] = await f.run(task);
   assert.equal(result.attempt,written.attempt); assert.equal(result.reused,true); assert.deepEqual(checks(task.dir),[written]);
   assert.equal(batchCount(f.batch),1); assert.ok(readText(f.batch).startsWith("原收尾摘要\n"));
+});
+
+test("必修 2：两端报告、检查点证据或日志损坏时，不补摘要、不复用", async t => {
+  const f = project(t), paths = ["before/result.json","after/替身记录.json","after/test.log"];
+  const task = await f.start(paths.map((issue,i) => ({...scene,issue:`损坏证据 ${i+1}`}))); f.submit(task);
+  const previous = await f.run(task), priorChecks = checks(task.dir);
+  rmSync(f.batch); // 模拟批次摘要未发布；仍保留执行账本及原尝试。
+  const changed = previous.map((r: any,i: number) => {
+    assert.equal(r.result,"已证明");
+    const file = join(dirname(r.report),paths[i]), content = i === 0 ? "" : "changed\n", originalHash = digest(readFileSync(file));
+    write(file,content);
+    return {file,content,originalHash,report:readText(r.report)};
+  });
+  const {proofs,ignoredAttempts} = await f.receipt(task);
+  for (const [i,r] of proofs.entries()) {
+    const prior = previous[i];
+    assert.equal(r.result,"已证明"); assert.equal(r.reused,false); assert.notEqual(r.attempt,prior.attempt);
+    const ignored = ignoredAttempts.find((entry: any) => entry.attempt === prior.attempt);
+    assert.ok(ignored); assert.ok(ignored.reason.includes(`证明证据摘要不符：${paths[i]}`));
+    assert.equal(prior.evidenceHashes[paths[i]],changed[i].originalHash);
+    assert.equal(readText(changed[i].file),changed[i].content); assert.equal(readText(prior.report),changed[i].report);
+    assert.ok(!readText(f.batch).includes(`<!-- dev-loop-proof:${prior.attempt} -->`));
+  }
+  assert.deepEqual(checks(task.dir).slice(0,priorChecks.length),priorChecks);
+  assert.equal(checks(task.dir).length,6); assert.equal(batchCount(f.batch),3);
+});
+
+test("必修 3：未发布的归档串入其他步骤或结论时，不能写入正式检查", async t => {
+  const f = project(t), task = await f.start([{...scene,issue:"步骤串入"},{...scene,issue:"结论串入"}]);
+  const commit = f.submit(task), ledger = join(task.dir,"checks.jsonl"), before = readText(ledger);
+  const old = await f.run(task);
+  write(ledger,before); rmSync(f.batch); // 模拟仅落盘总结果，尚未追加账本与批次摘要。
+  const tampered = old.map((r: any,i: number) => {
+    const record = getJson(r.report);
+    write(r.report,JSON.stringify({...record,step:i === 0 ? "复测" : record.step,result:"通过"}));
+    return readText(r.report);
+  });
+  const {proofs,ignoredAttempts} = await f.receipt(task);
+  assert.deepEqual(proofs.map((r: any) => [r.result,r.reused]),[["已证明",false],["已证明",false]]);
+  assert.deepEqual(checksOf(task.dir).filter(c => ["复测","评审"].includes(c.step)),[]);
+  assert.ok(ignoredAttempts.every((r: any) => /步骤或结论不合法/.test(r.reason)));
+  assert.deepEqual(ignoredAttempts.map((r: any) => r.attempt).sort(),old.map((r: any) => r.attempt).sort());
+  assert.ok(old.every((r: any,i: number) => readText(r.report) === tampered[i] && !readText(f.batch).includes(r.attempt)));
+  assert.deepEqual(checks(task.dir).map(c => c.result),["已证明","已证明"]);
+  assert.equal(checked(task.dir,commit),false); assert.equal(batchCount(f.batch),2);
 });
 
 test("证明只接受执行号；未交付拒绝，未声明不建证明目录；不存在的旧 SHA 不开工", async t => {
