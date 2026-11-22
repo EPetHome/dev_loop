@@ -7,79 +7,67 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, waitFor, update, fail, inputs, launchStarted } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, update, fail, inputs, launchStarted, type Status } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startCompanion, startFinish } from "./after-settle.ts";
 import { convention } from "./convention.ts";
-interface LaunchOptions {
-  openTerminal?: (script: string) => Promise<void>;
-  startupTimeoutMs?: number;
-  env?: NodeJS.ProcessEnv;
-  reviewOnly?: boolean;
-  confirmedCommit?: string; handoff?: boolean;
-}
+type LaunchOptions = {openTerminal?: (script: string) => Promise<void>; startupTimeoutMs?: number; env?: NodeJS.ProcessEnv;
+  reviewOnly?: boolean; confirmedCommit?: string; handoff?: boolean};
 const launchFiles = (dir: string, id: string) => ({
-  request: join(dir, "launch-" + id + ".json"), pid: join(dir, "launch-" + id + "-pid.json"),
-  exit: join(dir, "launch-" + id + "-exit.json"), log: join(dir, "launch-" + id + ".log"),
+  request: join(dir, `launch-${id}.json`), pid: join(dir, `launch-${id}-pid.json`),
+  exit: join(dir, `launch-${id}-exit.json`), log: join(dir, `launch-${id}.log`),
 });
 /** 在 Terminal 内保留真实 TTY；只收集 stderr，回报子进程退出及其原始错误。 */
 export async function terminalSession(dir: string, id: string): Promise<number> {
   const t = taskOf(dir), files = launchFiles(dir, id);
   const request = readJson<{args: string[]; deadline: number; sessionId?: string}>(files.request);
-  if (statusOf(dir).state !== "working" || Date.now() >= request.deadline) {
-    writeJson(files.exit, {code: 1, raw: "会话启动请求已过期或任务已停止"}); return 1;
-  }
-  return new Promise((accept, reject) => {
-    let raw = "", finished = false, child: ReturnType<typeof spawn> | undefined;
-    const finish = (code: number) => {
-      if (finished) return; finished = true;
-      update(dir, (s) => { if (s.loop.startingSession?.launchId === id) s.loop.startingSession = null; });
-      writeJson(files.exit, {code, raw}); accept(code);
-    };
-    try {
-      // 与 stop/registerSession 共用状态锁：创建+发布要么先于取消，要么取消后不再创建。
-      update(dir, (s) => {
-        if (s.state !== "working" || Date.now() >= request.deadline) return;
-        child = spawn(join(APP_ROOT, "bin/pi-dev"), request.args, {
-          cwd: t.worktree, stdio: ["inherit", "inherit", "pipe"],
-          env: {...process.env, LOOP_TASK_DIR: dir, LOOP_PI_WINDOW_OWNER: request.sessionId ? `${process.pid}:${request.sessionId}` : undefined},
-        });
-        child.stderr!.setEncoding("utf8");
-        child.stderr!.on("data", (text: string) => { raw += text; appendFileSync(files.log, text); process.stderr.write(text); });
-        child.once("error", (e) => { raw += String(e); appendFileSync(files.log, String(e)); finish(127); });
-        child.once("close", (code) => finish(code ?? 1));
-        if (child.pid) {
-          const p = identity(child.pid);
-          if (p.startedAt) { s.loop.startingSession = {...p, launchId: id}; writeJson(files.pid, p); }
-          else { raw += "无法读取待登记会话进程身份"; child.kill("SIGKILL"); }
-        }
-      });
-      if (!child) { raw = "会话启动请求已过期或任务已停止"; finish(1); }
-    } catch (e) { finished = true; child?.kill("SIGKILL"); reject(e); }
-  });
+  const expired = "会话启动请求已过期或任务已停止";
+  const startable = (s: Status) => s.state === "working" && Date.now() < request.deadline;
+  const saveExit = (code: number, raw: string) => { writeJson(files.exit, {code, raw}); return code; };
+  if (!startable(statusOf(dir))) return saveExit(1, expired);
+  const exit = Promise.withResolvers<number>(); let raw = "", child: ReturnType<typeof spawn> | undefined;
+  const log = (text: string) => { raw += text; appendFileSync(files.log, text); };
+  try {
+    // 与 stop/registerSession 共用状态锁：取消后不再创建进程。
+    update(dir, s => {
+      if (!startable(s)) return;
+      child = spawn(join(APP_ROOT, "bin/pi-dev"), request.args, {cwd: t.worktree, stdio: ["inherit", "inherit", "pipe"],
+        env: {...process.env, LOOP_TASK_DIR: dir, LOOP_PI_WINDOW_OWNER: request.sessionId ? `${process.pid}:${request.sessionId}` : undefined}});
+      child.stderr!.setEncoding("utf8").on("data", (text: string) => { log(text); process.stderr.write(text); });
+      child.once("error", e => { log(String(e)); exit.resolve(127); });
+      child.once("close", code => exit.resolve(code ?? 1));
+      if (!child.pid) return;
+      const p = identity(child.pid);
+      if (p.startedAt) { s.loop.startingSession = {...p, launchId: id}; writeJson(files.pid, p); }
+      else { raw += "无法读取待登记会话进程身份"; child.kill("SIGKILL"); }
+    });
+  } catch (e) { child?.kill("SIGKILL"); throw e; }
+  const code = child ? await exit.promise : 1;
+  update(dir, s => { if (s.loop.startingSession?.launchId === id) s.loop.startingSession = null; });
+  return saveExit(code, child ? raw : expired);
 }
 function waitForSession(dir: string, id: string, timeoutMs: number): Promise<void> {
   const files = launchFiles(dir, id);
   return new Promise((accept, reject) => {
-    let done = false, timer: ReturnType<typeof setTimeout> | undefined;
+    let done = false;
     const finish = (error?: Error) => {
-      if (done) return; done = true; watcher.close(); clearTimeout(timer);
-      if (error) reject(error); else accept();
+      if (done) return;
+      done = true; watcher.close(); clearTimeout(timer);
+      return error ? reject(error) : accept();
     };
     const check = () => {
       if (done) return;
       try {
-        const s = statusOf(dir), pid = optionalJson<Identity>(files.pid);
-        if (s.state !== "working") { finish(s.state === "failed" ? new Error(s.error?.raw || s.message) : undefined); return; }
-        const session = s.loop.session;
-        if (pid && session && pid.pid === session.pid && pid.startedAt === session.startedAt && !session.endedAt && alive(session)) { finish(); return; }
+        const s = statusOf(dir), pid = optionalJson<Identity>(files.pid), session = s.loop.session;
+        if (s.state !== "working") return finish(s.state === "failed" ? new Error(s.error?.raw || s.message) : undefined);
+        if (pid && session && pid.pid === session.pid && pid.startedAt === session.startedAt && !session.endedAt && alive(session)) return finish();
         const exited = optionalJson<{code: number; raw: string}>(files.exit);
         if (exited) finish(new Error("pi 开发会话启动失败（登记前退出，退出码 " + exited.code + "）\n" + exited.raw));
       } catch (e) { finish(e instanceof Error ? e : new Error(String(e))); }
     };
-    const watcher = watch(dir, check); watcher.on("error", finish);
-    timer = setTimeout(() => {
+    const watcher = watch(dir, check).on("error", finish);
+    const timer = setTimeout(() => {
       try {
         signalProcess(optionalJson<Identity>(files.pid));
         finish(new Error("pi 开发会话启动超时，未确认本次会话登记\n" + readFileSync(files.log, "utf8")));
@@ -119,8 +107,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
       {cwd:t.worktree,timeoutMs:Math.min(30000, timeoutMs)});
     if (result.code !== 0) throw new Error("终端启动失败\n" + result.output);
   });
-  await openTerminal(script);
-  await waitForSession(dir, id, deadline - Date.now());
+  await openTerminal(script); await waitForSession(dir, id, deadline - Date.now());
   update(dir, (s) => { if (s.state === "working") { s.message = "pi 开发会话已登记"; s.loop.bucket = "developmentMs"; s.timeLimitSec = null; } });
 }
 export async function launchMain(dir: string, resuming: boolean, options: LaunchOptions = {}): Promise<void> {
@@ -135,10 +122,9 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   try {
     if (options.reviewOnly || options.confirmedCommit) {
       const result = await settle(dir, "", {reviewOnly: options.reviewOnly, confirmedCommit: options.confirmedCommit});
-      if (!result.continue) { await startFinish(dir, options.env || process.env); return; }
-      if (taskOf(dir).host !== "pi") {
-        waitFor(dir, "需手动接入会话", (options.reviewOnly ? "补评审" : "确认交付后检查") + "需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
-      }
+      if (!result.continue) return await startFinish(dir, options.env || process.env);
+      if (taskOf(dir).host !== "pi") return waitFor(dir, "需手动接入会话", (options.reviewOnly ? "补评审" : "确认交付后检查") +
+        "需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason);
       update(dir, s => { s.loop.pendingReturn = result.reason; });
       const session = statusOf(dir).loop.session;
       if (alive(session) && !session?.endedAt) return;
@@ -147,10 +133,7 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
     if (!statusOf(dir).loop.ready) await prepare(dir);
     if (statusOf(dir).state !== "cancelled") { await startCompanion(dir,options.env || process.env); await launchSession(dir,resuming,options); }
   } catch (e) { fail(dir,e); throw e; }
-  finally {
-    clearInterval(timer);
-    update(dir, (s) => { if (s.loop.launcher?.pid === process.pid) s.loop.launcher = null; });
-  }
+  finally { clearInterval(timer); update(dir, s => { if (s.loop.launcher?.pid === process.pid) s.loop.launcher = null; }); }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [target, mode, value] = process.argv.slice(2);

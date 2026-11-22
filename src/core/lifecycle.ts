@@ -50,9 +50,9 @@ export function heartbeat(dir: string, now = Date.now(), throttled = false): voi
   const s = statusOf(dir); if (s.state !== "working" || (throttled && now - Date.parse(s.updatedAt) < 60000)) return;
   try { update(dir, () => {}); } catch (e) { if (!(e instanceof BusyError)) throw e; }
 }
-export function shutdownSession(dir: string): void { update(dir, s => {
-  if (s.loop.session) s.loop.session.endedAt = new Date().toISOString();
-  if (s.loop.bucket === "developmentMs") s.loop.bucket = null;
+export function shutdownSession(dir: string): void { update(dir, ({loop}) => {
+  if (loop.session) loop.session.endedAt = new Date().toISOString();
+  if (loop.bucket === "developmentMs") loop.bucket = null;
 }); }
 /** 只复用同一交付、同一输入下的复测；检查失败记录仍须是最近一次核心检查。 */
 export function retryReview(dir: string) {
@@ -88,10 +88,8 @@ export function resume(dir: string, text?: string, answering = false): {reused: 
       appendCheck(dir,{commit:s.loop.commit || t.baseCommit,tree:s.loop.delivery?.tree || "",step:"等你",result:"已续跑",startedAt,endedAt:new Date().toISOString(),durationMs:Math.max(0,Date.now()-Date.parse(startedAt)),evidence:[],promptHash,acceptanceHash});
     }
     if (answering) { appendJson(join(dir, "answers.jsonl"), {at: new Date().toISOString(), text}); s.loop.answerCount = answersOf(dir).length; }
-    if (text !== undefined) {
-      s.loop.pendingReturn = [s.loop.pendingReturn, answering ? "本人答复：" + text : text].filter(Boolean).join("\n\n");
-      s.loop.pendingOpening = !running && t.host === "pi";
-    }
+    if (text !== undefined) Object.assign(s.loop, {
+      pendingReturn: [s.loop.pendingReturn, answering ? "本人答复：" + text : text].filter(Boolean).join("\n\n"), pendingOpening: !running && t.host === "pi"});
     s.loop.testAllowance = Math.max(t.limits.测试.maxRepairs, s.loop.testReturns + 1);
     s.loop.reviewAllowance = Math.max(t.limits.开发评审.maxRepairs, s.loop.reviewReturns + 1); s.loop.facts!.resumes++; s.state = "working";
     const note = text !== undefined ? (t.host === "pi" ? "；话已写入待送" : "；未送达，需在窗口里说；下一次 hook 交接") : running ? "，请在原开发会话继续" : "";
@@ -105,9 +103,10 @@ export function stop(dir: string, abandon = false): Status {
   });
   const {startingSession,activeProcess,launcher,session} = stopped.loop;
   signalProcess(startingSession); signalProcess(activeProcess,true); signalProcess(launcher,true); signalProcess(session);
-  if (abandon) withLock(operationPath(dir), () => {
+  if (!abandon) return stopped;
+  withLock(operationPath(dir), () => {
     clearCheck(t); if (existsSync(t.worktree)) gitText(t.repo, ["worktree", "remove", "--force", t.worktree]);
     rmSync(t.worktree, { recursive: true, force: true }); update(dir, (s) => { s.loop.abandoned = true; });
   });
-  return abandon ? statusOf(dir) : stopped;
+  return statusOf(dir);
 }

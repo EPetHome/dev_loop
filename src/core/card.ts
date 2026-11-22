@@ -18,6 +18,7 @@ const object = (v: any, label: string) => {
   if (!v || typeof v !== "object" || Array.isArray(v)) throw new InputError(label + " 须为对象");
   return v;
 };
+const only = (o: object, allowed: string[]) => Object.keys(o).every(k => allowed.includes(k));
 const text = (v: any, label: string): string => {
   if (typeof v !== "string" || !v.trim() || /[\0\r\n]/.test(v)) throw new InputError(label + " 须为非空单行字符串");
   return v.trim();
@@ -31,13 +32,13 @@ function reference(value: any, file: string, repo: string, label: string): strin
 }
 function limit(v: any, defaults: Limit): Limit {
   const raw = v === undefined ? {} : object(v, "limits"), out = { maxRepairs: raw.maxRepairs ?? defaults.maxRepairs, timeoutMin: raw.timeoutMin ?? defaults.timeoutMin };
-  if (Object.keys(raw).some((k) => !["maxRepairs", "timeoutMin", "maxRecoveries"].includes(k)) ||
+  if (!only(raw, ["maxRepairs", "timeoutMin", "maxRecoveries"]) ||
       !Number.isSafeInteger(out.maxRepairs) || out.maxRepairs < 0 || !Number.isSafeInteger(out.timeoutMin) || out.timeoutMin < 1) throw new InputError("限额 maxRepairs 须为非负整数、timeoutMin 须为正整数");
   return out;
 }
 export function parseScope(value: any): Scope {
   const raw = object(Array.isArray(value) ? { allow: value } : value, "scope");
-  if (Object.keys(raw).some((k) => !["allow", "deny"].includes(k))) throw new InputError("scope 只支持 allow/deny");
+  if (!only(raw, ["allow", "deny"])) throw new InputError("scope 只支持 allow/deny");
   const out = { allow: raw.allow, deny: raw.deny ?? [] };
   for (const paths of [out.allow, out.deny]) if (!Array.isArray(paths) || paths.some((p) => typeof p !== "string" || !safeRelative(p) || p === ".")) throw new InputError("scope 须为仓库内相对路径/通配符数组");
   if (!out.allow.length) throw new InputError("scope.allow 不能为空");
@@ -52,8 +53,7 @@ function matches(file: string, pattern: string): boolean {
 }
 export const inScope = (file: string, scope: Scope) => scope.allow.some((p) => matches(file, p)) && !scope.deny.some((p) => matches(file, p));
 export function parseDevelopmentCard(content: string, file: string, repo: string): Card {
-  const raw = object(JSON.parse(content), "开发卡");
-  if (raw.version !== 1) throw new InputError("开发卡 version 必须是 1");
+  const raw = object(JSON.parse(content), "开发卡"); if (raw.version !== 1) throw new InputError("开发卡 version 必须是 1");
   if (!Array.isArray(raw.tasks) || !raw.tasks.length) throw new InputError("tasks 须为非空数组");
   if (raw.tasks.length > 1) throw new UnsupportedError("本步不支持多任务卡；第 3 步支持（须选验收并标明任务归属）");
   if (!Array.isArray(raw.flow) || !raw.flow.length) throw new InputError("flow 须为非空数组");
@@ -65,21 +65,20 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
   }
   if (raw.nature !== "开发" || raw.flow[0] !== "开发评审" || raw.flow.some((s: string, i: number) => i && order.indexOf(s) <= order.indexOf(raw.flow[i - 1]))) throw new InputError("flow 须按 开发评审, 测试, 合入, 部署, 推送 的顺序且不重复");
   if (raw.flow.some((s: string) => ["部署", "推送"].includes(s)) && !raw.flow.includes("合入")) throw new InputError("flow 写部署或推送须包含合入");
-  if (Object.keys(raw).some((k) => !["version","name","nature","base","target","host","flow","tasks","limits","acceptance","next"].includes(k))) throw new InputError("开发卡有未知字段");
+  if (!only(raw, ["version","name","nature","base","target","host","flow","tasks","limits","acceptance","next"])) throw new InputError("开发卡有未知字段");
   if (raw.target !== "dev") throw new InputError("target 必须为 dev，不碰 main");
   const base = text(raw.base ?? raw.target, "base");
   if (base === "main" || base.startsWith("-")) throw new InputError("base 不合法或是 main");
   gitText(repo, ["check-ref-format", "--branch", base]);
   gitText(repo, ["rev-parse", "--verify", "--end-of-options", "refs/heads/" + base + "^{commit}"]);
-  const host = raw.host ?? "pi";
-  if (!["pi","claude","codex"].includes(host)) throw new InputError("host 须为 pi/claude/codex");
+  const host = raw.host ?? "pi"; if (!["pi","claude","codex"].includes(host)) throw new InputError("host 须为 pi/claude/codex");
   const task = object(raw.tasks[0], "任务"), name = text(task.name, "任务名");
-  if (Object.keys(task).some((k) => !["name","prompt","scope","test","limits"].includes(k))) throw new InputError("任务有未知字段");
+  if (!only(task, ["name","prompt","scope","test","limits"])) throw new InputError("任务有未知字段");
   const test = task.test === undefined ? "无：卡未选择测试" : text(task.test, "test");
   if (raw.flow.includes("测试") && task.test === undefined) throw new InputError("测试 flow 要求填写 test 或「无：原因」");
   if (/^无\s*[:：]/.test(test) && !/^无\s*[:：]\s*\S/.test(test)) throw new InputError("无测试须写原因");
   const limits = raw.limits === undefined ? {} : object(raw.limits, "limits");
-  if (Object.keys(limits).some((k) => !["开发评审","测试","验收","部署"].includes(k))) throw new InputError("limits 有未知字段");
+  if (!only(limits, ["开发评审","测试","验收","部署"])) throw new InputError("limits 有未知字段");
   const effectiveLimits = { 测试: limit(limits.测试, { maxRepairs: 3, timeoutMin: 20 }), 开发评审: limit(limits.开发评审, { maxRepairs: 4, timeoutMin: 60 }), 部署: limit(limits.部署, { maxRepairs: 2, timeoutMin: 20 }) };
   const hookBudgetSec = (effectiveLimits.测试.timeoutMin + effectiveLimits.开发评审.timeoutMin) * 60 + HOOK_OVERHEAD_SEC;
   if (host !== "pi" && hookBudgetSec > HOOK_TIMEOUT_SEC) throw new UnsupportedError(
@@ -94,8 +93,7 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
 }
 export function readCard(file: string) {
   try {
-    file = realpathSync(file);
-    const repo = realpathSync(repoRoot(dirname(file))), content = readFileSync(file, "utf8");
+    file = realpathSync(file); const repo = realpathSync(repoRoot(dirname(file))), content = readFileSync(file, "utf8");
     return { file, repo, card: parseDevelopmentCard(content, file, repo), cardHash: digest(content) };
   } catch (e) { if (e instanceof InputError) throw e; throw new InputError(e instanceof Error ? e.message : String(e)); }
 }

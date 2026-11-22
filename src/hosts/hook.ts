@@ -17,8 +17,8 @@ function takeReturn(dir: string): string {
 }
 export async function handleHook(event: HookEvent, eventName = event.hook_event_name || "", env = process.env): Promise<string> {
   if (!["SessionStart", "PostToolUse", "Stop"].includes(eventName)) return "";
-  const dir = locate(event.cwd || process.cwd(), env);
-  if (!dir) return "";
+  const dir = locate(event.cwd || process.cwd(), env); if (!dir) return "";
+  const block = (reason: string) => JSON.stringify({decision:"block",reason});
   try {
     if (eventName === "SessionStart") {
       const host = event.host === "codex" || event.provider === "codex" || env.LOOP_HOST === "codex" ? "codex" : "claude";
@@ -31,16 +31,10 @@ export async function handleHook(event: HookEvent, eventName = event.hook_event_
       heartbeat(dir, Date.now(), true); const reason = takeReturn(dir);
       return reason ? JSON.stringify({hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:reason}}) : "";
     }
-    heartbeat(dir);
-    const pending = takeReturn(dir);
-    if (pending) return JSON.stringify({decision:"block",reason:pending});
-    const r = await settle(dir, lastAssistantMessage(event));
-    if (!r.continue) await startFinish(dir,env);
-    return r.continue ? JSON.stringify({decision:"block",reason:r.reason}) : "";
-  } catch (e) {
-    fail(dir, e);
-    return JSON.stringify({systemMessage:"dev-loop 自身失败：" + (e instanceof Error ? e.message : String(e))});
-  }
+    heartbeat(dir); const pending = takeReturn(dir); if (pending) return block(pending);
+    const r = await settle(dir, lastAssistantMessage(event)); if (r.continue) return block(r.reason);
+    await startFinish(dir,env); return "";
+  } catch (e) { fail(dir, e); return JSON.stringify({systemMessage:"dev-loop 自身失败：" + (e instanceof Error ? e.message : String(e))}); }
 }
 export async function hookMain(args = process.argv.slice(2)): Promise<void> {
   let raw = "";

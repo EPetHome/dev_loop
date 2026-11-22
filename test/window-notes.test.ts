@@ -16,20 +16,46 @@ const opening = (path: string, text: string) => `<file name="${path}">\n${text}\
 
 function piWindow(task: Task, options: {managed?: boolean; mode?: string; id?: string; owner?: string; branch?: unknown[]} = {}) {
   const handlers: Record<string, (event: any, ctx: any) => any> = {}, timers: (() => void)[] = [], sent: any[] = [];
+  const terminal = new Set<(key: string) => void>(), queued: string[] = [], dispatched: string[] = [];
+  let compacting = false;
+  const route = (text: string) => {
+    if (!text) return;
+    if (compacting) queued.push(text);
+    else { dispatched.push(text); emit("input", {source: "interactive", text}); }
+  };
+  // Pi 1.3.0: 普通提交和追问分别裁剪，压缩期间先排队，均不要求派发 input。
+  const editor = new class {
+    text = "";
+    actionHandlers = new Map([["app.message.followUp", () => { const value = this.getExpandedText().trim(); this.text = ""; route(value); }]]);
+    getExpandedText() { return this.text; }
+    submitValue() { const value = this.getExpandedText().trim(); this.text = ""; route(value); }
+    handleInput(key: string) {
+      if (key === "Enter") this.submitValue();
+      if (key === "Alt+Enter") this.actionHandlers.get("app.message.followUp")!();
+    }
+  }();
+  let focused: unknown = editor;
   const ctx = {cwd: task.worktree, mode: options.mode ?? "tui", sessionManager: {
     getSessionId: () => options.id ?? task.executionId, getSessionFile: () => join(task.dir, "Pi 会话.jsonl"), getBranch: () => options.branch ?? [],
-  }};
+  }, ui: {setStatus() {}, setTitle() {}, setWidget(_key: string, factory?: (tui: any) => object) { factory?.({getFocusedComponent: () => focused}); },
+    onTerminalInput(fn: (key: string) => void) { terminal.add(fn); return () => {terminal.delete(fn);}; }}};
   const env = {LOOP_TASK_DIR: task.dir,
     LOOP_PI_WINDOW_OWNER: options.managed === false ? undefined : options.owner ?? `${process.ppid}:${task.executionId}`};
   registerPi({on: (name, fn) => { handlers[name] = fn; }, sendMessage: (message, opts) => sent.push({message, opts})},
     {env, every: fn => { timers.push(fn); return {unref() {}}; }, clear() {}});
   const emit = (type: string, event = {}) => handlers[type]?.({type, ...event}, ctx);
   emit("session_start", {reason: "startup"});
-  return {emit, sent, ctx, input: (text: string, extra = {}) => emit("input", {source: "interactive", text, ...extra}),
+  const submit = (text: string, key = "Enter", source: "terminal" | "program" | "dialog" = "terminal") => {
+    editor.text = text; focused = source === "dialog" ? {handleInput() {}} : editor;
+    if (source !== "program") for (const fn of terminal) fn(key);
+    (focused as typeof editor).handleInput(key);
+  };
+  return {emit, sent, ctx, submit, queued, dispatched, input: (text: string, extra = {}) => emit("input", {source: "interactive", text, ...extra}),
+    compact: () => {compacting = true;}, flush: () => {compacting = false; queued.splice(0).forEach(route);},
     refresh: () => timers[1](), close: () => emit("session_shutdown", {reason: "quit"})};
 }
 
-test("G7 A1：只采 Pi input 原文，按提交顺序显示时间和多行文本", async t => {
+test("G7 A1：从编辑器提交原文，按顺序显示提交时间和多行文本", async t => {
   const f = fixture(t, {reviewer: 'cp "$2" "$LOOP_TASK_DIR/seen.md"\nprintf %s ' + sq(PASS)}), task = await f.prepare(), p = piWindow(task);
   const begin = "自动开场，不是本人输入", expanded = "展开出来的路径和内容，不是本人原话", tool = "工具输出不能冒认为本人";
   assert.equal(p.sent[0].message.customType, "dev-loop-convention");
@@ -37,15 +63,17 @@ test("G7 A1：只采 Pi input 原文，按提交顺序显示时间和多行文�
   p.emit("before_agent_start", {messageType: "user", prompt: begin});
   p.emit("message_end", {message: {role: "toolResult", content: [{type: "text", text: tool}]}});
   assert.equal(existsSync(noteFile(task)), false);
-  const text = ["  第一段：保留相同字句！\r\n再看 @相对路径.md\n保留相同字句！  ", "第二段『另一句』🙂\n\n保留相同字句！\n"];
+  const text = ["  第一段：保留相同字句！\n再看 @相对路径.md\n保留相同字句！  \n\n", " /tmp 文件夹：『另一句』🙂\n\n保留相同字句！\n"];
   const start = Date.now(); t.mock.timers.enable({apis: ["Date"], now: start});
   try {
-    assert.equal(p.input(text[0], {streamingBehavior: "steer"}), undefined); // 观察，不拦截或改写
+    p.submit(text[0]);
     p.emit("before_agent_start", {messageType: "user", prompt: expanded});
     p.emit("message_end", {message: {role: "user", content: expanded}});
     p.input("来源不明", {source: undefined}); p.input("RPC", {source: "rpc"}); p.input("自动扩展", {source: "extension"});
-    t.mock.timers.tick(1000);
-    p.input(text[1], {streamingBehavior: "followUp"});
+    p.submit("程序设置编辑器并提交", "Enter", "program"); p.submit("对话框内容", "Enter", "dialog");
+    p.submit("草稿未提交", "Tab"); p.submit("/compact"); p.submit("!! 终端命令");
+    t.mock.timers.tick(1000); p.submit(text[1], "Alt+Enter");
+    assert.ok(text.every(value => p.dispatched.includes(value.trim())), "Pi 仍按自己的方式裁剪并派发");
   } finally { t.mock.timers.reset(); }
   const notes = readNotes(task);
   assert.deepEqual(notes, text.map((text, i) => ({source: "pi-tui", at: new Date(start + i * 1000).toISOString(), text})));
@@ -59,6 +87,28 @@ test("G7 A1：只采 Pi input 原文，按提交顺序显示时间和多行文�
   assert.ok(offsets[0] > 0 && offsets[1] > offsets[0]);
   for (const data of [begin, tool, expanded, "来源不明", "自动扩展", "未知记录不能冒认"]) assert.ok(!material.includes(data), data);
   assert.equal(statusOf(task.dir).state, "completed"); p.close();
+});
+
+test("G7 r1：压缩时提交立刻落盘，有提交时间；排空不重记，未排空退出也保留", async t => {
+  const f = fixture(t), task = await f.prepare(), p = piWindow(task);
+  const texts = ["  正常提交。\n\n", "  追问提交！\n  尾行  \n\n", "  尚未排空即退出。\n\n"];
+  const start = Date.now(); t.mock.timers.enable({apis: ["Date"], now: start});
+  try {
+    p.compact(); p.submit(texts[0]);
+    t.mock.timers.tick(1000); p.submit(texts[1], "Alt+Enter");
+    assert.deepEqual(p.queued, texts.slice(0, 2).map(s => s.trim()));
+    assert.deepEqual(p.dispatched, []);
+    const before = readNotes(task);
+    assert.deepEqual(before.map(n => [n.at, n.text]), texts.slice(0, 2).map((s, i) => [new Date(start + i * 1000).toISOString(), s]));
+    t.mock.timers.tick(30_000); p.flush();
+    assert.deepEqual(p.dispatched, texts.slice(0, 2).map(s => s.trim()));
+    assert.deepEqual(readNotes(task), before);
+    p.compact(); p.submit(texts[2]); p.close();
+    assert.deepEqual(p.queued, [texts[2].trim()]);
+    assert.deepEqual(readNotes(task).map(n => n.text), texts);
+    p.submit("关闭后不可采集");
+    assert.equal(readNotes(task).length, 3);
+  } finally { t.mock.timers.reset(); }
 });
 
 test("G7 A2：答复、带话续跑、返修和恢复不补记，两次同文照记", async t => {
@@ -78,7 +128,7 @@ test("G7 A2：答复、带话续跑、返修和恢复不补记，两次同文照
   }
   assert.equal(existsSync(noteFile(task)), false);
   assert.deepEqual(answersOf(task.dir).map(a => a.text), ["经 CLI 的答复\n保留原文"]);
-  p.input(repeated); p.input(repeated);
+  p.submit(repeated); p.submit(repeated);
   assert.deepEqual(readNotes(task).map(n => n.text), [repeated, repeated]);
   write(join(task.worktree, "src/app.txt"), "bad fixture\n"); deliver(task.dir);
   const repair = await p.emit("agent_before_settle");
@@ -95,7 +145,7 @@ test("G7 A2：答复、带话续跑、返修和恢复不补记，两次同文照
   restored.input(opening(path, prompt));
   assert.deepEqual(readNotes(task).map(n => n.text), [repeated, repeated]);
   assert.equal(restored.sent.filter(s => s.message.customType === "dev-loop-return").length, 0);
-  restored.input("恢复后本人新输入！\n仍是原话。");
+  restored.submit("恢复后本人新输入！\n仍是原话。");
   assert.deepEqual(readNotes(task).map(n => n.text), [repeated, repeated, "恢复后本人新输入！\n仍是原话。"]);
   restored.close();
 });
@@ -115,7 +165,7 @@ process.stdout.write(${JSON.stringify(PASS.replace("疑问示例", doubt))});
   chmodSync(fake, 0o755);
   const old = process.env.PI_BIN;
   process.env.PI_BIN = fake;
-  try { p.input(quote); deliver(task.dir); await p.emit("agent_before_settle"); }
+  try { p.submit(quote); deliver(task.dir); await p.emit("agent_before_settle"); }
   finally { if (old === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = old; }
   const review = checksOf(task.dir).find(c => c.step === "评审")!;
   const state = statusOf(task.dir);
@@ -131,7 +181,7 @@ test("G7 A4：未绑定 Pi 和非 TUI 不记录；只新增聊天仍复用检查
   const f = fixture(t), task = await f.prepare();
   for (const options of [{managed: false}, {mode: "rpc"}, {mode: "print"}, {id: "另一会话"}, {owner: `0:${task.executionId}`}]) {
     const unrelated = piWindow(task, options);
-    unrelated.input("不能归为本执行的本人输入"); unrelated.close();
+    unrelated.submit("不能归为本执行的本人输入"); unrelated.close();
   }
   assert.equal(existsSync(noteFile(task)), false);
   const p = piWindow(task);
@@ -139,7 +189,7 @@ test("G7 A4：未绑定 Pi 和非 TUI 不记录；只新增聊天仍复用检查
   const material = readFileSync(reviewInput(task), "utf8");
   assert.doesNotMatch(material, /本人在窗口里说的话/);
   const before = statusOf(task.dir);
-  p.input("已检查后只问一句：做完了吗？");
+  p.submit("已检查后只问一句：做完了吗？");
   assert.equal(statusOf(task.dir).seq, before.seq);
   assert.equal(readNotes(task).length, 1); assert.equal(checked(task.dir, commit), true);
   assert.equal(deliver(task.dir).reused, true); await p.emit("agent_before_settle");

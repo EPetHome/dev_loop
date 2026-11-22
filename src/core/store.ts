@@ -12,16 +12,13 @@ import { idleSleep } from "../infra/idle-sleep.ts";
 export const PHASES = ["准备中", "开发中", "已交付", "复测中", "评审中", "等你", "完成", "失败", "已停止", "已放弃", "已合入", "合入失败", "推送中", "已推送", "推送失败", "推送结果不确定", "部署中", "已部署", "部署失败", "收尾中", "已退回"] as const;
 export type Phase = typeof PHASES[number];
 export type WaitReason = "复测退回到上限" | "评审必修到上限" | "停下没交付" | "模型出错" | "需手动接入会话" | "收尾没走完";
-export class LoopError extends Error {
-  category: string; result?: unknown;
+export class LoopError extends Error { category: string; result?: unknown;
   constructor(category: string, message: string, result?: unknown) { super(message); this.category = category; this.result = result; }
 }
 export type State = "working" | "input_required" | "completed" | "failed" | "cancelled";
 export type Resolution = "续跑" | "收尾" | "合入（接受未验证）" | "停止" | "放弃" | "沿用通过记录";
-interface Facts {
-  name: string; startedAt: string; resumes: number;
-  stops: {at: string; step: Phase; state: State; reason: string; message: string; resumedAt: string | null; resolvedBy: Resolution | null}[];
-}
+type StopFact = {at: string; step: Phase; state: State; reason: string; message: string; resumedAt: string | null; resolvedBy: Resolution | null};
+type Facts = {name: string; startedAt: string; resumes: number; stops: StopFact[]};
 const newFacts = (t: Task): Facts => ({name: t.name, startedAt: t.createdAt, resumes: 0, stops: []});
 export type Bucket = "developmentMs" | "testMs" | "reviewMs" | "inputMs" | "selfMs";
 export interface Task {
@@ -53,6 +50,8 @@ export interface Status {
 }
 export const taskOf = (dir: string) => readJson<Task>(join(dir, "task.json"));
 export const answersOf = (dir: string) => jsonLines<{at: string; text: string}>(join(dir, "answers.jsonl"));
+export const windowNotesPath = (dir: string) => join(dir, "窗口原话.jsonl");
+export const appendWindowNote = (dir: string, text: string) => appendJson(windowNotesPath(dir), {source: "pi-tui", at: new Date().toISOString(), text});
 export const statusOf = (dir: string) => { const s = readJson<Status>(join(dir, "status.json")); s.loop.answerCount = answersOf(dir).length; return s; };
 export const launchStarted = ({loop}: Status) => Boolean(loop.launchStarted || loop.prepared || loop.launcher || loop.session);
 export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.jsonl"));
@@ -125,7 +124,8 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
   return t;
 }
 export function allTasks(root = tasksRoot()): string[] {
-  try { return readdirSync(root,{withFileTypes:true}).flatMap(e=>e.isDirectory()?[join(root,e.name)]:[]); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  try { return readdirSync(root,{withFileTypes:true}).filter(e => e.isDirectory()).map(e => join(root,e.name)); }
+  catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; return []; }
 }
 export function locate(cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (env.LOOP_TASK_DIR) { taskOf(env.LOOP_TASK_DIR); return resolve(env.LOOP_TASK_DIR); }
@@ -142,12 +142,10 @@ export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "
 }
 export const checked = (dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
 interface StepView { phase: Phase; message: string; complete?: boolean }
-function stepView(dir: string, view: StepView): void {
-  update(dir, s => {
-    if (s.state === "completed" || (s.state === "input_required" && view.complete)) move(s,"completed",view.phase,view.message,null);
-    else if (s.state === "working" && s.loop.finisher) move(s,"working",view.phase,view.message,s.loop.bucket);
-  }, "合入（接受未验证）");
-}
+const stepView = (dir: string, {phase, message, complete}: StepView) => update(dir, s => {
+  if (s.state === "completed" || (s.state === "input_required" && complete)) move(s,"completed",phase,message,null);
+  else if (s.state === "working" && s.loop.finisher) move(s,"working",phase,message,s.loop.bucket);
+}, "合入（接受未验证）");
 export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
 export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash" | "acceptanceHash">, view?: StepView): void {
   const t = taskOf(dir); let hashes = {promptHash:"",acceptanceHash:""}; try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。

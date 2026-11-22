@@ -21,8 +21,7 @@ test("依赖方向：cli/hosts/steps/core/infra 单向；不引用旧 loop、不
     assert.doesNotMatch(content,/\/Users\/Admin\/Desktop\/loop\//);
   }
   const lines=files(src).filter(f=>/\.(ts|md)$/.test(f)).reduce((n,f)=>n+readFileSync(f,"utf8").trimEnd().split("\n").length,0);
-  // 核心 2000 行之外给 G7 的 Pi 采集、评审引用留 50 行，继续限制整体规模。
-  assert.ok(lines<=2050,"src 超过 2050 行："+lines);
+  assert.ok(lines<=2000,"src 超过 2000 行："+lines);
   console.log("依赖方向检查通过："+edges+" 条本地模块边，src "+lines+" 行");
   const pkg=JSON.parse(readFileSync(join(ROOT,"package.json"),"utf8"));
   assert.deepEqual(pkg.dependencies||{},{});assert.deepEqual(pkg.devDependencies||{},{});
