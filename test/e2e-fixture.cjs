@@ -21,8 +21,14 @@ for (const [i, scene] of plan.scenarios.entries()) {
     }
     item.evidence = evidence(`s${i}-${j}.txt`, JSON.stringify(messages));
     if (mode.startsWith("env") && scene.dependencies?.includes("fake notifier")) {
-      Object.assign(item, {status:"未验证", actual:"隔离通知服务连不通，尚未运行产品", cause:"外部环境", dependency:"fake notifier", error,
-        evidence:evidence("probe.txt",mode === "env-fake-error" ? "wrong raw" : error + "\n")});
+      const productError = mode === "env-product-log", raw = productError ? "ENOENT: open delivered/status.json" : error;
+      const probe = `s${i}-probe.json`, diagnostic = {executionId,attempt,commit,dependency:"fake notifier",result:"不可用",error:raw};
+      if (mode === "env-fake-error") diagnostic.error = "wrong raw";
+      if (mode === "env-probe-ready") diagnostic.result = "就绪";
+      if (mode === "env-probe-other") diagnostic.dependency = "different dependency";
+      if (mode === "env-probe-stale") diagnostic.attempt = "older-attempt";
+      Object.assign(item,{status:"未验证",actual:productError ? "产品未写出状态文件：" + raw : "隔离通知服务连不通，尚未运行产品",
+        cause:"外部环境",dependency:"fake notifier",error:raw,probe,evidence:evidence(probe,productError ? raw : JSON.stringify(diagnostic))});
       if (mode === "env-undeclared") item.dependency = "product app";
       status = "未验证"; exit = 75;
     }
@@ -32,6 +38,7 @@ for (const [i, scene] of plan.scenarios.entries()) {
   report.scenarios.push({id:scene.id,status,steps});
 }
 const first = report.scenarios[0];
+if (mode === "env-check-gap") first.steps.push({id:"重启不再通知",status:"通过",actual:"无额外通知",evidence:evidence("restart.txt","T17: no extra notification")});
 if (mode === "lying-assertion") first.steps.find(step => step.id === "同一任务完成通知").actual = 2;
 if (mode === "missing-scene") report.scenarios.pop();
 if (mode === "extra-scene") report.scenarios.push({...first,id:"not-in-plan"});

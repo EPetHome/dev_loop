@@ -68,28 +68,24 @@ export const environmentMessage = ({loop,executionId}: Status, check?: Check, ca
   `可选：bin/loop 续跑 ${executionId}（补跑）${canAccept ? ` / bin/loop 续跑 ${executionId} --接受环境缺项 ${check?.attempt}` : ""} / bin/loop 停止 ${executionId}。`;
 export const environmentAcceptable = (c?: Check) => c?.result === "环境未验证" && c.unit === "通过" && !!c.missingScenarios?.length;
 function claimRetest(t: Task, s: Status, text: string | undefined, accept: string | undefined) {
-  const waiting = s.loop.wait === ENV_WAIT, records = checksOf(t.dir), previous = recordedAttempt(s,records);
+  const {state,loop} = s, waiting = loop.wait === ENV_WAIT, records = checksOf(t.dir), previous = recordedAttempt(s,records);
+  const working = state === "working" && loop.retestAttempt && ["复测中","评审中"].includes(loop.phase);
+  if (working && text !== undefined) throw new InputError(`复测尝试 ${loop.retestAttempt} 已认领；可不带话续跑以恢复检查，或停止。`);
   let h: ReturnType<typeof inputs> | undefined, pinned = false;
   try { h = inputs(t); pinned = deliveryMatches(t,s); }
   catch (e) { if (!waiting || (text === undefined && accept === undefined)) throw e; }
   const current = previous && h && sameInputs(previous,h), canAccept = waiting && current && pinned && environmentAcceptable(previous);
-  if (waiting && text !== undefined || accept !== undefined && (!canAccept || accept !== previous?.attempt))
-    throw new InputError(environmentMessage(s,previous,canAccept));
-  const {state,loop} = s, last = lastTest(records,loop.commit);
-  const recover = loop.retestAttempt && (state === "cancelled" || state === "working" && ["复测中","评审中"].includes(loop.phase) || state === "failed" && !["临时故障","评审上下文超限"].includes(s.error?.category || ""));
-  const stale = h && last && !sameInputs(last,h) && (state === "completed" || loop.wait === "收尾没走完");
+  if (waiting && text !== undefined || accept !== undefined && (!canAccept || accept !== previous?.attempt)) throw new InputError(environmentMessage(s,previous,canAccept));
+  const recover = working || loop.retestAttempt && (state === "cancelled" || state === "failed" && !["临时故障","评审上下文超限"].includes(s.error?.category || ""));
+  const last = lastTest(records,loop.commit), stale = h && last && !sameInputs(last,h) && (state === "completed" || loop.wait === "收尾没走完");
   if (text !== undefined || !pinned || !(waiting || recover || stale)) return;
   const reusable = current && (!waiting || previous.result !== "环境未验证" || accept) ? previous : undefined;
-  const attempt = reusable?.attempt || (state === "working" && !previous && loop.phase === "复测中" && loop.retestAttempt) || randomUUID();
-  const accepted = accept || reusable?.result === "本人接受环境缺项";
+  const attempt = reusable?.attempt || (working && !previous && loop.phase === "复测中" && loop.retestAttempt) || randomUUID(), accepted = accept || reusable?.result === "本人接受环境缺项";
   const status = update(t.dir,next => {
     if (next.state !== state || next.loop.retestAttempt !== loop.retestAttempt || next.loop.delivery?.at !== loop.delivery?.at) throw new InputError("现场已变化；请重新查询执行");
-    if (accept) {
-      if (!sameInputs(previous!,inputs(t)) || !deliveryMatches(t,next)) throw new InputError("提交或输入已变化；请重新查询执行");
-      const now = Date.now(); appendCheck(t.dir,{...previous!,result:"本人接受环境缺项",...span(now,now)});
-    }
-    // 显式续跑可以解开已停止；迟到的后台进程不能。
-    next.state = "working"; next.loop.retestAttempt = attempt;
+    if (accept && (!sameInputs(previous!,inputs(t)) || !deliveryMatches(t,next))) throw new InputError("提交或输入已变化；请重新查询执行");
+    if (accept) { const now = Date.now(); appendCheck(t.dir,{...previous!,result:"本人接受环境缺项",...span(now,now)}); }
+    next.state = "working"; next.loop.retestAttempt = attempt; // 只允许显式续跑解开已停止。
     move(next,"working","复测中",accepted ? "已登记本人接受环境缺项，等待后台评审" : "已领取后台复测："+attempt,"selfMs");
     if (s.state !== "working") next.loop.facts!.resumes++;
   }, accepted ? "本人接受环境缺项" : "续跑");

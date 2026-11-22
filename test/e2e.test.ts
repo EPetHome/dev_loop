@@ -2,7 +2,9 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fixture, getJson, until, write, ROOT, PASS, sq } from "./helpers.ts";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { fixture, getJson, until, write, ROOT, NODE, PASS, MUST, sq } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { resume, stop } from "../src/core/lifecycle.ts";
 import { settle } from "../src/core/settle.ts";
@@ -83,6 +85,20 @@ for (const [mode, error] of Object.entries({
   assert.equal(checked(g.dir,commit),false); assert.equal(g.status().loop.reviewRounds,0); assert.equal(g.status().loop.testReturns,1);
 });
 
+for (const [mode, diagnostic] of [
+  ["env-product-log", /前置探测[\s\S]*ENOENT: open delivered\/status\.json/],
+  ["env-probe-ready", /前置探测.*不可用/],
+  ["env-probe-other", /前置探测.*依赖/],
+  ["env-probe-stale", /前置探测 attempt 不符/],
+  ["env-check-gap", /缺少检查点：S4 \/ 同一任务完成通知/],
+] as const) test("评审必修 1/2：有普通通过和退出 75 的错误报告仍须返修 · " + mode, async t => {
+  const g = await scene(t); g.mode(mode); const {commit} = g.submit(); const result = await settle(g.dir);
+  const [check] = g.tests(), view = await g.view();
+  assert.equal(result.continue,true); assert.equal(check.result,"失败"); assert.match(check.detail!,diagnostic);
+  assert.equal(view.loop.retest.canAccept,false); assert.equal(view.loop.wait,null); assert.equal(view.loop.testReturns,1);
+  assert.equal(checked(g.dir,commit),false);
+});
+
 test("A4/A5/A10：环境等待不返修、不合入；并发补跑只执行一次，再按卡收尾", async t => {
   const g = await scene(t,{flow:["开发评审","测试","合入"]}); g.mode("env"); const {commit} = g.submit();
   const before = g.status(); await settle(g.dir);
@@ -143,6 +159,45 @@ test("A7：停止抢在后台领取前；半份报告不复用；已登记的环
   g.mode("pass"); await g.run("续跑"); await g.finished();
   assert.equal(g.status().state,"completed"); assert.equal(g.tests().at(-1)?.result,"通过"); assert.notEqual(g.tests().at(-1)?.attempt,started);
   assert.ok(existsSync(join(g.dir,"e2e",started,"report.tmp")));
+});
+
+for (const recordedMetadata of [false,true]) test("评审必修 3：评审必修落盘后中断，只交接原必修 · 元数据已有=" + recordedMetadata, async t => {
+  const g = await scene(t,{flow:["开发评审","测试","合入"],reviewer:`if [ "$1" = 1 ]; then printf %s ${sq(MUST)}; else printf %s ${sq(PASS)}; fi`});
+  const {commit} = g.submit(); g.mode("env"); await settle(g.dir); g.mode("pass");
+  const request = resume(g.dir);
+  const cut = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const append = fs.appendFileSync;
+fs.appendFileSync = (file, row, ...args) => {
+  append(file,row,...args);
+  if (String(file).endsWith('/checks.jsonl') && String(row).includes('"step":"评审"') && String(row).includes('"result":"必修"')) process.exit(71);
+};
+syncBuiltinESMExports();
+const {launchMain} = await import(${JSON.stringify(join(ROOT,"src/hosts/launch.ts"))});
+await launchMain(process.argv[1], false, {retest:process.argv[2]});`;
+  const worker = spawn(NODE,["--input-type=module","-e",cut,g.dir,request.retest!],{cwd:g.repo,env:g.env,stdio:"inherit"});
+  assert.deepEqual(await once(worker,"close"),[71,null]);
+  const reviews = () => checksOf(g.dir).filter(c => c.step === "评审"), [decision] = reviews();
+  assert.equal(decision.result,"必修"); assert.equal(decision.attempt,request.retest); assert.equal(g.status().loop.reviewReturns,0);
+  if (recordedMetadata) update(g.dir,s => { s.loop.previousReviewCommit = commit; s.loop.previousMustFix = [decision.detail!]; });
+  await g.run("续跑");
+  const resumed = await until(g.dir,() => g.status(),s => !s.loop.launcher && ["开发中","已合入","失败"].includes(s.loop.phase));
+  assert.equal(resumed.loop.phase,"开发中"); assert.equal(resumed.loop.reviewReturns,1); assert.equal(resumed.loop.reviewRounds,1);
+  assert.match(resumed.loop.pendingReturn!,/输入 bad 时[\s\S]*返回错误结果/); assert.equal(g.git("rev-parse","dev"),g.task.baseCommit);
+  await launchMain(g.dir,false,{env:g.env,retest:request.retest});
+  assert.deepEqual(reviews(),[decision]); assert.equal(g.status().loop.reviewReturns,1); assert.equal(checked(g.dir,commit),false);
+});
+
+test("评审必修 4：无 launcher 的已认领补跑拒绝附言；同一请求可接管", async t => {
+  const g = await scene(t); g.submit(); g.mode("env"); await settle(g.dir);
+  const first = resume(g.dir), claimed = g.status();
+  assert.equal(claimed.loop.launcher,null); assert.equal(claimed.loop.phase,"复测中"); assert.ok(first.retest);
+  await assert.rejects(g.run("续跑","--话","不要开开发"),err => /复测/.test(raw(err as any)) && raw(err as any).includes(first.retest!));
+  assert.deepEqual(g.status(),claimed); assert.equal(existsSync(join(g.dir,"opened.json")),false);
+  g.mode("pass"); const receipt = JSON.parse((await g.run("续跑")).stdout);
+  assert.equal(receipt.retest,first.retest); await g.finished();
+  await launchMain(g.dir,false,{env:g.env,retest:first.retest});
+  assert.equal(g.status().loop.facts?.resumes,1); assert.deepEqual(g.tests().map(c => c.result),["环境未验证","通过"]);
+  assert.equal(g.tests().at(-1)?.attempt,first.retest); assert.equal(existsSync(join(g.dir,"opened.json")),false);
 });
 
 test("A8：接入卡无测试命令只提示、记没验证，不走自动收尾；旧卡原样", async t => {

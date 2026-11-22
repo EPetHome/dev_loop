@@ -100,7 +100,7 @@ export function move(s: Status, state: State, phase: Phase, message: string, buc
 }
 export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) => update(dir, s => { move(s,state,phase,message,bucket,timeout); });
 export function waiting(s: Status, reason: WaitReason, message: string, pendingReturn?: string) {
-  if (move(s,"input_required","等你",message,"inputMs")) { s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn; }
+  if (move(s,"input_required","等你",message,"inputMs")) Object.assign(s.loop,{wait:reason,...(pendingReturn === undefined ? {} : {pendingReturn})});
 }
 export const waitFor = (dir: string, reason: WaitReason, message: string, pendingReturn?: string) => update(dir, s => waiting(s,reason,message,pendingReturn));
 export function fail(dir: string, error: unknown, category?: string): void {
@@ -118,11 +118,9 @@ export function createTask(file: string, root = tasksRoot(), dispatchId: string 
     baseCommit:baseCommit || gitText(repo,["rev-parse","refs/heads/"+card.base]), branch:"dev-loop/"+executionId, worktree:join(dir,"worktree")};
   mkdirSync(dir); writeJson(join(dir, "task.json"), t); // 编号碰撞时 mkdir 拒绝覆盖。
   const s = initialStatus(t); writeJson(join(dir,"status.json"),s); idleSleep(dir,true);
-  for (const file of ["checks.jsonl","instructions.jsonl"]) writeFileSync(join(dir,file),"");
-  summary(dir,s); return t;
+  for (const file of ["checks.jsonl","instructions.jsonl"]) writeFileSync(join(dir,file),""); summary(dir,s); return t;
 }
-export const allTasks = (root = tasksRoot()) => (ifPresent(() => readdirSync(root,{withFileTypes:true})) || [])
-  .filter(e => e.isDirectory()).map(e => join(root,e.name));
+export const allTasks = (root = tasksRoot()) => (ifPresent(() => readdirSync(root,{withFileTypes:true})) || []).flatMap(e => e.isDirectory() ? [join(root,e.name)] : []);
 export function locate(cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (env.LOOP_TASK_DIR) { taskOf(env.LOOP_TASK_DIR); return resolve(env.LOOP_TASK_DIR); }
   const current = realpathSync(cwd); return allTasks(tasksRoot(env)).find(d=>inside(taskOf(d).worktree,current));
@@ -140,9 +138,11 @@ export function qualifiedTest(records: Check[], commit: string, hashes: Hashes) 
   const match = (c: Check) => sameInputs(c,hashes) && (hashes.e2eHash ? !!c.attempt && c.result !== "已停止" : testPassed(c));
   const test = lastTest(records,commit,match); return testPassed(test) ? test : undefined;
 }
+export const reviewFor = (records: Check[], test: Check) => records.findLast(c => c.step === "评审" && c.result !== "已停止" &&
+  c.commit === test.commit && c.tree === test.tree && c.attempt === test.attempt && sameInputs(c,test));
 export function missingChecks(dir: string, commit: string, hashes: Hashes = inputs(taskOf(dir))): string[] {
   const records = checksOf(dir).filter(c => c.commit === commit && ["复测","评审"].includes(c.step)), test = qualifiedTest(records,commit,hashes);
-  const review = records.some(c => c.step === "评审" && c.result === "通过" && sameInputs(c,hashes) && (!hashes.e2eHash || test && c.attempt === test.attempt));
+  const review = hashes.e2eHash ? !!test && reviewFor(records,test)?.result === "通过" : records.some(c => c.step === "评审" && c.result === "通过" && sameInputs(c,hashes));
   const missing = [...(test ? [] : ["复测：没有通过记录"]), ...(review ? [] : ["评审：没有通过记录"])];
   if (missing.length && records.some(c => !sameInputs(c,hashes))) missing.push((hashes.e2eHash ? "提示词、验收标准或 E2E 清单" : "提示词或验收标准") + "已变化，原检查不再算数");
   return missing;

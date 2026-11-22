@@ -8,7 +8,7 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, waitFor, update, fail, inputs, launchStarted } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, waiting, update, fail, inputs, launchStarted } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startCompanion, startFinish } from "./after-settle.ts";
@@ -109,9 +109,13 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
     if (options.reviewOnly || options.confirmedCommit || options.retest) {
       const result = await settle(dir, "", options);
       if (!result.continue || statusOf(dir).state !== "working") { await startFinish(dir, options.env || process.env); return; }
-      const source = options.reviewOnly ? "补评审" : options.retest ? "后台复测" : "确认交付后检查";
-      if (taskOf(dir).host !== "pi") { waitFor(dir,"需手动接入会话",`${source}需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n${result.reason}`,result.reason); return; }
-      update(dir, s => { if (s.state === "working") s.loop.pendingReturn = result.reason; });
+      const manual = taskOf(dir).host !== "pi", source = options.reviewOnly ? "补评审" : options.retest ? "后台复测" : "确认交付后检查";
+      if (manual || !result.retained) update(dir,s => {
+        if (s.state !== "working" || s.loop.phase !== "开发中") return;
+        if (manual && (!result.retained || s.loop.pendingReturn === result.reason)) waiting(s,"需手动接入会话",`${source}需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n${result.reason}`,result.reason);
+        else if (!result.retained) s.loop.pendingReturn = result.reason;
+      });
+      if (manual) return;
       const {session} = statusOf(dir).loop; if (alive(session) && !session?.endedAt) return;
       resuming = true;
     }
