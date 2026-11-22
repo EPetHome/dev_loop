@@ -77,7 +77,9 @@ test("r1 必修2：确认本次真实进程登记后才结束启动监测", asyn
   const f = fixture(t), task = await f.prepare(), pi = join(f.base, "fake-pi.cjs"), permission = join(f.base, "permission.ts");
   write(permission, "// fixture only\n");
   write(pi, "#!" + NODE + "\n(async()=>{const fs=require('fs');const {registerSession}=await import(" +
-    JSON.stringify(join(ROOT, "src/core/lifecycle.ts")) + ");const dir=process.env.LOOP_TASK_DIR;registerSession(dir,'pi','registered-pi',process.pid);" +
+    JSON.stringify(join(ROOT, "src/core/lifecycle.ts")) + ");const dir=process.env.LOOP_TASK_DIR;" +
+    "const id=process.argv[process.argv.indexOf('--session-id')+1];if(process.env.LOOP_PI_WINDOW_OWNER!==process.ppid+':'+id)throw new Error('窗口身份与实际启动不符');" +
+    "registerSession(dir,'pi','registered-pi',process.pid);" +
     "const watcher=fs.watch(dir,()=>{if(fs.existsSync(dir+'/finish-pi')){watcher.close();process.exit(0);}});})();\n");
   execFileSync("chmod", ["+x", pi]);
   const env = {...f.env, LOOP_LAUNCH_CMD: undefined, PI_BIN: pi, PERMISSION_EXTENSION: permission};

@@ -1,13 +1,14 @@
 import { locate, taskOf, statusOf, update, PHASES } from "../core/store.ts";
 import { registerSession, heartbeat, shutdownSession } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
+import { appendWindowNote } from "../core/window-notes.ts";
 import { convention } from "./convention.ts";
 import { alive } from "../infra/exec.ts";
 import { contentText } from "./hook-event.ts";
 import { startFinish } from "./after-settle.ts";
 /** 只用 Pi 的公开生命周期子集；结构类型让核心测试不依赖 pi 包。 */
 interface Context {
-  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean;
+  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean; mode?: string;
   ui?: { setStatus(key: string, text?: string): void; setTitle(title: string): void };
   sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getBranch(): any[] };
 }
@@ -20,8 +21,9 @@ export function registerPi(pi: PiAPI, options: {
   every?: (callback: () => void, ms: number) => any;
   clear?: (timer: any) => void;
 } = {}) {
-  let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "";
-  const clear = options.clear || clearInterval;
+  let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "", capture = false;
+  const env = options.env || process.env, clear = options.clear || clearInterval;
+  const isWindow = (ctx: Context) => ctx.mode === "tui" && env.LOOP_PI_WINDOW_OWNER === `${process.ppid}:${ctx.sessionManager.getSessionId()}`;
   const refresh = () => {
     if (!dir) return;
     try {
@@ -41,8 +43,8 @@ export function registerPi(pi: PiAPI, options: {
   };
   pi.on("session_start", (_event, ctx) => {
     if (timer !== undefined) clear(timer); if (viewTimer !== undefined) clear(viewTimer);
-    timer = viewTimer = undefined; context = ctx; last = "";
-    dir = locate(ctx.cwd, options.env || process.env);
+    timer = viewTimer = undefined; context = ctx; last = ""; capture = false;
+    dir = locate(ctx.cwd, env);
     if (!dir) return;
     if (!registerSession(dir, "pi", ctx.sessionManager.getSessionId(), process.pid, ctx.sessionManager.getSessionFile?.())) {
       dir = undefined; timer = undefined; ctx.shutdown?.(); return;
@@ -52,9 +54,17 @@ export function registerPi(pi: PiAPI, options: {
       try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：", e); }
     }, 60000);
     timer?.unref?.();
-    name = taskOf(dir).name; refresh();
+    const task = taskOf(dir);
+    capture = task.host === "pi" && ctx.cwd === task.worktree && isWindow(ctx);
+    name = task.name; refresh();
     viewTimer = (options.every || setInterval)(refresh, 1000); viewTimer?.unref?.();
-    pi.sendMessage({customType:"dev-loop-convention",content:convention(taskOf(dir)),display:true});
+    pi.sendMessage({customType:"dev-loop-convention",content:convention(task),display:true});
+  });
+  pi.on("input", (event, ctx) => {
+    if (!dir || !capture || !isWindow(ctx) || event.type !== "input" || event.source !== "interactive" || typeof event.text !== "string" || !event.text) return;
+    // Pi 1.3 的 CLI @文件也标为 interactive，封装以 </file> 后的换行结束；TUI 提交会 trim 掉末尾换行。
+    if (event.text.startsWith('<file name="') && event.text.endsWith("\n</file>\n")) return;
+    appendWindowNote(dir, event.text);
   });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (!dir) return;

@@ -10,6 +10,7 @@ import { copyLocalFiles, heartbeat, retryReview, setup } from "./lifecycle.ts";
 import { executeStaticReview } from "./review-call.ts";
 import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
 import { testLogSummary } from "./test-summary.ts";
+import { windowNoteMaterial } from "./window-notes.ts";
 import { snapshot, differences } from "./snapshot.ts";
 export interface SettleResult { continue: boolean; reason: string }
 interface SettleOptions { signal?: AbortSignal; reviewOnly?: boolean; confirmedCommit?: string; ending?: {stopReason?: string; errorMessage?: string} }
@@ -128,7 +129,8 @@ export async function settle(dir: string, lastReply = "", {signal, reviewOnly, c
       "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff("--no-renames","--diff-filter=d") || "（无改动）",
       "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", diff("--name-only","--diff-filter=A","-z").split("\0").filter(Boolean).join("\n") || "无",
       "## 运行差异", git(cwd,["diff","--name-only",t.baseCommit,commit,"--"]), differences(join(dir,"snapshot-base.json"),runtime),
-      "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 本人答复", answersOf(dir).map(a => a.at + "\n" + a.text).join("\n\n") || "无", "## 复测结果", testLogSummary(t.test, testResult, log),
+      "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 本人答复", answersOf(dir).map(a => a.at + "\n" + a.text).join("\n\n") || "无",
+      ...windowNoteMaterial(t), "## 复测结果", testLogSummary(t.test, testResult, log),
       ...(previous.previousReviewCommit ? ["## 上一轮必修", previous.previousMustFix.join("\n") || "无", "## 开发方回复", lastReply || delivery.note || "（无）"] : [])].join("\n\n");
     update(dir, s => { if (move(s,"working","评审中","正在评审第 " + round + " 轮","reviewMs",reviewSeconds)) s.loop.reviewRounds = round; });
     const reviewStart = Date.now(), budget = reviewSeconds * 1000 + Math.min(0,deadline-reviewStart);
