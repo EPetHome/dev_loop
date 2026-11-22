@@ -17,31 +17,43 @@ const opening = (path: string, text: string) => `<file name="${path}">\n${text}\
 function piWindow(task: Task, options: {managed?: boolean; mode?: string; id?: string; owner?: string; branch?: unknown[]} = {}) {
   const handlers: Record<string, (event: any, ctx: any) => any> = {}, timers: (() => void)[] = [], sent: any[] = [];
   const terminal = new Set<(key: string) => void>(), queued: string[] = [], dispatched: string[] = [];
-  let compacting = false;
+  const shell: string[] = [], commands: string[] = [], extension = "permission-system";
+  let compacting = false, streaming = false;
   const route = (text: string) => {
     if (!text) return;
-    if (compacting) queued.push(text);
-    else { dispatched.push(text); emit("input", {source: "interactive", text}); }
+    if (text.split(" ", 1)[0] === "/" + extension) { commands.push(text); return; }
+    if (!compacting) { dispatched.push(text); emit("input", {source: "interactive", text}); }
+    if (compacting || streaming) queued.push(text);
   };
-  // Pi 1.3.0: 普通提交和追问分别裁剪，压缩期间先排队，均不要求派发 input。
+  // Pi 1.3.0: 空闲追问也用 onSubmit；忙时追问绕过 TUI 内建命令，但仍识别扩展命令。
   const editor = new class {
     text = "";
-    actionHandlers = new Map([["app.message.followUp", () => { const value = this.getExpandedText().trim(); this.text = ""; route(value); }]]);
+    actionHandlers = new Map([["app.message.followUp", () => {
+      const value = this.getExpandedText().trim(); this.text = "";
+      if (compacting || streaming) route(value); else this.onSubmit(value);
+    }]]);
     getExpandedText() { return this.text; }
-    submitValue() { const value = this.getExpandedText().trim(); this.text = ""; route(value); }
+    onSubmit(text: string) {
+      const command = text.startsWith("!") && text.slice(text.startsWith("!!") ? 2 : 1).trim();
+      if (command) shell.push(command);
+      else if (text === "/compact") commands.push(text);
+      else route(text);
+    }
+    submitValue() { const value = this.getExpandedText().trim(); this.text = ""; this.onSubmit(value); }
     handleInput(key: string) {
       if (key === "Enter") this.submitValue();
       if (key === "Alt+Enter") this.actionHandlers.get("app.message.followUp")!();
     }
   }();
   let focused: unknown = editor;
-  const ctx = {cwd: task.worktree, mode: options.mode ?? "tui", sessionManager: {
+  const ctx = {cwd: task.worktree, mode: options.mode ?? "tui", isIdle: () => !compacting && !streaming, sessionManager: {
     getSessionId: () => options.id ?? task.executionId, getSessionFile: () => join(task.dir, "Pi 会话.jsonl"), getBranch: () => options.branch ?? [],
   }, ui: {setStatus() {}, setTitle() {}, setWidget(_key: string, factory?: (tui: any) => object) { factory?.({getFocusedComponent: () => focused}); },
     onTerminalInput(fn: (key: string) => void) { terminal.add(fn); return () => {terminal.delete(fn);}; }}};
   const env = {LOOP_TASK_DIR: task.dir,
     LOOP_PI_WINDOW_OWNER: options.managed === false ? undefined : options.owner ?? `${process.ppid}:${task.executionId}`};
-  registerPi({on: (name, fn) => { handlers[name] = fn; }, sendMessage: (message, opts) => sent.push({message, opts})},
+  registerPi({on: (name, fn) => { handlers[name] = fn; }, sendMessage: (message, opts) => sent.push({message, opts}),
+    getCommands: () => [{source: "extension", name: extension}]},
     {env, every: fn => { timers.push(fn); return {unref() {}}; }, clear() {}});
   const emit = (type: string, event = {}) => handlers[type]?.({type, ...event}, ctx);
   emit("session_start", {reason: "startup"});
@@ -50,8 +62,12 @@ function piWindow(task: Task, options: {managed?: boolean; mode?: string; id?: s
     if (source !== "program") for (const fn of terminal) fn(key);
     (focused as typeof editor).handleInput(key);
   };
-  return {emit, sent, ctx, submit, queued, dispatched, input: (text: string, extra = {}) => emit("input", {source: "interactive", text, ...extra}),
-    compact: () => {compacting = true;}, flush: () => {compacting = false; queued.splice(0).forEach(route);},
+  return {emit, sent, ctx, submit, shell, commands, queued, dispatched, input: (text: string, extra = {}) => emit("input", {source: "interactive", text, ...extra}),
+    compact: () => {compacting = true;}, stream: () => {streaming = true;}, flush: () => {
+      const pending = queued.splice(0), emitInput = compacting; compacting = streaming = false;
+      if (emitInput) pending.forEach(route);
+      else for (const text of pending) emit("message_start", {message: {role: "user", content: text}});
+    },
     refresh: () => timers[1](), close: () => emit("session_shutdown", {reason: "quit"})};
 }
 
@@ -108,6 +124,28 @@ test("G7 r1：压缩时提交立刻落盘，有提交时间；排空不重记，
     assert.deepEqual(readNotes(task).map(n => n.text), texts);
     p.submit("关闭后不可采集");
     assert.equal(readNotes(task).length, 3);
+  } finally { t.mock.timers.reset(); }
+});
+
+for (const busy of ["compact", "stream"] as const) test("G7 r2：同一 ! 原文按实际派发区分命令和追问 · " + busy, async t => {
+  const f = fixture(t), task = await f.prepare(), p = piWindow(task);
+  const text = "  ![示意图](design.png)\n  用这张图作参考。  \n\n", trimmed = text.trim();
+  const start = Date.now(); t.mock.timers.enable({apis: ["Date"], now: start});
+  try {
+    p.submit(text); p.submit(text, "Alt+Enter"); // 空闲时两个入口均由 onSubmit 解释命令
+    p[busy](); p.submit(text); // 忙时普通 Enter 仍解释命令
+    p.submit("/permission-system", "Alt+Enter"); // 忙时真正的扩展命令仍不是追问
+    assert.deepEqual(p.shell, Array(3).fill(trimmed.slice(1)));
+    assert.deepEqual(p.commands, ["/permission-system"]);
+    assert.equal(existsSync(noteFile(task)), false);
+    t.mock.timers.tick(1000); p.submit(text, "Alt+Enter");
+    assert.deepEqual(p.queued, [trimmed]);
+    assert.deepEqual(p.dispatched, busy === "compact" ? [] : [trimmed]);
+    const note = {source: "pi-tui", at: new Date(start + 1000).toISOString(), text};
+    assert.deepEqual(readNotes(task), [note], "排空前已有未裁剪原文与提交时间");
+    t.mock.timers.tick(30_000); p.flush();
+    assert.deepEqual(p.dispatched, [trimmed]); assert.deepEqual(readNotes(task), [note]);
+    p.close();
   } finally { t.mock.timers.reset(); }
 });
 

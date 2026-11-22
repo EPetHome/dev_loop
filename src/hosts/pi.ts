@@ -7,12 +7,12 @@ import { contentText } from "./hook-event.ts";
 import { startFinish } from "./after-settle.ts";
 import { watchPiEditor, type EditorUI } from "./pi-editor.ts";
 interface Context {
-  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean; mode?: string;
+  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean; mode?: string; isIdle?(): boolean;
   ui?: EditorUI & { setStatus(key: string, text?: string): void; setTitle(title: string): void };
   sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getBranch(): any[] };
 }
 interface PiAPI {
-  on(event: string, handler: (event: any, ctx: Context) => any): unknown;
+  on(event: string, handler: (event: any, ctx: Context) => any): unknown; getCommands?(): {name: string; source: string}[];
   sendMessage(message: {customType: string; content: string; display: boolean}, options?: {triggerTurn: boolean}): void;
 }
 type Options = {env?: NodeJS.ProcessEnv; every?: (fn: () => void, ms: number) => any; clear?: (timer: any) => void};
@@ -43,7 +43,7 @@ export function registerPi(pi: PiAPI, options: Options = {}) {
     const id = ctx.sessionManager.getSessionId(); if (!registerSession(taskDir, "pi", id, process.pid, ctx.sessionManager.getSessionFile?.())) { dir = undefined; ctx.shutdown?.(); return; }
     const task = taskOf(taskDir);
     if (task.host === "pi" && ctx.mode === "tui" && ctx.cwd === task.worktree && env.LOOP_PI_WINDOW_OWNER === `${process.ppid}:${id}`)
-      unwatch = watchPiEditor(ctx.ui, text => appendWindowNote(taskDir, text));
+      unwatch = watchPiEditor(ctx, text => appendWindowNote(taskDir, text), name => pi.getCommands?.().some(c => c.name === name && c.source === "extension") === true);
     repeat(() => { try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：", e); } }, 60000);
     name = task.name; refresh(); repeat(refresh, 1000);
     pi.sendMessage({customType:"dev-loop-convention",content:convention(task),display:true});
