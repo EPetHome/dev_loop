@@ -107,9 +107,33 @@ export function authorizationFor(run: Execution) {
   });
   return recorded.sort((a,b)=>a.at-b.at);
 }
-const itemIds = (s: string) => s.match(/\bA\d+\b/g) || [];
-const sceneIds = (s: string) => s.match(/\bS\d+\b/g) || [];
-const issueIdsIn = (s: string) => s.match(/\b[A-Z]{2,}\d{2,}\b/g) || [];
+const itemIds = (s: string): string[] => s.match(/\bA\d+\b/g) || [];
+const sceneIds = (s: string): string[] => s.match(/\bS\d+\b/g) || [];
+const issueIdsIn = (s: string): string[] => s.match(/\b[A-Z]{2,}\d+\b/g) || [];
+type ScopeIds = {issues: Set<string>; scenes: Set<string>};
+const scopeIds = (s: string): ScopeIds => ({issues:new Set(issueIdsIn(s)),scenes:new Set(sceneIds(s))});
+const scopeSelector = /^[\s\[({「『【“"']*(?:(?:问题单|单号|场景|路径)(?:编号)?\s*:?\s*)?[\s\[({「『【“"']*([A-Z]{2,}\d+|S\d+)\b/;
+const scopeSeparator = /^[\s\])}」』】”"']*(?:(?:[、,/+&]|以及|或者|和|与|及|或)[\s\])}」』】”"']*)*/;
+
+/** 普通编号与场景是关联线索；“仅/只”名单单独保留，关联线索不能扩张名单。 */
+function acceptanceScope(text: string) {
+  const normalized = text.normalize("NFKC"), limits: ScopeIds[] = [];
+  let unparsed = false;
+  for (const match of normalized.matchAll(/(?:仅|只)(?:限于?|适用于?|用于|针对|对)\s*:?\s*/g)) {
+    const limit = scopeIds("");
+    let remaining = normalized.slice(match.index + match[0].length), found = scopeSelector.exec(remaining);
+    if (!found) { unparsed = true; continue; }
+    while (found) {
+      const id = found[1];
+      (/^S\d+$/.test(id) ? limit.scenes : limit.issues).add(id);
+      remaining = remaining.slice(found[0].length).replace(scopeSeparator,"");
+      found = scopeSelector.exec(remaining);
+    }
+    if (/^(?:等(?!级)|\.\.\.|…|除外|以外|不含)/.test(remaining)) unparsed = true;
+    limits.push(limit);
+  }
+  return {...scopeIds(normalized), limits, unparsed};
+}
 const criterion = /^(?:[-*+]\s+)?(A\d+)[.．、)）]\s*/;
 const authTag = /\[授权\]|【授权】/;
 function issueAuthorization(issue: Issue, explicit: string) {
@@ -159,24 +183,27 @@ function batchAuthorization(project: Project, run: Execution, batch: Batch, orig
   }
   return {rows, unreadable, acceptance:acceptance ?? ""};
 }
-function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets: string[], reported: string, batchIssueIds: ReadonlySet<string>) {
-  const explicit = issueAuthorization(issue,reported), scenes = new Set(targets.flatMap(sceneIds));
+type ScopeRelation = "本单" | "其他单" | "其他场景" | "未知" | "明确排除" | "归属冲突" | "范围无法确认";
+function relateScope(text: string, issue: Issue, targets: string[], batchIssueIds: ReadonlySet<string>): ScopeRelation {
+  const scope = acceptanceScope(text), scenes = new Set(targets.flatMap(sceneIds));
   const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
-  const scopeOf = (text: string) => {
-    const issueIds = issueIdsIn(text), mentionedScenes = sceneIds(text);
-    const thisIssue = issueIds.some(id=>issue.ids.includes(id));
-    const otherIssues = new Set(issueIds.filter(id=>batchIssueIds.has(id) && !issue.ids.includes(id)));
-    const thisTarget = mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name));
-    const exclusive = /(?:仅|只)(?:用于|针对|适用于|限于)\s*(?:问题单\s*)?([A-Z]{2,}\d{2,})\b(?!\s*(?:和|与|及|、|[+,，/])\s*(?:问题单\s*)?[A-Z]{2,}\d{2,}\b)/.exec(text)?.[1];
-    if ((thisIssue || thisTarget) && exclusive && otherIssues.has(exclusive)) return "归属冲突";
-    // 一条标准可以指向多张单。另一个编号不能覆盖已经匹配的本单编号或目标。
-    if (thisIssue || thisTarget) return "本单";
-    if (otherIssues.size) return "其他单";
-    return mentionedScenes.length && scenes.size ? "其他场景" : "未知";
-  };
-  const scoped = rows.map(row=>({row, scope:scopeOf(row.text)}));
+  const ownIssue = (ids: Set<string>) => issue.ids.some(id=>ids.has(id));
+  const ownScene = (ids: Set<string>) => [...ids].some(id=>scenes.has(id));
+  const matches = ownIssue(scope.issues) || ownScene(scope.scenes) || names.some(name=>text.includes(name));
+  if (scope.unparsed) return matches ? "归属冲突" : "范围无法确认";
+  const excludes = scope.limits.some(limit=>limit.issues.size && !ownIssue(limit.issues) || limit.scenes.size && scenes.size && !ownScene(limit.scenes));
+  if (excludes) return matches ? "归属冲突" : "明确排除";
+  if (scope.limits.some(limit=>limit.scenes.size && !scenes.size)) return matches ? "归属冲突" : "范围无法确认";
+  if (matches) return "本单";
+  if ([...scope.issues].some(id=>batchIssueIds.has(id))) return "其他单";
+  return scope.scenes.size && scenes.size ? "其他场景" : "未知";
+}
+const otherScope = (scope: ScopeRelation) => ["其他单","其他场景","明确排除"].includes(scope);
+function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets: string[], reported: string, batchIssueIds: ReadonlySet<string>) {
+  const explicit = issueAuthorization(issue,reported);
+  const scoped = rows.map(row=>({row, scope:relateScope(row.text,issue,targets,batchIssueIds)}));
   const associated = new Set([...explicit.ids, ...scoped.flatMap(({row,scope})=>row.id && ["本单","归属冲突"].includes(scope) ? [row.id] : [])]);
-  const other = new Set(scoped.flatMap(({row,scope})=>row.id && ["其他单","其他场景"].includes(scope) ? [row.id] : []));
+  const other = new Set(scoped.flatMap(({row,scope})=>row.id && otherScope(scope) ? [row.id] : []));
   const required = new Map<string,Ref[]>(), conflicts: {id:string; sources:Ref[]}[] = [], missing: string[] = [];
   const issueSource = ref(issue.file);
   const addRequirement = (id: string, source: Ref) => required.set(id,[...(required.get(id) || []),source]);
@@ -185,12 +212,15 @@ function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets:
   for (const id of associated) {
     const definitions = scoped.filter(({row})=>row.id === id);
     if (explicit.references.has(id) && !definitions.length) missing.push(id);
-    if (definitions.some(({scope})=>scope === "其他单" || scope === "归属冲突")) conflicts.push({id,sources:[issueSource,...definitions.map(({row})=>row.source)]});
+    if (definitions.some(({scope})=>["其他单","明确排除","归属冲突","范围无法确认"].includes(scope))) {
+      const line = issue.header.split(/\r?\n/).findIndex(raw=>["验收项","验收条目","授权项"].some(label=>itemIds(field(raw,label)).includes(id)));
+      conflicts.push({id,sources:[line < 0 ? issueSource : ref(issue.file,line+1),...definitions.map(({row})=>row.source)]});
+    }
     for (const {row} of definitions) if (row.authorized) addRequirement(id,row.source);
   }
   const unclear: Ref[] = [];
-  for (const {row,scope} of scoped) if (row.authorized && scope !== "其他单" && scope !== "其他场景" &&
-      (!row.id || !associated.has(row.id) && !other.has(row.id))) unclear.push(row.source);
+  for (const {row,scope} of scoped) if (row.authorized && !otherScope(scope) &&
+      (!row.id || !associated.has(row.id) && (scope === "范围无法确认" || !other.has(row.id)))) unclear.push(row.source);
   return {required, conflicts, unclear, missing, references:[...explicit.references], unknown:explicit.unknown};
 }
 

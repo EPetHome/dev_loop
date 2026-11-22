@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Reader, canonical, entry, hash, object, ref, repoPath, sha, str, strings, time, type Doc, type Ref } from "./files.ts";
 
 export interface Check { source: Ref; step: string; result: string; commit: string; detail: string; evidence: string[]; value: Doc }
@@ -143,8 +143,8 @@ export function deployments(project: Project, batch: Batch | undefined, run: Exe
   if (history) for (const c of run.checks) if (c.step === "开发" && c.result === "已交付") registered.add(c.commit);
   const versions = new Set([...registered].flatMap(commit=>[...mergeFacts(run,commit).versions]));
   const result = run.checks.flatMap((c): Deployment[] => {
-    if (!["部署", "退回"].includes(c.step) || !sha(c.commit)) return [];
-    const bound = versions.has(c.commit);
+    if (!["部署", "退回"].includes(c.step) || !history && !sha(c.commit)) return [];
+    const bound = sha(c.commit) && versions.has(c.commit);
     // 自动部署可能在试合并版本上失败、尚未留下合入记录。它仍是本执行确实改动过线上的尝试。
     if (!history && !bound) return [];
     const evidence = c.evidence[c.step === "部署" ? 1 : 0];
@@ -190,36 +190,67 @@ function earlier(a: DeploymentPoint, b: DeploymentPoint) {
   return a.run === b.run ? a.index < b.index : a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest;
 }
 
-function compensatedDeployment(project: Project, ledgers: DeploymentLedger[], current: DeploymentPoint) {
-  const {run,event:rollback,index} = current, dir = rollback.evidenceDir;
-  if (!run.ledgerOK || rollback.result !== "已退回" || !dir) return;
-  const attempt = run.checks.findLast(c=>c.step === "退回" && c.source.line === rollback.source.line);
-  if (!attempt?.evidence.includes(join(dir,"merge-rollback.log"))) return;
-  const tried = ledgers.find(l=>l.run === run);
-  const trialIndex = tried?.records.slice(0,index).findLastIndex(affectsLive) ?? -1;
-  if (!tried || trialIndex < 0) return;
-  const trialPoint = deploymentPoint(tried,trialIndex), trial = trialPoint.event;
-  if (!deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== dir) return;
-  const evidence = [trial,rollback];
+function isCompensation(point: DeploymentPoint) {
+  const {run,event} = point, dir = event.evidenceDir;
+  if (!run.ledgerOK || event.result !== "已退回" || !dir) return false;
+  const check = run.checks.find(c=>c.step === "退回" && c.source.line === event.source.line);
+  return check?.evidence.some(path=>resolve(run.dir,path) === join(dir,"merge-rollback.log")) ?? false;
+}
 
-  // merge 补偿写回的是旧登记，失败的部署却不会更新它。先辨认登记，再用项目内流水验证真实前序。
-  const repo = str(run.task.repo), file = join(project.tasks,`.deployed-${hash(repo).slice(0,20)}.json`);
+/** 从最后确认的前序部署往后重放。同执行按流水，跨执行只取能证明唯一先后的位置。 */
+function replayCompensations(prior: DeploymentPoint, tail: DeploymentPoint[]) {
+  const pairs: {trial: Deployment; rollback: Deployment}[] = [], used = new Set<string>();
+  let trial: DeploymentPoint | undefined;
+  while (tail.length) {
+    const heads = tail.filter(p=>!tail.some(other=>earlier(other,p)));
+    if (heads.length !== 1) return;
+    const point = heads[0], event = point.event, dir = event.evidenceDir;
+    tail.splice(tail.indexOf(point),1);
+    if (!point.run.ledgerOK || !sha(event.commit) || !earlier(prior,point)) return;
+    if (!trial) {
+      if (event.result === "部署失败，已回退") continue;
+      if (!deployedOK(event) || !dir || dir === prior.event.evidenceDir || used.has(dir)) return;
+      trial = point;
+    } else {
+      if (point.run !== trial.run || !isCompensation(point) || event.commit !== trial.event.commit || !dir || dir !== trial.event.evidenceDir ||
+          trial.event.at !== undefined && event.at !== undefined && trial.event.at > event.at) return;
+      // 同一证据目录只用于一次试部署，不能拿旧回退来结算新尝试。
+      used.add(dir);
+      pairs.push({trial:trial.event,rollback:event});
+      trial = undefined;
+    }
+  }
+  if (!trial) return pairs;
+}
+
+function compensatedDeployment(project: Project, ledgers: DeploymentLedger[], current: DeploymentPoint) {
+  if (!isCompensation(current)) return;
+  const {run,event:rollback} = current;
+  const trial = ledgers.find(l=>l.run === run)?.records.slice(0,current.index).findLast(affectsLive);
+  const evidence = trial ? [trial,rollback] : [rollback];
+  if (!trial || !deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== rollback.evidenceDir) return {evidence};
+
+  // 登记能指向前序版本，但不证明中间的部署都已回退。把本项目整段流水与登记一并核对。
+  const file = join(project.tasks,`.deployed-${hash(str(run.task.repo)).slice(0,20)}.json`);
   const marker = new Reader(project.tasks,project.read.warnings).doc(file);
   if (!sha(marker?.commit) || !isAbsolute(str(marker?.evidenceDir))) return {evidence};
   const owner = ledgers.find(l=>l.run.id === marker.executionId);
   if (!owner?.run.ledgerOK) return {evidence};
-  const priorIndex = owner.records.findIndex(d=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir);
-  if (priorIndex < 0) return {evidence};
-  const prior = deploymentPoint(owner,priorIndex), event = prior.event;
-  if (event === trial || event.at === undefined || trial.began === undefined || event.at > trial.began) return {evidence};
-  // 同项目的其它卡也可能改过线上。已成功回退的失败尝试不改前序；其余影响或先后不清不能被登记抹掉。
+  const matching = owner.records.flatMap((d,i)=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir ? [i] : []);
+  if (matching.length !== 1) return {evidence};
+  const prior = deploymentPoint(owner,matching[0]), event = prior.event;
+  if (event === trial || !earlier(prior,current)) return {evidence};
   const otherRuns = project.runs.filter(r=>r.batch !== run.batch).map(r=>({run:r,records:deployments(project,r.batch,r,true)}));
-  const conflicting = [...ledgers,...otherRuns].flatMap(l=>l.records.flatMap((d,i)=>{
-    if (!affectsLive(d) || [trial,rollback,event].includes(d)) return [];
-    return earlier(deploymentPoint(l,i),prior) ? [] : [d];
+  const relevant = [...ledgers,...otherRuns].flatMap(l=>l.records.flatMap((d,i)=>{
+    if (d === event) return [];
+    const point = deploymentPoint(l,i);
+    return earlier(point,prior) ? [] : [point];
   }));
-  if (conflicting.length) return {evidence:[...evidence,event,...conflicting]};
-  return {evidence:[...evidence,event],restored:{run:owner.run,event,trial,rollback,marker:ref(file)}};
+  // 不把尾部其它变更甚至未配对的尝试藏在最后的“已退回”后面。
+  const observed = [...evidence,event,...relevant.map(p=>p.event)];
+  const pairs = replayCompensations(prior,relevant);
+  if (pairs?.at(-1)?.rollback !== rollback) return {evidence:observed};
+  return {evidence:observed,restored:{run:owner.run,event,trial,rollback,pairs,marker:ref(file)}};
 }
 
 /** 完成时间缺失时，后续同执行的正式收尾只能证明部署不晚于此时，不能用来计算七天。 */
@@ -251,5 +282,6 @@ export function batchDeployment(project: Project, batch: Batch) {
   const current = possibleLatest.length === 1 ? possibleLatest[0] : undefined;
   const compensation = current && compensatedDeployment(project,ledgers,current), restored = compensation?.restored;
   const events = [...new Set([...candidates.map(d=>d.event),...(compensation?.evidence ?? [])])];
-  return {current:restored || current, restored, firstAvailable, events, orderUnknown:possibleLatest.length > 1};
+  return {current:restored || current, restored, firstAvailable, events,
+    restorationUnknown:Boolean(compensation && !restored), orderUnknown:possibleLatest.length > 1};
 }

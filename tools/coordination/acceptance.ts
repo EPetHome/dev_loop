@@ -58,7 +58,9 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
     const view = {batch:batch.key, file, storedStatus:status || null, state, entries, feedback:contacts, deploymentAt:renderTime(success?.at),
       deployment:deployed && !deployed.bound && deployedOK(deployed) ? "部署版本未关联" : deployed?.result ?? (deployment.orderUnknown ? "部署先后不明" : null), deploymentExecution:deployed?.execution ?? null, deploymentCommit:deployed?.commit ?? null,
       deploymentFacts:deployment.events,
-      ...(deployment.restored && {deploymentRestored:{trial:deployment.restored.trial.source, rollback:deployment.restored.rollback.source, marker:deployment.restored.marker}}),
+      ...(deployment.restorationUnknown && {deploymentUncertainty:"补偿退回的前序版本无法确认"}),
+      ...(deployment.restored && {deploymentRestored:{trial:deployment.restored.trial.source, rollback:deployment.restored.rollback.source, marker:deployment.restored.marker,
+        pairs:deployment.restored.pairs.map(p=>({trial:p.trial.source,rollback:p.rollback.source}))}}),
       nextStartAt:renderTime(nextAt), sevenDaysAt:renderTime(sevenAt), due:eligible, reason:eligible ? reason : null, sources,
       reminder:state === "待验" || state === "待验收", writable:eligible && readerReady};
     const eol = text.includes("\r\n") ? "\r\n" : "\n";

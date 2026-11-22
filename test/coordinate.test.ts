@@ -279,6 +279,46 @@ test("同一授权条目同时覆盖本单目标和另一单；仅限另一单�
   assert(conflict.evidence.some(s=>s.file===criteria && s.line===3)); assert(!conflict.ready);
 });
 
+test("授权适用范围按编号集合核对：同场景、简写和已有批准都不能扩大范围",t=>{
+  const f=fixture(t), b=f.batch("授权范围表"), r=f.execution(b,"scope-list",now-days(2)); r.pass();
+  const issue=f.issue("带显式引用",b.name,"编号：PA046\n验收项：A2\n防复发检查：S3 / 原单重投","功能地图，S3");
+  const others=["PA099","PA100"].map(id=>f.issue(id,b.name,`编号：${id}`,"测试用例，另需定向证明"));
+  const {file:proof}=recordProof(r), original=read(issue);
+  const criteria=join(b.d,"标准.md"), taskFile=join(r.dir,"task.json");
+  doc(taskFile,{...JSON.parse(read(taskFile)),acceptance:criteria});
+  write(b.acceptance,"状态：待验\nA2. 核对结果\n");
+  jsonl(join(r.dir,"answers.jsonl"),[{at:at(now-days(1)),text:"同意授权：A2"}]);
+  const variants = [
+    ["仅用于 PA099、PA100 的 S3 检查",false],
+    ["仅限 PA099 的 S3 检查",false],
+    ["仅限于（问题单 PA099、PA100）或 S3 的办理说明",false],
+    ["仅用于问题单 PA099、PA100 及 PA046 的 S3 检查",true],
+    ["仅限：『PA099』和 `PA046` 的 S5 检查",true],
+    ["仅限场景 S5",false],
+    ["仅限场景 S1、S3",true],
+    ["仅限协调方刚才说的那张单，核对 S3",false],
+    ["仅限于 PA046、PA099 等",false],
+    ["只用于 PA046 或 PA099，核对 S3",true],
+    ["同时验证 S3 / 原单重投、PA099、PA100 的 S5",true],
+    ["用正式账号检查 S5",true],
+  ] as const;
+  for (const [scope,allowed] of variants) {
+    const text=`## 验收标准\n\n### 授权验证\nA2. [授权] ${scope}\n`, acceptanceHash=hash(text);
+    write(criteria,text); r.check("复测","通过",{acceptanceHash}); r.check("评审","通过",{acceptanceHash});
+    r.check("防复发证明","已证明",{acceptanceHash,evidence:[proof]});
+    const preview=f.run("查询"), view=mustFind(preview.issues,v=>v.file===issue);
+    assert.equal(view.ready,allowed,scope); assert.equal(preview.changes.some(c=>c.from===issue),allowed,scope);
+    if (!allowed) {
+      assert.match(view.reasons.join("\n"),/A2 .*归属冲突/,scope);
+      assert(view.evidence.some(s=>s.file===issue && s.line===8),scope);
+      assert(view.evidence.some(s=>s.file===criteria && s.line===4),scope);
+      f.apply("查询",preview);
+      assert.equal(read(issue),original);
+    }
+  }
+  assert(others.every(existsSync));
+});
+
 test("结构化证明必须使用登记的旧版；未声明旧版只认开工基线",t=>{
   const f=fixture(t), b=f.batch("补证明"), historical="5".repeat(40), wrong="6".repeat(40);
   const declaration = {issue:"PA046",scenario:"S3",checkpoint:"原单重投",before:historical};
@@ -468,6 +508,56 @@ test("失败且未确认回退的部署使旧登记失效；补偿不能凭登�
   assert.equal(restored.deploymentExecution,reestablished.id); assert.equal(restored.deploymentAt,fixedAt);
   assert.equal(restored.sevenDaysAt,at(now+days(4))); assert(!restored.due);
   assert.equal(f.run("查询",args,now+days(4)).acceptances[0].reason,"部署满七天");
+});
+
+test("多次试部署按尝试逐对重放；同一提交的两次补偿不混证据目录",t=>{
+  const f=fixture(t), b=f.batch("连续试部署"), old=f.execution(b,"known-live",now-days(10)), deployedAt=at(now-days(8));
+  const live=join(old.dir,"live-A"), marker=join(f.tasks,`.deployed-${hash(f.repo).slice(0,20)}.json`);
+  old.check("部署","已部署",{endedAt:deployedAt,evidence:[live+".log",live]});
+  doc(marker,{executionId:old.id,commit,evidenceDir:live});
+  write(b.acceptance,"状态：待验\nA1. [人工] 查看部署版本\n");
+  const retry=f.execution(b,"same-execution",now-days(4),{state:"input_required"});
+  const add = (r:typeof retry, stamp:number, name:string, outcome="已退回", log="merge-rollback.log", wrongDirectory=false) => {
+    const dir=join(r.dir,name);
+    r.check("部署","已部署",{commit:merged,startedAt:at(stamp),endedAt:at(stamp+3000),evidence:[dir+".log",dir]});
+    if (!outcome) return;
+    r.check("合入","合入失败");
+    const rollback=wrongDirectory ? join(r.dir,"wrong-attempt") : dir;
+    r.check("退回",outcome,{commit:merged,startedAt:at(stamp+4000),endedAt:at(stamp+6000),evidence:[rollback,join(rollback,log)]});
+    r.check("收尾","失败",{evidence:[dir]});
+  };
+  add(retry,now-days(3),"trial-1");
+  add(retry,now-days(2),"trial-2");
+  const last=f.execution(b,"separate-execution",now-days(1.5),{state:"input_required"});
+  add(last,now-days(1),"trial-3");
+  const args=["--acceptance-ready"], get=()=>f.run("查询",args), ok=get(), view=ok.acceptances[0];
+  assert.equal(view.deploymentExecution,old.id); assert.equal(view.deploymentAt,deployedAt);
+  assert.equal(view.sevenDaysAt,at(now-days(1))); assert.equal(view.reason,"部署满七天");
+  assert.deepEqual(view.deploymentRestored?.pairs.map(p=>[p.trial.file,p.trial.line,p.rollback.file,p.rollback.line]),[
+    [retry.index,1,retry.index,3], [retry.index,5,retry.index,7], [last.index,1,last.index,3],
+  ]);
+  assert.equal(view.deploymentFacts.filter(d=>d.result==="已退回").length,3);
+  const valid=read(retry.index);
+  for (const problem of ["回退失败","未退回","部署失败未回退","错误目录","普通退回","错误提交","同目录重复尝试","退回时间倒序"] as const) {
+    write(retry.index,"");
+    add(retry,now-days(3),"trial-1",problem==="回退失败" ? problem : problem==="未退回" ? "" : "已退回",
+      problem==="普通退回" ? "manual-rollback.log" : "merge-rollback.log",problem==="错误目录");
+    if (["错误提交","部署失败未回退","退回时间倒序"].includes(problem)) {
+      const rows=read(retry.index).trim().split("\n").map(line=>JSON.parse(line));
+      if (problem==="错误提交") rows[2].commit="4".repeat(40);
+      if (problem==="部署失败未回退") { rows[0].result="部署失败，未回退"; rows.splice(1); }
+      if (problem==="退回时间倒序") rows[2].endedAt=at(now-days(3));
+      jsonl(retry.index,rows);
+    }
+    add(retry,now-days(2),problem==="同目录重复尝试" ? "trial-1" : "trial-2");
+    const rejected=get(), pending=rejected.acceptances[0];
+    assert.equal(pending.sevenDaysAt,null,problem); assert(!pending.due,problem); assert.equal(pending.deploymentRestored,undefined,problem);
+    assert.equal(pending.deploymentUncertainty,"补偿退回的前序版本无法确认",problem);
+    assert(pending.sources.some(s=>s.file===retry.index),problem); assert(pending.sources.some(s=>s.file===last.index),problem);
+    assert(!rejected.changes.some(c=>c.to===b.acceptance),problem);
+  }
+  write(retry.index,valid); f.apply("查询",ok,args);
+  assert.match(read(b.acceptance),/结束人工提醒：部署满七天/);
 });
 
 test("部署缺完成时间时，仅用后续收尾证明下次开工，不推算七天",t=>{
