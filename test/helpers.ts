@@ -69,7 +69,7 @@ fs.renameSync(file + '.tmp',file);\n`);
       }
       signalProcess(optionalJson<Identity>(lease));
     }
-    rmSync(base, {recursive: true, force: true});
+    rmSync(base,{recursive:true,force:true,maxRetries:2}); // 进程清空 launcher 后可能还在写最后一份摘要。
   });
   return {base, repo, root, card, raw, git, env,
     async prepare() { task = createTask(card, root); await prepare(task.dir); return task; },

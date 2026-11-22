@@ -35,20 +35,21 @@ function backToDevelopment(dir: string, problem: string | Check, test = false, r
 /** 三家宿主共用的唯一推进点；聊天、忽略文件、日志丢失均不参与通过资格判断。 */
 export async function settle(dir: string, lastReply = "", {signal, reviewRequest, confirmedCommit, retest, ending}: SettleOptions = {}): Promise<SettleResult> {
   let release: (() => void) | undefined, clean = () => {}, pulse: ReturnType<typeof setInterval> | undefined;
-  let started: {at:number; selfMs:number; task:Task} | undefined, hashes: Hashes = {promptHash:"",acceptanceHash:""};
+  let started: {at:number; selfMs:number; task:Task} | undefined, hashes: Hashes = {promptHash:"",acceptanceHash:""}; const reviewOnly = reviewRequest !== undefined;
   const selfTime = () => update(dir, (s) => { if (s.state === "working" || s.state === "completed") { s.loop.bucket = "selfMs"; s.timeLimitSec = null; } });
   try {
-    try { release = lock(operationPath(dir), confirmedCommit || retest ? 2000 : 0); }
-    catch (e) { if (e instanceof BusyError) return quiet("该任务的交付/检查正在处理中"); throw e; }
-    const t = taskOf(dir), initial = statusOf(dir), {loop,state,message} = initial, reviewOnly = reviewRequest !== undefined;
+    if (reviewOnly && !matchesReviewRequest(statusOf(dir),reviewRequest)) return quiet();
+    try { release = lock(operationPath(dir), reviewOnly || confirmedCommit || retest ? 2000 : 0); }
+    catch (e) { if (!(e instanceof BusyError)) throw e; return quiet("该任务的交付/检查正在处理中"); } // 等锁超时不消费请求。
+    const initial = statusOf(dir), {loop,state,message} = initial;
     if (confirmedCommit && (state !== "working" || loop.phase !== "已交付" || loop.delivery?.commit !== confirmedCommit)) return quiet();
     if (reviewOnly ? !matchesReviewRequest(initial,reviewRequest) : retest ? state !== "working" || loop.phase !== "复测中" || loop.retestAttempt !== retest
       : loop.reviewRequest || loop.retestAttempt && ["复测中","评审中"].includes(loop.phase)) return quiet();
     if (loop.released || loop.releasePending) return quiet(loop.released ? "工作区已释放" : "等待释放工作区"); if (alive(loop.finisher)) return quiet("正在收尾");
-    if (state === "working" && loop.finisher) return park(dir,"收尾没走完",`收尾进程已退出，可运行 bin/loop 收尾 ${t.executionId} 手工接手。`);
+    if (state === "working" && loop.finisher) return park(dir,"收尾没走完",`收尾进程已退出，可运行 bin/loop 收尾 ${initial.executionId} 手工接手。`);
     if (["cancelled","input_required","failed"].includes(state)) return quiet(message); if (!loop.ready) return quiet("工作区正在准备");
     pulse = setInterval(() => heartbeat(dir),60000); pulse.unref();
-    const ownStart = Date.now(); started = {at:ownStart,selfMs:loop.durations.selfMs,task:t}; selfTime();
+    const t = taskOf(dir), ownStart = Date.now(); started = {at:ownStart,selfMs:loop.durations.selfMs,task:t}; selfTime();
     const [commit,currentTree] = gitText(t.worktree,["rev-parse","HEAD","HEAD^{tree}"]).split("\n"), {delivery} = loop, dirty = changes(t.worktree);
     if (dirty.length || !delivery || commit !== delivery.commit || currentTree !== delivery.tree || ((confirmedCommit || retest) && !onTaskBranch(t))) {
       const candidate = dirty.length || undeliveredCommit(t,initial,commit) ? digest(JSON.stringify([commit,dirty.sort()])) : "";
@@ -141,8 +142,7 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
     update(dir, s => { if (move(s,"working","评审中","正在评审第 " + round + " 轮","reviewMs",reviewSeconds)) s.loop.reviewRounds = round; });
     const reviewStart = Date.now(), budget = reviewSeconds * 1000 + Math.min(0,deadline-reviewStart);
     const outcome = await executeStaticReview(pinned,round,material,budget,signal), mustFix = outcome.review?.mustFix; selfTime();
-    if (statusOf(dir).state !== "cancelled") verifyPin();
-    const reviewed = record("评审",reviewStart,{result:!mustFix ? "失败" : mustFix.length ? "必修" : "通过",attempt:test.attempt,evidence:outcome.evidence,detail:mustFix?.join("\n") || outcome.error});
+    if (statusOf(dir).state !== "cancelled") verifyPin(); const reviewed = record("评审",reviewStart,{result:!mustFix ? "失败" : mustFix.length ? "必修" : "通过",attempt:test.attempt,evidence:outcome.evidence,detail:mustFix?.join("\n") || outcome.error});
     if (reviewed.result === "已停止") return quiet("已停止"); if (!mustFix) {
       keep = !outcome.contextOverflow && (!reviewOnly || Boolean(reuse));
       fail(dir,outcome.error || "评审调用失败",outcome.contextOverflow ? "评审上下文超限" : "临时故障"); return quiet(outcome.error);

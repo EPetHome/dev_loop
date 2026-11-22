@@ -7,7 +7,7 @@ import { lock, withLock, BusyError, appendJson, iso, span } from "../infra/files
 import { onTaskBranch } from "./deliver.ts";
 import { InputError } from "./card.ts";
 import { alive, signalProcess, identity } from "../infra/exec.ts";
-import { taskOf, statusOf, answersOf, update, move, appendCheck, recordStep, checksOf, inputs, checked, qualifiedTest, sameInputs, lastTest, ENV_WAIT, type Check, type Status, type Task } from "./store.ts";
+import { taskOf, statusOf, answersOf, update, move, appendCheck, recordStep, checksOf, inputs, checked, qualifiedTest, sameInputs, lastTest, matchesReviewRequest, ENV_WAIT, type Check, type Status, type Task } from "./store.ts";
 import { clearCheck, operationPath, run } from "./run.ts";
 export function copyLocalFiles(t: Task, cwd = t.worktree) {
   for (const path of t.config.localFiles) {
@@ -54,8 +54,7 @@ export const shutdownSession = (dir: string) => update(dir,({loop}) => {
 });
 /** 只复用同一交付、同一输入下的复测；检查失败记录仍须是最近一次核心检查。 */
 export function retryReview(dir: string) {
-  const t = taskOf(dir), s = statusOf(dir), commit = s.loop.delivery?.commit;
-  if (!commit || !deliveryMatches(t,s)) return;
+  const t = taskOf(dir), s = statusOf(dir), commit = s.loop.delivery?.commit; if (!commit || !deliveryMatches(t,s)) return;
   const h = inputs(t), records = checksOf(dir), last = records.findLast(c => c.step === "复测" || c.step === "评审");
   if (last?.step !== "评审" || last.result !== "失败" || last.commit !== commit || !sameInputs(last,h)) return;
   const test = qualifiedTest(records,commit,h); return test?.attempt === last.attempt ? test : undefined;
@@ -99,16 +98,17 @@ export function resume(dir: string, text?: string, answering = false, accept?: s
 }
 function resumeLocked(t: Task, text?: string, answering = false, accept?: string): Resumed {
   if ((text !== undefined || answering) && !text?.trim()) throw new InputError("话不能为空");
-  const {dir} = t, s = statusOf(dir), {loop,state} = s;
+  const {dir} = t, s = statusOf(dir), {loop,state} = s, {reviewRequest} = loop;
   const requireResumable = (s: Status) => {
     if (answering && s.state !== "input_required") throw new InputError(`答复只在「等你」时接收；当前为「${s.loop.phase}」`);
     requireNotReleasing(s);
     if (s.loop.released || s.loop.abandoned) throw new Error((s.loop.released ? "工作区已释放" : "已放弃并删除 worktree")+"，不能续跑；请重新启动卡");
   }; requireResumable(s);
   if (loop.phase === "收尾中" || [loop.finisher,loop.startingSession,loop.launcher].some(alive) || !loop.retestAttempt && alive(loop.activeProcess)) throw new Error("执行正在准备或检查，请先停止再续跑");
+  if (text === undefined && accept === undefined && reviewRequest && matchesReviewRequest(s,reviewRequest) && retryReview(dir))
+    return {reused:false,running:false,reviewOnly:true,status:s};
   const retest = t.e2e && claimRetest(t,s,text,accept); if (retest) return retest;
-  const running = alive(loop.session) && !loop.session?.endedAt, commit = loop.delivery?.commit;
-  const after = !!(t.after?.length || t.next), pending = after && loop.afterCommit !== commit;
+  const running = alive(loop.session) && !loop.session?.endedAt, commit = loop.delivery?.commit, after = !!(t.after?.length || t.next), pending = after && loop.afterCommit !== commit;
   const reused = text === undefined && loop.wait !== "收尾没走完" && (!after || state === "completed" || pending) && !!(commit && deliveryMatches(t,s) && checked(dir,commit));
   const reviewOnly = !reused && text === undefined && state === "failed" && s.error?.category === "临时故障" && !!retryReview(dir);
   if (!reused && !reviewOnly && running && state !== "input_required") throw new Error("开发会话仍在运行；请在原会话继续或先停止");
@@ -118,7 +118,7 @@ function resumeLocked(t: Task, text?: string, answering = false, accept?: string
       s.state = "working"; if (pending) s.loop.afterCommit = commit!;
       move(s,pending ? "working" : "completed",pending ? "收尾中" : ["等你","已停止"].includes(s.loop.phase) ? "完成" : s.loop.phase,"沿用此 commit 的复测与评审通过记录",pending ? "selfMs" : null); return;
     }
-    if (reviewOnly) { if (move(s,"working","评审中","已续跑，后台只重做评审","selfMs")) s.loop.reviewRequest = randomUUID(); return; }
+    if (reviewOnly) { if (move(s,"working","评审中","已续跑，后台只重做评审；若后台退出，可不带话续跑同一请求","selfMs")) s.loop.reviewRequest = randomUUID(); return; }
     if (s.state === "input_required") {
       const {prompt,acceptance,e2e,...hashes} = inputs(t);
       appendCheck(dir,{commit:s.loop.commit || t.baseCommit,tree:s.loop.delivery?.tree || "",step:"等你",result:"已续跑",evidence:[],...hashes,...span(s.loop.stepStartedAt)});
