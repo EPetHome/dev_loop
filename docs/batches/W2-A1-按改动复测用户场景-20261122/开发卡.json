@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "name": "W2-A1-按改动复测用户场景-20261122",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试"
+  ],
+  "next": "../W2-A2-证明旧问题能被测试抓住-20261122/开发卡.json",
+  "tasks": [
+    {
+      "name": "W2-A1-按改动复测用户场景",
+      "prompt": "../../prompt/提示词-W2-A1-按改动复测用户场景.md",
+      "scope": {
+        "allow": [
+          "src/**",
+          "test/**",
+          "README.md",
+          "docs/参考-运行细节.md",
+          "docs/写法-需求提示词与验收标准.md"
+        ]
+      },
+      "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+    }
+  ],
+  "limits": {
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20
+    },
+    "开发评审": {
+      "maxRepairs": 5,
+      "timeoutMin": 60
+    }
+  }
+}
