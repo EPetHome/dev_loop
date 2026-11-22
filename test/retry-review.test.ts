@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
-import { fixture, write, sq, PASS, MUST, until, NODE } from "./helpers.ts";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { fixture, write, writeFixtureScript, sq, PASS, MUST, until } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { resume, registerSession } from "../src/core/lifecycle.ts";
@@ -73,7 +73,7 @@ for (const [name, raw, overflow] of [
   ["临时断连", "连接暂时中断，稍后再试", false],
 ] as const) test("W1 A17 / 问题单 A3：只读本次 Pi 评审结束原因 · " + name, async t => {
   const f = fixture(t, {config: {reviewerCmd: ""}}), task = await f.prepare(), bin = join(f.base, "fake-review-pi.cjs");
-  write(bin, "#!" + NODE + "\n" + `
+  writeFixtureScript(bin,"node",`
 const fs = require("fs"), path = require("path"), t = process.env.LOOP_TASK_DIR;
 const arg = name => process.argv[process.argv.indexOf(name)+1];
 const id = arg("--session-id"), dir = process.argv.includes("--session-dir") ? arg("--session-dir") : path.join(t,"legacy-review-sessions");
@@ -86,7 +86,6 @@ log("2026-test_"+id+".jsonl", id, err(oldOverflow), err(raw));
 fs.appendFileSync(path.join(t,"order"), "review\\n");
 console.log("评审未生成报告");
 `);
-  chmodSync(bin, 0o755);
   const old = process.env.PI_BIN;
   try { process.env.PI_BIN = bin; deliver(task.dir); await settle(task.dir); await settle(task.dir); }
   finally { if (old === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = old; }

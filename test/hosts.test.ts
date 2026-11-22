@@ -112,7 +112,7 @@ test("A8：pi 使用最后助手消息；Claude/Codex JSONL 回退兼容",async(
   assert.equal(existsSync(join(task.dir,"order")),false);
 });
 test("阶段 A9：pi 已交付→复测中→评审中→完成，外部变更下一次刷新可见",async(t)=>{
-  const hold='const fs=require("fs"),p=process.env.LOOP_TASK_DIR,k=process.argv[2];fs.writeFileSync(p+"/"+k+"-started","");const w=fs.watch(p,()=>{if(fs.existsSync(p+"/"+k+"-go")){w.close();}});';
+  const hold='const fs=require("fs"),p=process.env.LOOP_TASK_DIR,k=process.argv[2];const check=()=>{if(fs.existsSync(p+"/"+k+"-go"))w.close();};const w=fs.watch(p,check);fs.writeFileSync(p+"/"+k+"-started","");check();';
   const f=fixture(t,{test:'node hold.cjs test',reviewer:'node hold.cjs review; printf %s '+sq(PASS)});
   write(join(f.repo,"hold.cjs"),hold);f.git("add","hold.cjs");f.git("commit","-m","controlled phases");
   const task=await f.prepare(),p=fakePi(task.dir,task.worktree,"");p.events.session_start({},p.ctx);

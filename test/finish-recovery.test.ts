@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, write, until, getJson, NODE, ROOT, MUST, PASS, sq } from "./helpers.ts";
+import { fixture, write, writeFixtureScript, until, getJson, NODE, ROOT, MUST, PASS, sq } from "./helpers.ts";
 import { spawn, execFileSync } from "node:child_process";
 import { finish, pendingAcceptance } from "../src/cli/finish.ts";
 import { queued } from "../src/cli/queue.ts";
@@ -76,7 +76,7 @@ test("W1 A18 / 问题单 A4：真实必修退回，返修正式通过才接力�
 for (const afterDispatch of [false, true]) test("W1 r1 必修4 / A18：收尾中断后同一下一卡只启动一次 · " + (afterDispatch ? "派发后" : "已分配、派发前"), async t => {
   const f = fixture(t, {card: {next: "next.json"}});
   write(join(f.repo, "next.json"), JSON.stringify({...f.raw, next: undefined}));
-  write(f.env.LOOP_LAUNCH_CMD!, "#!" + NODE + '\nrequire("fs").appendFileSync(process.env.LOOP_TASK_DIR+"/opens","open\\n");\n');
+  writeFixtureScript(f.env.LOOP_LAUNCH_CMD!,"node",'require("fs").appendFileSync(process.env.LOOP_TASK_DIR+"/opens","open\\n");\n');
   const first = await f.prepare(), {commit} = deliver(first.dir);
   await settle(first.dir);
   const fault = `

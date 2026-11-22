@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { fixture, write, until, getJson, ROOT, NODE, hook, hostProcess } from "./helpers.ts";
+import { fixture, write, writeFixtureScript, until, getJson, ROOT, NODE, hook, hostProcess } from "./helpers.ts";
 import { statusOf, waitFor, transition, fail } from "../src/core/store.ts";
 import { heartbeat, stop } from "../src/core/lifecycle.ts";
 import { alive, type Identity } from "../src/infra/exec.ts";
@@ -15,13 +15,13 @@ import { writeJson } from "../src/infra/files.ts";
 function inhibitor(t: Parameters<typeof fixture>[0], f: ReturnType<typeof fixture>) {
   const clock = join(f.base, "clock.json"), log = join(f.base, "assertions.jsonl"), cmd = join(f.base, "fake-caffeinate.cjs"), previous = process.env.LOOP_CAFFEINATE_CMD;
   writeJson(clock, Date.now());
-  write(cmd, "#!" + NODE + "\n" +
+  writeFixtureScript(cmd,"node",
     'const fs=require("fs"),cp=require("child_process"),clock=' + JSON.stringify(clock) + ',log=' + JSON.stringify(log) + ';' +
     'const now=()=>JSON.parse(fs.readFileSync(clock,"utf8")),args=process.argv.slice(2),start=now(),seconds=args.includes("-t")?Number(args[args.indexOf("-t")+1]):Infinity,owner=args.includes("-w")?args[args.indexOf("-w")+1]:"",expires=start+seconds*1000;' +
     'const emit=event=>fs.appendFileSync(log,JSON.stringify({event,pid:process.pid,task:process.env.LOOP_TASK_DIR,args,at:now()})+"\\n");' +
     'let done=false;const end=()=>{if(done)return;done=true;emit("off");process.exit(0);};' +
     'process.on("SIGTERM",end);fs.watchFile(clock,{interval:50},()=>{const p=owner?cp.spawnSync("ps",["-p",owner,"-o","stat="],{encoding:"utf8"}):null;if(now()>=expires||(p&&(p.status!==0||p.stdout.trim().startsWith("Z"))))end();else emit("checked");});if(Number.isFinite(seconds))setTimeout(end,seconds*1000);emit("on");\n');
-  execFileSync("chmod", ["+x", cmd]); process.env.LOOP_CAFFEINATE_CMD = f.env.LOOP_CAFFEINATE_CMD = cmd;
+  process.env.LOOP_CAFFEINATE_CMD = f.env.LOOP_CAFFEINATE_CMD = cmd;
   t.after(() => { process.env.LOOP_CAFFEINATE_CMD = previous; });
   const events = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
   return {clock, log, events, async event(event: string, pid: number) { return until(f.base, events, es => es.some(e => e.event === event && e.pid === pid), log); }};
