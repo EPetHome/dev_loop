@@ -12,7 +12,8 @@ function script(name: string, body = "") {
 }
 async function setup(t: Parameters<typeof fixture>[0], bodies: {cmd?: string; check?: string | false; rollback?: string | false} = {}) {
   const cfg={cmd:"scripts/deploy.sh",...(bodies.check===false?{}:{check:"scripts/check.sh"}),...(bodies.rollback===false?{}:{rollback:"scripts/rollback.sh"})};
-  const f=fixture(t,{config:{deploy:cfg}});
+  // 客户端须等 cmd/check/rollback 三个独立进程和检出清理。这里只放宽测试外层上限，不改脚本时限。
+  const f=fixture(t,{config:{deploy:cfg},cliTimeoutMs:45000});
   for(const name of ["cmd","check","rollback"] as const){
     const path=cfg[name];if(!path)continue;
     write(join(f.repo,path),script(name,typeof bodies[name]==="string"?bodies[name]:""));chmodSync(join(f.repo,path),0o755);
@@ -38,7 +39,7 @@ test("部署 A7：cmd/check 各一次、环境/日志正确、独立检出销毁
 test("部署 A8：check 失败自动 rollback 一次、FAILED=check、退出1、清理检出",async(t)=>{
   const f=await setup(t,{check:"process.exit(7);"});
   await assert.rejects(f.cli(["部署",f.task.executionId,"--json"]),(e:any)=>{
-    assert.equal(e.code,1);const err=JSON.parse(e.stderr).error,r=err.result;assert.equal(err.category,"未知");assert.equal(r.result,"部署失败，已回退");
+    assert.equal(e.code,1,e.message);const err=JSON.parse(e.stderr).error,r=err.result;assert.equal(err.category,"未知");assert.equal(r.result,"部署失败，已回退");
     assert.deepEqual(r.steps.map((x:any)=>[x.name,x.code]),[["cmd",0],["check",7],["rollback",0]]);
     const received=calls(r.evidenceDir);assert.deepEqual(received.map(x=>x.name),["cmd","check","rollback"]);assert.equal(received[2].failed,"check");assert.equal(existsSync(received[0].cwd),false);assert.match(err.raw,/退出码 7/);return true;
   });

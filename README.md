@@ -165,6 +165,26 @@ bin/loop 查询 <执行编号> --json
 - `summary.md`：结论和各阶段耗时。
 - 测试、评审原文在同目录；证据缺失不会把已通过的结论作废。
 
+## 协调工具：开工复盘、收单和体检
+
+独立入口 `node tools/coordinate.ts`，不由核心调用。只处理 `--project` 指定的项目；不代投递、不运行项目脚本、不改规则、测试预期或上线状态。项目外调用请给脚本的绝对路径。
+
+| 命令 | 预览内容 |
+|---|---|
+| `开工 --project <项目目录> --card <待开工的卡>` | 上一批的信号及出处、重复候选、可关单及缺项、到期提醒、项目体检；当月尚未存档时生成月报 |
+| `查询 --project <项目目录>` | 查看复盘/收单；不把本次调用算作下一次开工，仍检查已发生的开工和部署满七天 |
+| `体检 --project <项目目录>` | 四类接入检查、功能/场景/脚本的提示，不设开工门槛 |
+| `月报 --project <项目目录> [--month YYYY-MM]` | 按请求现场重算，含指标分母、未知和剪枝候选；默认本机当前月 |
+| `候选决定 --project <项目目录> --decision <本人决定.json>` | 预览登记本人已作出的「接受不处理」或「已批准」；工具不替本人批准或修改规则 |
+
+- `--card` 和 `--changed <路径>` 相对于项目根目录；可重复给 `--changed`，重命名给出新旧路径，删除给出旧路径。已有执行时可读起点到交付的 Git 改动。`--tasks-root` 可覆盖 `LOOP_TASKS_ROOT`（默认 `~/.dev-loop/tasks`）。
+- 默认**只读**。核对 JSON 的 `project`、`changes` 和 `blocked` 后，用**同一命令及参数**加 `--apply <planId>` 才写入。变动已失效时重新预览；中断时用 `incomplete` 中的原编号重试。归档文件不改名，撞名不覆盖。日志、月报、决定和移动前的原件保存在项目内 `.dev-loop-coord/`，建议从 Git 排除。
+- 项目的验收读取器已识别「未确认（无反馈）」或确认无读取器以后，才加 `--acceptance-ready`（或登记 `acceptanceReaderReady: true`）。否则只列到期项；无反馈不等于通过，授权没做的逐项保留。
+
+**PA 的稳定调用**：用 Node 启动 `/Users/Admin/Desktop/dev-loop/tools/coordinate.ts`，参数数组 `['开工','--project', 项目绝对路径, '--card', 卡路径]`。只查流程只调预览；正式投递前展示 `previous`、`candidates`（`needsDecision: true` 才需再请本人决定）、`blocked`、`health` 等，再按调用方已获准的范围应用 `planId`，之后仍走原来的投递入口。PA 的读取器尚未迁好时不要带 `--acceptance-ready`。工具结果的 `protocol` 为 `coordinate-report/1`；`changes` 附拟写路径和内容摘要，`applied.results` 给每项实际结果（`applied` / `conflict`）及原件位置，`applied.complete: false` 表示有冲突未应用。`issues`、`acceptances` 是预览时的视图，写完可另调 `查询` 取现状。命令失败时退出 1，stderr 为 `{error:{category,raw}}`。体检提示和待授权不阻断开工，也不能当作授权。
+
+[登记路径、证据格式及指标口径](docs/参考-运行细节.md#协调工具的输入和存档) · [项目接入清单](docs/项目模板/README.md)
+
 ## 自检
 
 在 dev-loop 仓库根目录：

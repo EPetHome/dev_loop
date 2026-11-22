@@ -5,8 +5,11 @@ import { fixture, write, until, NODE, ROOT } from "./helpers.ts";
 import { registerSession } from "../src/core/lifecycle.ts";
 import { deliver } from "../src/core/deliver.ts";
 export const flow = ["开发评审", "测试", "合入", "部署", "推送"];
+// 收尾可能串行启动多个替身并清理 Git 检出。给整个测试链留余量，仍以实际状态/回执继续，不等满上限。
+const finishDeadlineMs = 60000;
+export const untilFinish = <T>(dir: string, get: () => T, ready: (value: T) => boolean, file?: string) => until(dir,get,ready,file,finishDeadlineMs);
 export async function finishingFixture(t: Parameters<typeof fixture>[0], o: {flow?: string[]; cmd?: string; check?: string; rollback?: string} = {}) {
-  const f = fixture(t,{card:{flow:o.flow || flow.slice(0,4)},config:{deploy:{cmd:"deploy.cjs",check:"check.cjs",rollback:"rollback.cjs"}}});
+  const f = fixture(t,{card:{flow:o.flow || flow.slice(0,4)},config:{deploy:{cmd:"deploy.cjs",check:"check.cjs",rollback:"rollback.cjs"}},cliTimeoutMs:finishDeadlineMs});
   f.raw.tasks[0].scope = ["src/**","check.cjs"]; write(f.card,JSON.stringify(f.raw));
   for (const name of ["deploy","check","rollback"] as const) {
     const body = name === "deploy" ? o.cmd : o[name];
@@ -46,6 +49,6 @@ syncBuiltinESMExports();
   let stderr = ""; child.stderr!.setEncoding("utf8"); child.stderr!.on("data", chunk=>{stderr += chunk;});
   const exited = new Promise<{code:number|null;stderr:string}>((ok,no)=>{child.once("error",no);child.once("close",code=>ok({code,stderr}));});
   t.after(()=>{if(child.exitCode===null&&child.signalCode===null)child.kill("SIGKILL");});
-  await until(dir,()=>existsSync(marker),Boolean);
+  await untilFinish(dir,()=>existsSync(marker),Boolean,marker);
   return { proceed:()=>write(gate,"remove\n"), exited };
 }

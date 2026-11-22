@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { setTimeout as pollAfter } from "node:timers/promises";
 import { fixture, write, until, getJson, ROOT, NODE, hook, hostProcess } from "./helpers.ts";
 import { statusOf, waitFor, transition, fail } from "../src/core/store.ts";
 import { heartbeat, stop } from "../src/core/lifecycle.ts";
@@ -23,8 +24,20 @@ function inhibitor(t: Parameters<typeof fixture>[0], f: ReturnType<typeof fixtur
     'process.on("SIGTERM",end);fs.watchFile(clock,{interval:50},()=>{const p=owner?cp.spawnSync("ps",["-p",owner,"-o","stat="],{encoding:"utf8"}):null;if(now()>=expires||(p&&(p.status!==0||p.stdout.trim().startsWith("Z"))))end();else emit("checked");});if(Number.isFinite(seconds))setTimeout(end,seconds*1000);emit("on");\n');
   execFileSync("chmod", ["+x", cmd]); process.env.LOOP_CAFFEINATE_CMD = f.env.LOOP_CAFFEINATE_CMD = cmd;
   t.after(() => { process.env.LOOP_CAFFEINATE_CMD = previous; });
-  const events = () => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
-  return {clock, log, events, async event(event: string, pid: number) { return until(f.base, events, es => es.some(e => e.event === event && e.pid === pid), log); }};
+  type AssertionEvent = {event: string; pid: number; task: string; args: string[]; at: number};
+  const events = (): AssertionEvent[] => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+  // write 可落在初读与 watchFile 首次 stat 之间而没有变更通知。直接读事件，不依赖日志元数据或模拟时钟。
+  const wait = async (expected: string, found: (entries: AssertionEvent[]) => boolean) => {
+    const deadline = performance.now() + 12000;
+    for (;;) {
+      const entries = events();
+      if (found(entries)) return entries;
+      const left = deadline - performance.now();
+      if (left <= 0) assert.fail(`等待 ${expected} 超时：${log}；最近事件：${JSON.stringify(entries.slice(-8))}`);
+      await pollAfter(Math.min(50,left));
+    }
+  };
+  return {clock, events, wait, event: (event: string, pid: number) => wait(`${event} pid=${pid}`, es => es.some(e => e.event === event && e.pid === pid))};
 }
 test("A7：working租约随注入时钟/心跳续期，等你立即放开；另一个working任务不受影响", async t => {
   const f = fixture(t), driver = inhibitor(t, f);
@@ -78,7 +91,7 @@ for (const host of ["claude", "codex"]) test("r1必修1：" + host + "真实hook
   assert.deepEqual(driver.events().find(e => e.event === "on" && e.pid === bound.pid).args, ["-i", "-w", String(worker.owner.pid)]);
   assert.equal(bound.owner.pid, worker.owner.pid); const seq = statusOf(task.dir).seq;
   t.mock.timers.enable({apis: ["Date"], now: Date.now()}); t.mock.timers.tick(121000); writeJson(driver.clock, Date.now());
-  await until(f.base, driver.events, events => events.some(e => e.pid === bound.pid && e.at === Date.now() && ["checked", "off"].includes(e.event)),driver.log);
+  await driver.wait(`checked/off pid=${bound.pid} at=${Date.now()}`, events => events.some(e => e.pid === bound.pid && e.at === Date.now() && ["checked", "off"].includes(e.event)));
   assert.equal(alive(bound), true); assert.equal(driver.events().some(e => e.pid === bound.pid && e.event === "off"), false);
   assert.equal(statusOf(task.dir).state, "working"); assert.equal(statusOf(task.dir).seq, seq, "没有工具事件或心跳来续期");
   await hook(f, task.dir, "Stop", {cwd: task.worktree, last_assistant_message: "需要确认，暂不交付"});

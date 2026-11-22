@@ -1,0 +1,287 @@
+import { execFileSync } from "node:child_process";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { Reader, canonical, entry, hash, object, ref, repoPath, sha, str, strings, time, type Doc, type Ref } from "./files.ts";
+
+export interface Check { source: Ref; step: string; result: string; commit: string; detail: string; evidence: string[]; value: Doc }
+export interface Execution {
+  id: string; dir: string; task: Doc; status: Doc; loop: Doc; started?: number; batch?: Batch; card: string;
+  checks: Check[]; ledgerOK: boolean; read: Reader;
+}
+export interface Batch { key: string; card: string; name: string; dir: string; results: string; acceptance: string; runs: Execution[] }
+export type Deployment = { at?: number; began?: number; source: Ref; result: string; commit: string; execution: string; bound: boolean; evidenceDir?: string };
+export const deployedOK = (d?: Deployment) => !!d && ["已部署","已部署（未检查）"].includes(d.result);
+export const delivered = (run: Execution) => str(object(run.loop.delivery).commit) || str(run.loop.commit);
+export const official = (check: Check) => check.step === "评审" && ["通过", "必修"].includes(check.result);
+export const roundOf = (check: Check) => Number(check.evidence.map(f => /-r(\d+)(?:-a\d+)?\.md$/.exec(f)?.[1]).find(Boolean)) || undefined;
+export const statusRef = (run: Execution, field?: string) => ref(join(run.dir, "status.json"), undefined, field);
+export const taskRef = (run: Execution, field?: string) => ref(join(run.dir, "task.json"), undefined, field);
+export const taskFile = (run: Execution, path: string) => repoPath(run.dir, path);
+
+export class Project {
+  root: string;
+  tasks: string;
+  read: Reader;
+  config: Doc;
+  state: string;
+  runs: Execution[] = [];
+  batches: Batch[] = [];
+  catalogOK = true;
+  query: { source: string; available: boolean; matched: number; execution?: string; error?: string };
+  constructor(root: string, tasks: string, loop: string) {
+    this.root = root; this.state = join(root, ".dev-loop-coord"); this.tasks = tasks;
+    this.read = new Reader(root); this.config = this.read.doc(join(root, ".dev-loop-coord.json")) || {};
+    this.query = {source: `${loop} 查询 --brief --json`, available: false, matched: 0};
+    const index = new Reader(tasks);
+    const catalogue = index.list(tasks);
+    if (index.warnings.length) this.catalogOK = false;
+    for (const e of catalogue.filter(e => e.isDirectory() && !e.name.startsWith("."))) {
+      const dir = join(tasks, e.name), path = join(dir, "task.json");
+      const task = index.doc(path), repo = str(task?.repo);
+      if (!task || !isAbsolute(repo)) { this.catalogOK = false; continue; }
+      if (index.get(path, () => canonical(repo)) !== root) continue;
+      if (task.executionId !== e.name) { this.read.warn(path, "登记执行编号与目录不一致"); this.catalogOK = false; continue; }
+      const read = new Reader(dir, this.read.warnings), statusPath = join(dir, "status.json");
+      const status = read.doc(statusPath);
+      if (!status || status.executionId !== e.name) read.warn(statusPath, "状态缺失或执行编号不符");
+      const checksPath = join(dir, "checks.jsonl"), count = this.read.warnings.length;
+      const checks = read.lines(checksPath).flatMap(({value, source}): Check[] => {
+        if (typeof value.step !== "string" || typeof value.result !== "string") { read.warn(checksPath, "没有检查步骤或结论", source.line); return []; }
+        return [{source, value, step: value.step, result: value.result, commit: str(value.commit), detail: str(value.detail), evidence: strings(value.evidence)}];
+      });
+      const ledgerOK = count === this.read.warnings.length && !!read.get(checksPath, () => entry(dir,checksPath)?.isFile());
+      if (!ledgerOK) read.warn(checksPath, "检查流水缺失或不完整");
+      const card = str(task.card), safeCard = card && this.read.get(path, () => {
+        // 历史卡可能已删除，但其登记路径仍可引用；不把另一仓库的卡算进来。
+        const p = repoPath(root, card);
+        if (canonical(p) !== p) throw new Error("开发卡路径含符号链接：" + p);
+        return p;
+      });
+      const ownStatus = status?.executionId === e.name ? status : {};
+      const state = object(ownStatus.loop);
+      this.runs.push({id: e.name, dir, task, status: ownStatus, loop: state, card: safeCard || "", checks, ledgerOK, read});
+    }
+    if (!this.catalogOK) this.read.warn(tasks, "执行索引部分不可读；未猜测归属，缺失不能视为没有");
+    for (const run of this.runs) run.started = time(run.task.createdAt) ?? time(object(run.loop.facts).startedAt);
+    this.runs.sort((a,b) => (a.started ?? -Infinity) - (b.started ?? -Infinity) || a.id.localeCompare(b.id));
+    const latest = this.runs.at(-1);
+    if (latest) this.publicStatus(loop,latest);
+    this.loadBatches();
+  }
+  path(name: string) { return repoPath(this.root, name); }
+  setting(key: string, fallback: string) {
+    const path = str(this.config[key]);
+    if (path) {
+      const configured = this.read.get(join(this.root,".dev-loop-coord.json"),()=>this.path(path));
+      if (configured) return configured;
+    }
+    return this.path(fallback);
+  }
+  private publicStatus(loop: string, run: Execution) {
+    this.query.execution = run.id;
+    try {
+      // 只查询本项目最新执行。--all 还会读取其他项目的答复/活动工作区，不作为项目复盘入口。
+      const text = execFileSync(loop, ["查询", "--brief", "--json"], {cwd: this.root, encoding: "utf8", timeout: 12000, maxBuffer: 8 * 1024 * 1024,
+        env: {...process.env, LOOP_NODE:process.execPath, LOOP_TASKS_ROOT: this.tasks, LOOP_TASK_DIR: run.dir}, stdio:["ignore","pipe","pipe"]});
+      const result = object(JSON.parse(text)), s = object(Array.isArray(result.executions) && result.executions[0]);
+      if (result.complete !== true || s.executionId !== run.id || object(s.refs).card !== run.task.card) throw new Error("公开查询未返回登记的执行");
+      this.query.available = true;
+      this.query.matched = 1;
+      // 查询只补齐同一次读取的公开字段；不用旧/新版本的状态拼接不同现场。
+      if (s.seq === run.status.seq && s.updatedAt === run.status.updatedAt) { run.status = s; run.loop = object(s.loop); }
+    } catch (e) {
+      this.query.error = "公开查询不可用；本次仅使用已核对归属的原始状态";
+      run.read.warn(join(run.dir,"status.json"),this.query.error);
+    }
+  }
+  private loadBatches() {
+    const byCard = new Map<string, Batch>();
+    const add = (card: string) => {
+      let batch = byCard.get(card);
+      if (!batch) {
+        const dir = dirname(card), nested = basename(card) === "开发卡.json";
+        const name = nested ? basename(dir) : basename(card, ".json");
+        // 旧 loop-cards/ 的平铺卡按文件区分，不共用一个验收.md。
+        const results = join(dir, nested ? "结果.md" : `${name}-结果.md`), acceptance = join(dir, nested ? "验收.md" : `${name}-验收.md`);
+        batch = {key: relative(this.root, nested ? dir : card), card, dir, name, results, acceptance, runs: []};
+        byCard.set(card, batch);
+      }
+      return batch;
+    };
+    const roots = new Set([this.setting("batches", "docs/batches"), this.path("loop-cards")]);
+    for (const dir of roots) for (const child of this.read.list(dir)) {
+      const path = join(dir, child.name);
+      if (child.isDirectory() && this.read.list(path).some(e => ["开发卡.json", "验收.md", "结果.md"].includes(e.name) && e.isFile())) add(join(path, "开发卡.json"));
+      if (child.isFile() && /\.json$/.test(child.name) && this.read.doc(path)?.version === 1) add(path);
+    }
+    for (const run of this.runs) if (run.card) { run.batch = add(run.card); run.batch.runs.push(run); }
+    this.batches = [...byCard.values()].sort((a,b) => a.key.localeCompare(b.key));
+  }
+}
+
+export function checked(project: Project, run: Execution) {
+  const commit = delivered(run), prompt = str(run.task.prompt), acceptance = str(run.task.acceptance);
+  const read = (path: string) => project.read.get(path, () => project.read.text(project.path(path)));
+  // 关单只认同一交付 + 当前提示词和验收哈希；缺材料不猜，不拿「没验证」当通过。
+  const p = prompt ? read(prompt) : undefined, a = acceptance ? read(acceptance) : "";
+  const hashes = p !== undefined && a !== undefined ? {promptHash: hash(p), acceptanceHash: hash(a)} : undefined;
+  const selected = run.checks.filter(c => hashes && c.commit === commit && c.value.promptHash === hashes.promptHash && c.value.acceptanceHash === hashes.acceptanceHash);
+  const test = selected.findLast(c => c.step === "复测"), review = selected.findLast(c => c.step === "评审");
+  return {commit, hashes, test, review, passed: run.ledgerOK && sha(commit) && test?.result === "通过" && review?.result === "通过"};
+}
+export function mergedVersion(check: Check) {
+  try { const after = object(JSON.parse(check.detail)).devAfter; if (sha(after)) return after; }
+  catch { /* 无 devAfter，不能把其他部署版本归到本批。 */ }
+}
+export function mergeFacts(run: Execution, commit = delivered(run)) {
+  const merges = run.checks.filter(c => c.step === "合入" && c.commit === commit && /^(已合入(?:（未验证）)?|已在 dev)$/.test(c.result));
+  const versions = new Set([commit]);
+  for (const c of merges) { const after = mergedVersion(c); if (after) versions.add(after); }
+  return {versions, merges};
+}
+export function deployments(project: Project, batch: Batch | undefined, run: Execution, history = false): Deployment[] {
+  const registered = new Set([delivered(run)]);
+  if (history) for (const c of run.checks) if (c.step === "开发" && c.result === "已交付") registered.add(c.commit);
+  const versions = new Set([...registered].flatMap(commit=>[...mergeFacts(run,commit).versions]));
+  const result = run.checks.flatMap((c): Deployment[] => {
+    if (!["部署", "退回"].includes(c.step) || !history && !sha(c.commit)) return [];
+    const bound = sha(c.commit) && versions.has(c.commit);
+    // 自动部署可能在试合并版本上失败、尚未留下合入记录。它仍是本执行确实改动过线上的尝试。
+    if (!history && !bound) return [];
+    const evidence = c.evidence[c.step === "部署" ? 1 : 0];
+    const evidenceDir = evidence && run.read.get(c.source.file,()=>taskFile(run,evidence));
+    return [{at:time(c.value.endedAt), began:time(c.value.startedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id,bound,
+      evidenceDir:evidenceDir || undefined}];
+  });
+  // 缺时只用唯一、同执行同版的旧批次结果段补齐；已记录的退回和多次部署不由旧摘要覆盖。
+  const last = result.at(-1);
+  if (!batch || result.length > 1 || last && (last.at !== undefined || !deployedOK(last))) return result;
+  const paths = basename(batch.card) === "开发卡.json" ? [batch.results] : [batch.results, join(batch.dir,"结果.md")];
+  const notes: Deployment[] = [];
+  for (const file of paths) {
+    let execution = "", commit = "";
+    for (const [i,line] of (project.read.text(file) || "").split(/\r?\n/).entries()) {
+      if (/^##\s/.test(line)) { execution = ""; commit = ""; }
+      const field = /^(执行|版本|部署时间)\s*[:：]\s*(.*?)\s*$/.exec(line);
+      if (!field) continue;
+      const [, key, value] = field;
+      if (key === "执行") execution = value;
+      if (key === "版本") commit = value;
+      if (key !== "部署时间" || execution !== run.id || !registered.has(commit) || !sha(commit)) continue;
+      if (last && !mergeFacts(run,commit).versions.has(last.commit)) continue;
+      const at = time(value);
+      if (at !== undefined) notes.push({at, began:last?.began, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution,bound:true,evidenceDir:last?.evidenceDir});
+    }
+  }
+  return notes.length === 1 ? notes : result;
+}
+
+const affectsLive = (d: Deployment) => deployedOK(d) || ["已退回","退回失败"].includes(d.result) ||
+  (d.result.startsWith("部署失败") && d.result !== "部署失败，已回退");
+type DeploymentLedger = {run: Execution; records: Deployment[]};
+type DeploymentPoint = {run: Execution; event: Deployment; index: number; earliest?: number; latest?: number};
+function deploymentPoint({run,records}: DeploymentLedger, index: number): DeploymentPoint {
+  const event = records[index];
+  const earliest = event.at ?? event.began ?? records.slice(0,index).findLast(d=>d.at !== undefined)?.at ?? run.started;
+  const next = records.slice(index+1).find(d=>d.began !== undefined || d.at !== undefined);
+  const latest = event.at ?? next?.began ?? next?.at ?? (deployedOK(event) ? deploymentReadyBy(run,event)?.at : undefined);
+  return {run,event,index,earliest,latest};
+}
+function earlier(a: DeploymentPoint, b: DeploymentPoint) {
+  return a.run === b.run ? a.index < b.index : a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest;
+}
+
+function isCompensation(point: DeploymentPoint) {
+  const {run,event} = point, dir = event.evidenceDir;
+  if (!run.ledgerOK || event.result !== "已退回" || !dir) return false;
+  const check = run.checks.find(c=>c.step === "退回" && c.source.line === event.source.line);
+  return check?.evidence.some(path=>resolve(run.dir,path) === join(dir,"merge-rollback.log")) ?? false;
+}
+
+/** 从最后确认的前序部署往后重放。同执行按流水，跨执行只取能证明唯一先后的位置。 */
+function replayCompensations(prior: DeploymentPoint, tail: DeploymentPoint[]) {
+  const pairs: {trial: Deployment; rollback: Deployment}[] = [], used = new Set<string>();
+  let trial: DeploymentPoint | undefined;
+  while (tail.length) {
+    const heads = tail.filter(p=>!tail.some(other=>earlier(other,p)));
+    if (heads.length !== 1) return;
+    const point = heads[0], event = point.event, dir = event.evidenceDir;
+    tail.splice(tail.indexOf(point),1);
+    if (!point.run.ledgerOK || !sha(event.commit) || !earlier(prior,point)) return;
+    if (!trial) {
+      if (event.result === "部署失败，已回退") continue;
+      if (!deployedOK(event) || !dir || dir === prior.event.evidenceDir || used.has(dir)) return;
+      trial = point;
+    } else {
+      if (point.run !== trial.run || !isCompensation(point) || event.commit !== trial.event.commit || !dir || dir !== trial.event.evidenceDir ||
+          trial.event.at !== undefined && event.at !== undefined && trial.event.at > event.at) return;
+      // 同一证据目录只用于一次试部署，不能拿旧回退来结算新尝试。
+      used.add(dir);
+      pairs.push({trial:trial.event,rollback:event});
+      trial = undefined;
+    }
+  }
+  if (!trial) return pairs;
+}
+
+function compensatedDeployment(project: Project, ledgers: DeploymentLedger[], current: DeploymentPoint) {
+  if (!isCompensation(current)) return;
+  const {run,event:rollback} = current;
+  const trial = ledgers.find(l=>l.run === run)?.records.slice(0,current.index).findLast(affectsLive);
+  const evidence = trial ? [trial,rollback] : [rollback];
+  if (!trial || !deployedOK(trial) || trial.commit !== rollback.commit || trial.evidenceDir !== rollback.evidenceDir) return {evidence};
+
+  // 登记能指向前序版本，但不证明中间的部署都已回退。把本项目整段流水与登记一并核对。
+  const file = join(project.tasks,`.deployed-${hash(str(run.task.repo)).slice(0,20)}.json`);
+  const marker = new Reader(project.tasks,project.read.warnings).doc(file);
+  if (!sha(marker?.commit) || !isAbsolute(str(marker?.evidenceDir))) return {evidence};
+  const owner = ledgers.find(l=>l.run.id === marker.executionId);
+  if (!owner?.run.ledgerOK) return {evidence};
+  const matching = owner.records.flatMap((d,i)=>d.bound && deployedOK(d) && d.commit === marker.commit && d.evidenceDir === marker.evidenceDir ? [i] : []);
+  if (matching.length !== 1) return {evidence};
+  const prior = deploymentPoint(owner,matching[0]), event = prior.event;
+  if (event === trial || !earlier(prior,current)) return {evidence};
+  const otherRuns = project.runs.filter(r=>r.batch !== run.batch).map(r=>({run:r,records:deployments(project,r.batch,r,true)}));
+  const relevant = [...ledgers,...otherRuns].flatMap(l=>l.records.flatMap((d,i)=>{
+    if (d === event) return [];
+    const point = deploymentPoint(l,i);
+    return earlier(point,prior) ? [] : [point];
+  }));
+  // 不把尾部其它变更甚至未配对的尝试藏在最后的“已退回”后面。
+  const observed = [...evidence,event,...relevant.map(p=>p.event)];
+  const pairs = replayCompensations(prior,relevant);
+  if (pairs?.at(-1)?.rollback !== rollback) return {evidence:observed};
+  return {evidence:observed,restored:{run:owner.run,event,trial,rollback,pairs,marker:ref(file)}};
+}
+
+/** 完成时间缺失时，后续同执行的正式收尾只能证明部署不晚于此时，不能用来计算七天。 */
+export function deploymentReadyBy(run: Execution, event: Deployment) {
+  if (event.at !== undefined) return {at:event.at,source:event.source};
+  if (!run.ledgerOK) return;
+  const index = run.checks.findIndex(c=>c.step === "部署" && c.source.file === event.source.file && c.source.line === event.source.line);
+  if (index < 0) return;
+  for (const check of run.checks.slice(index+1)) {
+    const at = time(check.value.endedAt);
+    if (check.step === "收尾" && check.result === "通过" && at !== undefined && at >= (event.began ?? run.started ?? -Infinity)) {
+      return {at,source:check.source};
+    }
+  }
+}
+
+/** 同执行按流水；跨执行只在实际时间或可核对的上下界能排出先后时认定最新。 */
+export function batchDeployment(project: Project, batch: Batch) {
+  let firstAvailable: {run:Execution; event:Deployment} | undefined;
+  const ledgers = batch.runs.map(run=>({run,records:deployments(project,batch,run,true)}));
+  const candidates = ledgers.flatMap(ledger => {
+    const {run,records} = ledger, i = records.findLastIndex(affectsLive);
+    for (const event of records) if (event.bound && deployedOK(event) &&
+      (!firstAvailable || (event.at ?? Infinity) < (firstAvailable.event.at ?? Infinity))) firstAvailable = {run,event};
+    // 退回本身也是事件。就算当初部署没写时间，退回时间也足以给那次部署排序。
+    return i < 0 ? [] : [deploymentPoint(ledger,i)];
+  });
+  const possibleLatest = candidates.filter(a=>!candidates.some(b=>a !== b && earlier(a,b)));
+  const current = possibleLatest.length === 1 ? possibleLatest[0] : undefined;
+  const compensation = current && compensatedDeployment(project,ledgers,current), restored = compensation?.restored;
+  const events = [...new Set([...candidates.map(d=>d.event),...(compensation?.evidence ?? [])])];
+  return {current:restored || current, restored, firstAvailable, events,
+    restorationUnknown:Boolean(compensation && !restored), orderUnknown:possibleLatest.length > 1};
+}

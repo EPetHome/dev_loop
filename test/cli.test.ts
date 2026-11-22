@@ -9,19 +9,30 @@ import { settle } from "../src/core/settle.ts";
 import { resume, stop } from "../src/core/lifecycle.ts";
 import { execFileSync } from "node:child_process";
 test("A1：启动先返回回执/status，后台 worktree、localFiles、setup、会话",async(t)=>{
-  const f=fixture(t,{config:{setup:"node setup.cjs"}});
+  const f=fixture(t,{config:{setup:"node setup.cjs"},cliTimeoutMs:30000});
   write(join(f.repo,"setup.cjs"),'const fs=require("fs");const p=process.env.LOOP_TASK_DIR;fs.writeFileSync(p+"/setup-started","yes");const done=()=>{if(fs.existsSync(p+"/release-setup")){w.close();process.exit(0);}};const w=fs.watch(p,done);done();\n');
   f.git("add","setup.cjs");f.git("commit","-m","controlled setup");
-  const start=performance.now(), receipt=JSON.parse((await f.cli(["启动",f.card,"--派单编号","PA-1","--指令编号","start-1","--json"])).stdout);
-  assert.ok(performance.now()-start<5000,"回执不等待 setup");assert.match(receipt.executionId,/^[A-Za-z0-9_-]+-[a-f0-9]{6}$/);
-  const dir=receipt.taskDir;assert.equal(statusOf(dir).state,"working");assert.equal(statusOf(dir).dispatchId,"PA-1");
-  await until(dir,()=>existsSync(join(dir,"setup-started")),Boolean);
+  // 不计测试检出中 bin/loop 的首次执行开销；帮助不启动任务，计时仍覆盖完整的启动命令。
+  await f.cli(["帮助"]);
+  const began = performance.now();
+  const reply = await f.cli(["启动",f.card,"--派单编号","PA-1","--指令编号","start-1","--json"]);
+  const elapsed = performance.now() - began;
+  assert.ok(elapsed < 5000,`启动回执需在 5 秒内，实测 ${Math.round(elapsed)}ms`);
+  // setup 仍等本测试放行，用闸门独立验证回执不等待 setup。
+  const receipt=JSON.parse(reply.stdout);
+  assert.match(receipt.executionId,/^[A-Za-z0-9_-]+-[a-f0-9]{6}$/);
+  const dir=receipt.taskDir, initial=statusOf(dir);
+  assert.equal(initial.state,"working");assert.equal(initial.dispatchId,"PA-1");
+  assert.equal(initial.loop.ready,false,"收到回执时没有放行 setup");
+  const started=join(dir,"setup-started");
+  await until(dir,()=>existsSync(started),Boolean,started);
   assert.equal(existsSync(join(dir,"opened.json")),false);
   const task=taskOf(dir);assert.ok(existsSync(join(task.worktree,".git")));
   assert.equal(f.git("show-ref","--verify","refs/heads/"+task.branch).split(" ")[0],task.baseCommit);
   assert.equal(readFileSync(join(task.worktree,"local.txt"),"utf8"),"local secret fixture\n");
   write(join(dir,"release-setup"),"go");
-  const opened=await until(dir,()=>getJson(join(dir,"opened.json")),v=>Boolean(v.task));
+  const openedFile=join(dir,"opened.json");
+  const opened=await until(dir,()=>getJson(openedFile),v=>Boolean(v.task),openedFile);
   assert.equal(opened.cwd,task.worktree);assert.equal(opened.task,dir);
   assert.match(readFileSync(join(dir,"developer-prompt.md"),"utf8"),new RegExp(ROOT+"/bin/loop 交付"));
   const second=JSON.parse((await f.cli(["启动",f.card,"--指令编号","start-1","--json"])).stdout);
