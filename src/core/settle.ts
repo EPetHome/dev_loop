@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { atomicWrite, lock, BusyError, digest, optionalJson, writeJson, span, withLock, errorText, iso } from "../infra/files.ts";
 import { APP_ROOT } from "../infra/paths.ts";
-import { alive, signalProcess } from "../infra/exec.ts";
+import { alive, retireGroup } from "../infra/exec.ts";
 import { git, gitText, changes } from "../infra/git.ts";
 import { taskOf, statusOf, update, move, waitFor, waiting, inputs, sameInputs, checked, reviewFor, matchesReviewRequest, appendCheck, checksOf, answersOf, fail, PHASES, ENV_WAIT, type Check, type Hashes, type Task, type WaitReason } from "./store.ts";
 import { checkAttempt, checkWorktree, clearCheck, operationPath, run } from "./run.ts";
@@ -45,11 +45,14 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
     if (confirmedCommit && (state !== "working" || loop.phase !== "已交付" || loop.delivery?.commit !== confirmedCommit)) return quiet();
     if (reviewOnly ? !matchesReviewRequest(initial,reviewRequest) : retest ? state !== "working" || loop.phase !== "复测中" || loop.retestAttempt !== retest
       : loop.reviewRequest || loop.retestAttempt && ["复测中","评审中"].includes(loop.phase)) return quiet();
-    if (loop.released || loop.releasePending) return quiet(loop.released ? "工作区已释放" : "等待释放工作区"); if (alive(loop.finisher)) return quiet("正在收尾");
+    if (loop.released || loop.releasePending || alive(loop.finisher)) return quiet(loop.released ? "工作区已释放" : loop.releasePending ? "等待释放工作区" : "正在收尾");
     if (state === "working" && loop.finisher) return park(dir,"收尾没走完",`收尾进程已退出，可运行 bin/loop 收尾 ${initial.executionId} 手工接手。`);
     if (["cancelled","input_required","failed"].includes(state)) return quiet(message); if (!loop.ready) return quiet("工作区正在准备");
-    pulse = setInterval(() => heartbeat(dir),60000); pulse.unref();
-    const t = taskOf(dir), ownStart = Date.now(); started = {at:ownStart,selfMs:loop.durations.selfMs,task:t}; selfTime();
+    if ((retest || reviewOnly) && loop.activeProcess) {
+      await retireGroup(loop.activeProcess); if (update(dir,s => { s.loop.activeProcess = null; }).state === "cancelled") return quiet("已停止");
+    }
+    const t = taskOf(dir), ownStart = Date.now(); started = {at:ownStart,selfMs:loop.durations.selfMs,task:t};
+    pulse = setInterval(() => heartbeat(dir),60000); pulse.unref(); selfTime();
     const [commit,currentTree] = gitText(t.worktree,["rev-parse","HEAD","HEAD^{tree}"]).split("\n"), {delivery} = loop, dirty = changes(t.worktree);
     if (dirty.length || !delivery || commit !== delivery.commit || currentTree !== delivery.tree || ((confirmedCommit || retest) && !onTaskBranch(t))) {
       const candidate = dirty.length || undeliveredCommit(t,initial,commit) ? digest(JSON.stringify([commit,dirty.sort()])) : "";
@@ -86,14 +89,12 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
     const saved = retest && recordedAttempt(initial,records); let test = reviewOnly ? retryReview(dir) : saved && sameInputs(saved,hashes) ? saved : undefined;
     if (reviewOnly && !test) return backToDevelopment(dir,"评审续跑条件已变化，请重新交付。");
     const record = (step: string, start: number, data: Pick<Check,"result"|"detail"|"evidence"|"attempt"|"missingScenarios"|"unit">) => withLock(join(dir,"status.lock"), () => {
-      const c: Check = {commit,tree:delivery.tree,step,...span(start),...hashes,...data,result:statusOf(dir).state === "cancelled" ? "已停止" : data.result};
-      appendCheck(dir,c); return c;
+      const c: Check = {commit,tree:delivery.tree,step,...span(start),...hashes,...data,result:statusOf(dir).state === "cancelled" ? "已停止" : data.result}; appendCheck(dir,c); return c;
     });
     const cwd = checkWorktree(dir), marker = checkAttempt(dir), timeout = t.limits.测试.timeoutMin*60, pinned = {...t,worktree:cwd}, deadline = ownStart+timeout*1000;
     const attemptKey = (c: Pick<Check,"attempt"|"startedAt">) => c.attempt || digest(JSON.stringify([commit,hashes,c.startedAt]));
     const reuse = test && existsSync(join(cwd,".git")) && optionalJson<string>(marker) === attemptKey(test);
     let keep = false; clean = () => { if (!keep) clearCheck(t); };
-    if (retest) signalProcess(loop.activeProcess,true); // 旧执行器退出时可能还留有其子进程。
     const sendBack = (review: Check) => backToDevelopment(dir,review,false,!!(retest || reviewOnly || confirmedCommit)), restored = retest && test ? reviewFor(records,test) : undefined;
     if (restored?.result === "必修") return sendBack(restored);
     const verifyPin = () => {
@@ -103,8 +104,7 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
     const currentInputs = () => sameInputs(hashes,inputs(t)), changed = () => backToDevelopment(dir,"提示词、验收标准或 E2E 清单在检查期间变化，请重新交付后检查。");
     const attempt = !test && e2e ? retest && !existsSync(join(dir,"e2e",retest)) ? retest : randomUUID() : undefined;
     if (!test) update(dir,s => { if (move(s,"working","复测中","正在复测："+t.test,"testMs",timeout)) s.loop.retestAttempt = attempt; });
-    if (statusOf(dir).state === "cancelled") return quiet("已停止");
-    const plan = e2e && attempt ? planE2e(t,commit,attempt,hashes,e2e) : undefined;
+    if (statusOf(dir).state === "cancelled") return quiet("已停止"); const plan = e2e && attempt ? planE2e(t,commit,attempt,hashes,e2e) : undefined;
     if (!reuse && !["环境未验证","失败"].includes(test?.result || "")) {
       clearCheck(t); gitText(t.repo,["worktree","add","--detach","--force",cwd,commit]); copyLocalFiles(pinned); verifyPin();
       if (t.config.setup) await setup(pinned,plan ? join("e2e",plan.plan.attempt,"setup.log") : "check-setup-"+commit+".log",signal,deadline-Date.now());

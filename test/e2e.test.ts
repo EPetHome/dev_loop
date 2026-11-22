@@ -2,14 +2,14 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { fixture, getJson, until, write, ROOT, NODE, PASS, MUST, sq } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { resume, stop } from "../src/core/lifecycle.ts";
 import { settle } from "../src/core/settle.ts";
 import { appendCheck, checked, checksOf, ENV_WAIT, statusOf, update } from "../src/core/store.ts";
-import { alive } from "../src/infra/exec.ts";
+import { alive, identity, signalProcess, type Identity } from "../src/infra/exec.ts";
 import { gitText } from "../src/infra/git.ts";
 import { launchMain } from "../src/hosts/launch.ts";
 import { companion } from "../src/cli/companion.ts";
@@ -251,6 +251,46 @@ for (const entry of ["launcher","执行锁内"] as const) test("评审必修：�
   assert.notEqual(after.e2eHash,before.e2eHash); assert.match(after.detail!,/新清单的检查点：通过/);
   assert.equal(readFileSync(join(g.dir,"order"),"utf8"),"test\nreview\nreview\ntest\nreview\n");
   assert.equal(existsSync(join(g.dir,"opened.json")),false);
+});
+
+test("评审必修：补评审 launcher 意外退出，接管先结束原评审进程组", async t => {
+  // 现场保留一层同组子进程；在新评审自己的入口记录旧组是否还活着。
+  const held = `const fs=require('node:fs'), cp=require('node:child_process'), dir=process.env.LOOP_TASK_DIR, round=process.argv[1];
+const running = pid => { const r=cp.spawnSync('ps',['-p',String(pid),'-o','stat='],{encoding:'utf8'}); return r.status===0 && !r.stdout.trim().startsWith('Z'); };
+const old = round==='3' ? JSON.parse(fs.readFileSync(dir+'/held-review-2.json','utf8')) : undefined;
+const oldRunning = old ? [old.pid,old.child].filter(running) : [];
+const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},60000)'],{stdio:'ignore'});
+const file=dir+'/held-review-'+round+'.json'; fs.writeFileSync(file+'.tmp',JSON.stringify({pid:process.pid,child:child.pid,oldRunning})); fs.renameSync(file+'.tmp',file);
+setInterval(()=>{},60000);`;
+  const g = await scene(t,{reviewer:`test -e "$LOOP_TASK_DIR/hold-review" || exit 7\nexec ${sq(NODE)} -e ${sq(held)} "$1"`});
+  const spawned: Identity[] = [];
+  t.after(() => { for (const p of spawned) signalProcess(p); }); // 失败时也只清理本用例登记的替身。
+  const running = (p: Identity) => {
+    if (!alive(p)) return false;
+    try { return !execFileSync("ps",["-p",String(p.pid),"-o","stat="],{encoding:"utf8"}).trim().startsWith("Z"); }
+    catch { return false; }
+  };
+  const readHeld = async (round: number) => {
+    const file = join(g.dir,`held-review-${round}.json`), info = await until(g.dir,() => getJson<{pid:number;child:number;oldRunning:number[]}>(file),Boolean);
+    const group = await until(g.dir,() => g.status().loop.activeProcess,p => p?.pid === info.pid && !!p.startedAt);
+    const members = [group!,identity(info.child)]; spawned.push(...members); return {info,members};
+  };
+  g.submit(); await settle(g.dir); assert.equal(g.status().error?.category,"临时故障");
+  const originalTests = g.tests(), {reviewRequest} = resume(g.dir).status.loop; assert.ok(reviewRequest);
+  write(join(g.dir,"hold-review"),"");
+  const launcher = spawn(NODE,[join(ROOT,"src/hosts/launch.ts"),g.dir,"--review",reviewRequest],{cwd:g.repo,env:g.env,stdio:"inherit"});
+  const exited = once(launcher,"exit"); t.after(() => { launcher.kill("SIGKILL"); });
+  const old = await readHeld(2); assert.equal(g.status().loop.launcher?.pid,launcher.pid);
+  assert.ok(launcher.kill("SIGKILL")); assert.deepEqual(await exited,[null,"SIGKILL"]);
+  assert.ok(old.members.every(running),"只杀 launcher，旧评审及其子进程仍活着");
+  const receipt = JSON.parse((await g.run("续跑")).stdout);
+  assert.equal(receipt.reviewOnly,true); assert.equal(receipt.status.loop.reviewRequest,reviewRequest);
+  const next = await readHeld(3);
+  assert.deepEqual(next.info.oldRunning,[],"在替代评审入口，旧进程组须已退出");
+  assert.deepEqual(g.tests(),originalTests); assert.equal(existsSync(join(g.dir,"opened.json")),false);
+  await g.run("停止");
+  await until(g.dir,() => [...old.members,...next.members].every(p => !running(p)),Boolean,"等待新旧评审进程退出");
+  assert.equal(g.status().state,"cancelled"); assert.deepEqual(g.tests(),originalTests);
 });
 
 test("接力等复测与对应评审：同输入有旧通过也不跳过本次等待", async t => {
