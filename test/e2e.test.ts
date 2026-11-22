@@ -9,6 +9,7 @@ import { deliver } from "../src/core/deliver.ts";
 import { resume, stop } from "../src/core/lifecycle.ts";
 import { settle } from "../src/core/settle.ts";
 import { appendCheck, checked, checksOf, ENV_WAIT, statusOf, update } from "../src/core/store.ts";
+import { alive } from "../src/infra/exec.ts";
 import { gitText } from "../src/infra/git.ts";
 import { launchMain } from "../src/hosts/launch.ts";
 import { companion } from "../src/cli/companion.ts";
@@ -154,8 +155,11 @@ test("A7：停止抢在后台领取前；半份报告不复用；已登记的环
   assert.equal(g.status().state,"cancelled"); assert.deepEqual(g.tests(),[env]);
   g.mode("hold"); await g.run("续跑");
   const started = await until(g.dir,() => readFileSync(join(g.dir,"test-started"),"utf8"), Boolean).catch(e => { t.diagnostic(JSON.stringify(g.status())); throw e; });
+  const {loop:{launcher,activeProcess}} = await until(g.dir,g.status,s => !!s.loop.launcher?.startedAt && !!s.loop.activeProcess?.startedAt);
   await g.run("停止"); assert.equal(g.status().state,"cancelled");
   assert.equal(existsSync(join(g.dir,"e2e",started,"result.json")),false);
+  // 停止已登记不等于子进程已被回收；先等旧检查退出，再验证后续恢复。
+  await until(g.dir,() => !alive(launcher) && !alive(activeProcess),Boolean,"等待旧复测进程退出："+g.dir);
   g.mode("pass"); await g.run("续跑"); await g.finished();
   assert.equal(g.status().state,"completed"); assert.equal(g.tests().at(-1)?.result,"通过"); assert.notEqual(g.tests().at(-1)?.attempt,started);
   assert.ok(existsSync(join(g.dir,"e2e",started,"report.tmp")));

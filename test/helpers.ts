@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, chmodSync, rmSync, realpathSync, watch, watchFile, unwatchFile, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, chmodSync, rmSync, realpathSync, watch, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { execFileSync, execFile, spawn } from "node:child_process";
@@ -93,19 +93,21 @@ export async function hostProcess(t: {after: (f: () => any) => any}) {
   t.after(async () => { signalProcess(owner); await closed; });
   return {owner, async exit() { child.send("exit"); await closed; }};
 }
-/** 事件驱动地等文件/状态变化；只有总截止时间，没有固定 sleep。 */
+// 等待夹具用真实定时器，不跟着测试里的业务时钟一起快进。
+const pollEvery = setInterval, stopPolling = clearInterval;
+/** 目录用事件，跨进程日志和临时文件用条件轮询；保留相同截止时间。 */
 export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string): Promise<T> {
   return new Promise((accept, reject) => {
     const signal = AbortSignal.timeout(12000);
-    let watcher: ReturnType<typeof watch> | undefined;
-    const close = () => { watcher?.close(); if (file) unwatchFile(file,check); signal.removeEventListener("abort", abort); };
+    let watcher: ReturnType<typeof watch> | undefined, timer: ReturnType<typeof setInterval> | undefined;
+    const close = () => { watcher?.close(); stopPolling(timer); signal.removeEventListener("abort",abort); };
     const check = () => {
       try { const value = get(); if (ready(value)) { close(); accept(value); } }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { close(); reject(e); } }
     };
     const abort = () => { close(); reject(new Error("等待文件事件超时：" + (file || dir))); };
-    // 长驻替身的普通日志文件用状态变化通知，不依赖 macOS 递归目录事件。
-    if (file) watchFile(file,{interval:50},check); else watcher = watch(dir,{recursive:true},check);
+    // 直接读条件：文件若在首轮 stat 基线采集前改变，watchFile 可以漏掉通知。
+    if (file) timer = pollEvery(check,50); else watcher = watch(dir,{recursive:true},check);
     signal.addEventListener("abort", abort, {once:true}); check();
   });
 }
