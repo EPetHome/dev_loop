@@ -77,17 +77,17 @@ export async function hostProcess(t: {after: (f: () => any) => any}) {
   return {owner, async exit() { child.send("exit"); await closed; }};
 }
 /** 事件驱动地等文件/状态变化；只有总截止时间，没有固定 sleep。 */
-export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string): Promise<T> {
+export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string, timeoutMs = 12000): Promise<T> {
   return new Promise((accept, reject) => {
-    const signal = AbortSignal.timeout(12000);
+    const signal = AbortSignal.timeout(timeoutMs);
     let watcher: ReturnType<typeof watch> | undefined;
     const close = () => { watcher?.close(); if (file) unwatchFile(file,check); signal.removeEventListener("abort", abort); };
     const check = () => {
       try { const value = get(); if (ready(value)) { close(); accept(value); } }
       catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { close(); reject(e); } }
     };
-    const abort = () => { close(); reject(new Error("等待文件事件超时：" + (file || dir))); };
-    // 长驻替身的普通日志文件用状态变化通知，不依赖 macOS 递归目录事件。
+    const abort = () => { close(); reject(new Error(`等待文件事件超时（${timeoutMs}ms）：${file || dir}`)); };
+    // 能定位单个状态或标记文件时，直接观察该文件；不依赖 macOS 递归目录事件。
     if (file) watchFile(file,{interval:50},check); else watcher = watch(dir,{recursive:true},check);
     signal.addEventListener("abort", abort, {once:true}); check();
   });

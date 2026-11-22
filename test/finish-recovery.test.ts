@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, write, until, getJson, NODE, ROOT, MUST, PASS, sq } from "./helpers.ts";
+import { fixture, write, getJson, NODE, ROOT, MUST, PASS, sq } from "./helpers.ts";
 import { spawn, execFileSync } from "node:child_process";
 import { finish, pendingAcceptance } from "../src/cli/finish.ts";
 import { queued } from "../src/cli/queue.ts";
@@ -19,7 +19,7 @@ import { settle } from "../src/core/settle.ts";
 import { identity } from "../src/infra/exec.ts";
 import { reviewed } from "./step-helpers.ts";
 import { validateStart } from "../src/cli/start.ts";
-import { flow, finishingFixture, received } from "./finish-helpers.ts";
+import { flow, finishingFixture, received, untilFinish as until } from "./finish-helpers.ts";
 test("A10：退回最新部署只动线上、收到原证据；旧部署/重复退回无法执行", async t => {
   const f = await finishingFixture(t); await settle(f.task.dir); await finish(f.task.dir);
   const before=f.git("rev-parse","dev"), evidence=received(f.task.dir)[0].evidence;
@@ -149,7 +149,8 @@ test("收尾崩溃转等你，可手工接手；提示词变化不重复自动�
 });
 test("失败返修时原会话已结束：独立进程精确恢复原 Pi 会话并保留 pendingReturn", async t => {
   const f=await finishingFixture(t,{check:"console.log('restore reason');process.exit(7);"});update(f.task.dir,s=>{s.loop.session!.endedAt=new Date().toISOString();});
-  await settle(f.task.dir);await startFinish(f.task.dir,f.env);const opened=await until(f.task.dir,()=>getJson<{args:string[]}>(join(f.task.dir,"opened.json")),Boolean);
+  await settle(f.task.dir);await startFinish(f.task.dir,f.env);const openedFile=join(f.task.dir,"opened.json");
+  const opened=await until(f.task.dir,()=>getJson<{args:string[]}>(openedFile),Boolean,openedFile);
   await until(f.task.dir,()=>statusOf(f.task.dir),s=>!s.loop.launcher && !s.loop.finisher);assert.ok(opened.args.includes("--session"));assert.ok(opened.args.includes("fake"));assert.match(statusOf(f.task.dir).loop.pendingReturn!,/restore reason/);assert.equal(statusOf(f.task.dir).loop.phase,"开发中");
 });
 test("flow 子序列、after/next 快照、基点覆盖；旧卡无收尾", t => {
