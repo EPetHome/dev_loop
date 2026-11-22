@@ -21,9 +21,11 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
   return project.batches.flatMap(batch => {
     const file = batch.acceptance, text = project.read.text(file) ?? originals?.get(file);
     if (text === undefined) return [];
-    const status = plain(header.exec(text)?.[2] || ""), deployment = batchDeployment(project,batch), deployed = deployment?.latest;
-    const success = deployment && deployedOK(deployed) ? deployment.success : undefined;
-    const observed = success ? deployment?.run : batch.runs.findLast(r=>r.status.state === "completed");
+    const status = plain(header.exec(text)?.[2] || ""), deployment = batchDeployment(project,batch), deployed = deployment.current?.event;
+    const success = deployed?.bound && deployedOK(deployed) ? deployed : undefined;
+    // 七天只看可确认的部署；下一次开工另从已有可体验版本或已完成的执行计。
+    const available = deployment.firstAvailable, readyRun = available?.run ?? batch.runs.find(r=>r.status.state === "completed");
+    const observed = (success && deployment.current?.run) || batch.runs.findLast(r=>r.status.state === "completed") || readyRun;
     const contacts = [...feedbackAt(file,text),...issueFeedback(list,batch)];
     const actual = decisionsIn(text,file), permissions = observed ? authorizationFor(observed) : [];
     const original = text.split(/^## 协调记录：未确认（无反馈）\s*$/m,1)[0];
@@ -37,19 +39,21 @@ export function acceptances(project: Project, list: Issue[], now: number, openin
       return [{id, kind:auth ? "授权" : "人工", text:raw, source:ref(file,i+1), ...(auth && {authorization:done ? "本人已做" : "授权未做", decision})}];
     });
     // 下批必须是不同卡、同项目，且确实在上一批就绪后；没有部署时间时不造七日到期。
-    const lastReview = observed?.checks.findLast(c=>c.step === "评审" && c.result === "通过");
-    const readyAt = success?.at ?? (time(lastReview?.value.endedAt) ?? observed?.started);
+    const review = readyRun?.checks.findLast(c=>c.step === "评审" && c.result === "通过");
+    const readyAt = available?.event.at ?? time(review?.value.endedAt) ?? readyRun?.started;
     const next = readyAt === undefined ? undefined : project.runs.find(r=>r.batch && r.batch !== batch && r.started !== undefined && r.started > readyAt && r.started <= now);
     const prospective = opening && (!card || batch.card !== card) && readyAt !== undefined && readyAt < now;
     const nextAt = next?.started ?? (prospective ? now : undefined), sevenAt = success?.at === undefined ? undefined : success.at + days(7);
     const expires = Math.min(nextAt ?? Infinity,sevenAt ?? Infinity);
     const due = expires <= now, reason = due ? (nextAt === expires ? "同项目下次开工" : "部署满七天") : null;
-    const deploymentSources = deployment ? [deployment.success.source, ...(deployed !== deployment.success ? [deployment.latest.source] : [])] : [];
+    const deploymentSources = deployment.events.map(d=>d.source);
+    if (available && !deploymentSources.includes(available.event.source)) deploymentSources.push(available.event.source);
     const sources = [ref(file,1), ...(observed ? [taskRef(observed), statusRef(observed)] : []), ...deploymentSources, ...(next ? [taskRef(next)] : [])];
     const state = contacts.length && !["通过","不通过","不验"].includes(status) ? "有反馈" : settled.has(status) || pending.has(status) ? status : "未知";
     const eligible = pending.has(status) && !contacts.length && due;
     const view = {batch:batch.key, file, storedStatus:status || null, state, entries, feedback:contacts, deploymentAt:renderTime(success?.at),
-      deployment:deployed?.result ?? null, deploymentExecution:deployed?.execution ?? null, deploymentCommit:deployed?.commit ?? null,
+      deployment:deployed && !deployed.bound && deployedOK(deployed) ? "部署版本未关联" : deployed?.result ?? (deployment.orderUnknown ? "部署先后不明" : null), deploymentExecution:deployed?.execution ?? null, deploymentCommit:deployed?.commit ?? null,
+      deploymentFacts:deployment.events,
       nextStartAt:renderTime(nextAt), sevenDaysAt:renderTime(sevenAt), due:eligible, reason:eligible ? reason : null, sources,
       reminder:state === "待验" || state === "待验收", writable:eligible && readerReady};
     const eol = text.includes("\r\n") ? "\r\n" : "\n";

@@ -8,7 +8,7 @@ export interface Execution {
   checks: Check[]; ledgerOK: boolean; read: Reader;
 }
 export interface Batch { key: string; card: string; name: string; dir: string; results: string; acceptance: string; runs: Execution[] }
-export type Deployment = { at?: number; source: Ref; result: string; commit: string; execution: string };
+export type Deployment = { at?: number; began?: number; source: Ref; result: string; commit: string; execution: string; bound: boolean };
 export const deployedOK = (d?: Deployment) => !!d && ["已部署","已部署（未检查）"].includes(d.result);
 export const delivered = (run: Execution) => str(object(run.loop.delivery).commit) || str(run.loop.commit);
 export const official = (check: Check) => check.step === "评审" && ["通过", "必修"].includes(check.result);
@@ -128,20 +128,27 @@ export function checked(project: Project, run: Execution) {
   const test = selected.findLast(c => c.step === "复测"), review = selected.findLast(c => c.step === "评审");
   return {commit, hashes, test, review, passed: run.ledgerOK && sha(commit) && test?.result === "通过" && review?.result === "通过"};
 }
+export function mergedVersion(check: Check) {
+  try { const after = object(JSON.parse(check.detail)).devAfter; if (sha(after)) return after; }
+  catch { /* 无 devAfter，不能把其他部署版本归到本批。 */ }
+}
 export function mergeFacts(run: Execution, commit = delivered(run)) {
   const merges = run.checks.filter(c => c.step === "合入" && c.commit === commit && /^(已合入(?:（未验证）)?|已在 dev)$/.test(c.result));
   const versions = new Set([commit]);
-  for (const c of merges) {
-    try { const after = object(JSON.parse(c.detail)).devAfter; if (sha(after)) versions.add(after); } catch { /* 无 devAfter，不能把其他部署版本归到本批。 */ }
-  }
+  for (const c of merges) { const after = mergedVersion(c); if (after) versions.add(after); }
   return {versions, merges};
 }
 export function deployments(project: Project, batch: Batch, run: Execution, history = false): Deployment[] {
   const registered = new Set([delivered(run)]);
   if (history) for (const c of run.checks) if (c.step === "开发" && c.result === "已交付") registered.add(c.commit);
   const versions = new Set([...registered].flatMap(commit=>[...mergeFacts(run,commit).versions]));
-  const result = run.checks.flatMap((c): Deployment[] => ["部署", "退回"].includes(c.step) && versions.has(c.commit) && sha(c.commit) ?
-    [{at:time(c.value.endedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id}] : []);
+  const result = run.checks.flatMap((c): Deployment[] => {
+    if (!["部署", "退回"].includes(c.step) || !sha(c.commit)) return [];
+    const bound = versions.has(c.commit);
+    // 自动部署可能在试合并版本上失败、尚未留下合入记录。它仍是本执行确实改动过线上的尝试。
+    if (!history && !bound) return [];
+    return [{at:time(c.value.endedAt), began:time(c.value.startedAt), source:c.source, result:c.result, commit:c.commit, execution:run.id,bound}];
+  });
   // 缺时只用唯一、同执行同版的旧批次结果段补齐；已记录的退回和多次部署不由旧摘要覆盖。
   const last = result.at(-1);
   if (result.length > 1 || last && (last.at !== undefined || !deployedOK(last))) return result;
@@ -159,22 +166,31 @@ export function deployments(project: Project, batch: Batch, run: Execution, hist
       if (key !== "部署时间" || execution !== run.id || !registered.has(commit) || !sha(commit)) continue;
       if (last && !mergeFacts(run,commit).versions.has(last.commit)) continue;
       const at = time(value);
-      if (at !== undefined) notes.push({at, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution});
+      if (at !== undefined) notes.push({at, began:last?.began, source:ref(file,i+1), result:last?.result || "已部署", commit:last?.commit || commit, execution,bound:true});
     }
   }
   return notes.length === 1 ? notes : result;
 }
 
-/** 批次视图按实际部署时间选版本，不按最后一次重试。退回只影响对应版本，不当成新部署。 */
+const affectsLive = (d: Deployment) => deployedOK(d) || ["已退回","退回失败"].includes(d.result) ||
+  (d.result.startsWith("部署失败") && d.result !== "部署失败，已回退");
+
+/** 同执行按流水；跨执行只在实际时间或可核对的上下界能排出先后时认定最新。 */
 export function batchDeployment(project: Project, batch: Batch) {
+  let firstAvailable: {run:Execution; event:Deployment} | undefined;
   const candidates = batch.runs.flatMap(run => {
-    const records = deployments(project,batch,run,true), i = records.findLastIndex(deployedOK);
+    const records = deployments(project,batch,run,true), i = records.findLastIndex(affectsLive);
+    for (const event of records) if (event.bound && deployedOK(event) &&
+      (!firstAvailable || (event.at ?? Infinity) < (firstAvailable.event.at ?? Infinity))) firstAvailable = {run,event};
     if (i < 0) return [];
-    const success = records[i];
-    const latest = records.slice(i+1).findLast(d=>d.commit === success.commit && ["已退回","退回失败"].includes(d.result));
-    return [{run,success,latest:latest || success}];
+    const event = records[i];
+    // 退回本身也是事件。就算当初部署没写时间，退回时间也足以给那次部署排序。
+    const earliest = event.at ?? event.began ?? records.slice(0,i).findLast(d=>d.at !== undefined)?.at ?? run.started;
+    const nextDated = records.slice(i+1).find(d=>d.began !== undefined || d.at !== undefined);
+    const latest = event.at ?? nextDated?.began ?? nextDated?.at;
+    return [{run,event,earliest,latest}];
   });
-  // 若某执行最后的成功部署没有时间，无法证明它早于其他部署，不能拿其他版本的时间结束提醒。
-  return candidates.findLast(d=>d.success.at === undefined) ?? candidates.reduce<typeof candidates[number] | undefined>((latest,d)=>
-    !latest || (d.success.at ?? 0) >= (latest.success.at ?? 0) ? d : latest,undefined);
+  const possibleLatest = candidates.filter(a=>!candidates.some(b=>a !== b && a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest));
+  const current = possibleLatest.length === 1 ? possibleLatest[0] : undefined;
+  return {current, firstAvailable, events:candidates.map(d=>d.event), orderUnknown:possibleLatest.length > 1};
 }

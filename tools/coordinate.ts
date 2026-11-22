@@ -67,7 +67,7 @@ function preview(o: Options, now: number, recovery?: Plan) {
     if (to && !entry(project.root,to)) changes.push({kind:"候选确认",to,content:json({candidate:c.id,decision:c.decision.source,observed}),
       summary:`${c.key}：批准后的 ${observed.batch} 有同类观测且未再出现`,sources});
   }
-  const iv = collectIssues ? issueViews(project,list) : [];
+  const iv = collectIssues ? issueViews(project,list,originals) : [];
   for (const [i,v] of iv.entries()) if (v.ready) {
     const issue = list[i], path = join(project.setting("issues","issues"),"【history】",basename(issue.file));
     const result = project.read.get(path,()=>({existing:entry(project.root,path)}));

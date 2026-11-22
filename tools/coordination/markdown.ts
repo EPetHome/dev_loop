@@ -13,6 +13,15 @@ export function sections(text: string): Block[] {
   }
   return headings.map(({title,index,level}, i) => ({title, level, line: index + 1, bodyLine: index + 2, body: lines.slice(index + 1, headings[i + 1]?.index).join("\n")}));
 }
+/** 读取带子节的完整标题范围；普通 sections() 仍保持逐段读取的语义。 */
+export function sectionTrees(text: string, title: string): Block[] {
+  const lines = text.split(/\r?\n/), blocks = sections(text);
+  return blocks.flatMap((block,i) => {
+    if (block.title !== title) return [];
+    const end = blocks.find((next,j)=>j > i && next.level <= block.level);
+    return [{...block, body:lines.slice(block.line, end && end.line - 1).join("\n")}];
+  });
+}
 export function items(body: string, file: string, bodyLine: number): {text: string; source: Ref}[] {
   if (!body.trim() || /^(?:无|（无）|暂无)[。.]?$/.test(plain(body))) return [];
   const result: {text: string; source: Ref}[] = [];

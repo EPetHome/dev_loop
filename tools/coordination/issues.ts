@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { array, inside, object, ref, sha, str, time, type Doc, type Ref } from "./files.ts";
-import { checked, delivered, deployments, mergeFacts, statusRef, taskRef, type Batch, type Execution, type Project } from "./history.ts";
-import { field, links, plain, sections } from "./markdown.ts";
+import { checked, delivered, deployments, mergeFacts, mergedVersion, statusRef, taskRef, type Batch, type Execution, type Project } from "./history.ts";
+import { field, links, plain, sections, sectionTrees } from "./markdown.ts";
 
 const issueStatus = /^([^\S\r\n]*(?:[-*]\s+)?(?:\*\*)?状态(?:\*\*)?[^\S\r\n]*[:：](?:\*\*)?[^\S\r\n]*)([^\r\n]+)/m;
 const closed = /^(?:已解决|不做|重复)(?:$|[（(·：:\s])/;
@@ -47,13 +47,24 @@ function fixRun(project: Project, issue: Issue) {
 // 连字符或斜杠内的片段不是独立提交号；不能把执行编号里的日期或随机尾段当 SHA。
 const shaToken = /(?<![\w/-])[0-9a-f]{7,64}(?![\w/-])/g;
 const noIntroduction = /^(定位不到|非\s*dev-loop)(?:$|[（(，、：:\s])/;
-function isAncestor(project: Project, from: string, to: string) {
-  if (from === to) return true;
-  const {status} = spawnSync("git",["--no-replace-objects","merge-base","--is-ancestor",from,to,"--"],{cwd:project.root,timeout:3000,
-    env:{...process.env,GIT_DIR:undefined,GIT_WORK_TREE:undefined,GIT_COMMON_DIR:undefined,GIT_NO_LAZY_FETCH:"1",GIT_ALLOW_PROTOCOL:""}});
-  return status === 0;
+function readGit(project: Project, args: string[]) {
+  return spawnSync("git",["--no-replace-objects",...args],{cwd:project.root,timeout:3000,encoding:"utf8",
+    env:{...process.env,GIT_DIR:undefined,GIT_WORK_TREE:undefined,GIT_COMMON_DIR:undefined,GIT_CEILING_DIRECTORIES:dirname(project.root),GIT_NO_LAZY_FETCH:"1",GIT_ALLOW_PROTOCOL:""}});
 }
-function introductionFor(project: Project, run: Execution, prefix: string) {
+function isAncestor(project: Project, from: string, to: string) {
+  return from === to || readGit(project,["merge-base","--is-ancestor",from,to,"--"]).status === 0;
+}
+const devRef = "refs/heads/dev";
+export function readDevTip(project: Project) {
+  const result = readGit(project,["rev-parse","--verify",devRef + "^{commit}"]), commit = result.stdout?.trim();
+  if (result.status === 0 && sha(commit)) return commit;
+}
+function entryIntoDev(project: Project, run: Execution, final: string, devTip?: string) {
+  const recorded = mergeFacts(run,final).merges.at(-1);
+  if (recorded) return {kind:"合入流水", commit:mergedVersion(recorded) ?? null, source:recorded.source};
+  if (devTip && isAncestor(project,final,devTip)) return {kind:"dev 历史", commit:devTip, source:ref(project.root,undefined,devRef)};
+}
+function introductionFor(project: Project, run: Execution, prefix: string, devTip?: string) {
   const final = delivered(run);
   if (!run.ledgerOK || !sha(final)) return;
   const review = run.checks.findLast(c=>c.step === "评审" && c.commit === final);
@@ -62,15 +73,18 @@ function introductionFor(project: Project, run: Execution, prefix: string) {
   if (test?.result !== "通过") return;
   const seen = run.checks.filter(c=>["开发","复测","评审"].includes(c.step) && sha(c.commit) && c.commit.startsWith(prefix));
   if (new Set(seen.map(c=>c.commit)).size !== 1 || !isAncestor(project,seen[0].commit,final)) return;
-  return {run, introducedCommit:seen[0].commit, deliveryCommit:final, sources:[seen[0].source,test.source,review.source,statusRef(run,"loop.delivery")]};
+  // 有复测、评审通过的任务分支尚不等于交付进入 dev；接力通过 dev 的祖先关系核对。
+  const entry = entryIntoDev(project,run,final,devTip);
+  if (!entry) return;
+  return {run, introducedCommit:seen[0].commit, deliveryCommit:final, entry, sources:[seen[0].source,test.source,review.source,statusRef(run,"loop.delivery"),entry.source]};
 }
-export function introducedRun(project: Project, issue: Issue) {
+export function introducedRun(project: Project, issue: Issue, devTip?: string) {
   if (noIntroduction.test(issue.introduced)) return;
   const byId = project.runs.filter(r=>mentions(issue.introduced,r.id));
   const [prefix,...extra] = new Set(issue.introduced.match(shaToken));
   if (!prefix || extra.length || byId.length > 1) return;
   const runs = byId.length ? byId : project.runs.filter(r=>r.batch && batchMatches(issue,r.batch,issue.introduced));
-  const matches = runs.flatMap(run=>{ const found = introductionFor(project,run,prefix); return found ? [found] : []; });
+  const matches = runs.flatMap(run=>{ const found = introductionFor(project,run,prefix,devTip); return found ? [found] : []; });
   return matches.length === 1 ? matches[0] : undefined;
 }
 
@@ -101,8 +115,9 @@ const authTag = /\[授权\]|【授权】/;
 function issueAuthorization(issue: Issue, explicit: string) {
   const rows = issue.text.split(/\r?\n/).filter(l=>!l.trimStart().startsWith(">") && (authTag.test(l) || /^授权项\s*[:：]/.test(plain(l))));
   if (explicit) rows.push(explicit);
-  const ids = new Set([...rows.flatMap(itemIds), ...["验收项","验收条目"].flatMap(label=>itemIds(field(issue.header,label)))]);
-  return {ids, required:new Set(rows.flatMap(itemIds)), unknown:rows.some(r=>!itemIds(r).length)};
+  const references = new Set([...itemIds(explicit), ...["验收项","验收条目","授权项"].flatMap(label=>itemIds(field(issue.header,label)))]);
+  const required = new Set(rows.flatMap(itemIds));
+  return {references, ids:new Set([...required,...references]), required, unknown:rows.some(r=>!itemIds(r).length)};
 }
 type AcceptanceRow = {id?: string; text: string; source: Ref; authorized: boolean};
 function criteriaRows(text: string, file: string, firstLine = 1) {
@@ -126,41 +141,45 @@ function criteriaRows(text: string, file: string, firstLine = 1) {
   }
   return rows;
 }
-function batchAuthorization(project: Project, run: Execution, acceptance: string) {
-  const batch = run.batch;
-  if (!batch) return [];
-  const rows = criteriaRows(acceptance,batch.acceptance);
+function batchAuthorization(project: Project, run: Execution, batch: Batch, originals?: ReadonlyMap<string,string>) {
+  const unreadable: Ref[] = [], warningCount = project.read.warnings.length;
+  const acceptance = project.read.text(batch.acceptance) ?? originals?.get(batch.acceptance);
+  if (acceptance === undefined && project.read.warnings.length > warningCount) unreadable.push(ref(batch.acceptance));
+  const rows = criteriaRows(acceptance ?? "",batch.acceptance);
   for (const key of ["acceptance","prompt"]) {
     const name = str(run.task[key]);
     if (!name) continue;
     const file = project.read.get(name,()=>project.path(name));
+    const text = file === batch.acceptance ? acceptance : file ? project.read.text(file) : undefined;
+    if (text === undefined) { unreadable.push(ref(file || name)); continue; }
     if (!file || file === batch.acceptance) continue;
-    const text = project.read.text(file) || "";
-    const sectionsOfCriteria = sections(text).filter(s=>s.title === "验收标准");
-    if (sectionsOfCriteria.length) for (const s of sectionsOfCriteria) rows.push(...criteriaRows(s.body,file,s.bodyLine));
-    else if (key === "acceptance") rows.push(...criteriaRows(text,file));
+    const criteria = sectionTrees(text,"验收标准");
+    for (const s of criteria) rows.push(...criteriaRows(s.body,file,s.bodyLine));
+    if (!criteria.length && key === "acceptance") rows.push(...criteriaRows(text,file));
   }
-  return rows;
+  return {rows, unreadable, acceptance:acceptance ?? ""};
 }
-function authorizationRequirements(project: Project, issue: Issue, run: Execution, acceptance: string, targets: string[], reported: string) {
-  const explicit = issueAuthorization(issue,reported), rows = batchAuthorization(project,run,acceptance);
-  const scenes = new Set(targets.flatMap(sceneIds));
+function authorizationRequirements(issue: Issue, rows: AcceptanceRow[], targets: string[], reported: string, batchIssueIds: ReadonlySet<string>) {
+  const explicit = issueAuthorization(issue,reported), scenes = new Set(targets.flatMap(sceneIds));
   const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
-  const belongs = (text: string) => sceneIds(text).some(s=>scenes.has(s)) || issueIdsIn(text).some(id=>issue.ids.includes(id)) || names.some(name=>text.includes(name));
-  const associated = new Set(rows.flatMap(row=>row.id && (explicit.ids.has(row.id) || belongs(row.text)) ? [row.id] : []));
+  const scopeOf = (text: string) => {
+    const issueIds = issueIdsIn(text), mentionedScenes = sceneIds(text);
+    if (issueIds.some(id=>issue.ids.includes(id)) || mentionedScenes.some(id=>scenes.has(id)) || names.some(name=>text.includes(name))) return "本单";
+    if (issueIds.some(id=>batchIssueIds.has(id))) return "其他单";
+    return mentionedScenes.length && scenes.size ? "其他单" : "未知";
+  };
+  const scoped = rows.map(row=>({row, scope:scopeOf(row.text)}));
+  const associated = new Set([...explicit.ids, ...scoped.flatMap(({row,scope})=>row.id && scope === "本单" ? [row.id] : [])]);
+  const other = new Set(scoped.flatMap(({row,scope})=>row.id && scope === "其他单" ? [row.id] : []));
   const required = new Map<string,Ref[]>();
   for (const id of explicit.required) required.set(id,[ref(issue.file)]);
   const unclear: Ref[] = [];
-  for (const row of rows.filter(r=>r.authorized)) {
-    if (row.id && associated.has(row.id)) {
-      required.set(row.id,[...(required.get(row.id) || []),row.source]);
-    } else {
-      // 另一个明确命名的场景/问题单只约束它自己。不把无关联条目凭空分配给本单。
-      const disjoint = !belongs(row.text) && sceneIds(row.text).length > 0 && scenes.size > 0;
-      if (!disjoint) unclear.push(row.source);
-    }
+  for (const {row,scope} of scoped) if (row.authorized && scope !== "其他单") {
+    if (row.id && associated.has(row.id)) required.set(row.id,[...(required.get(row.id) || []),row.source]);
+    else if (!row.id || !other.has(row.id)) unclear.push(row.source);
   }
-  return {required, unclear, unknown:explicit.unknown};
+  const missing = [...explicit.references].filter(id=>!scoped.some(({row,scope})=>row.id === id && scope !== "其他单"));
+  return {required, unclear, missing, references:[...explicit.references], unknown:explicit.unknown};
 }
 
 function localLink(root: string, file: string, link: string) {
@@ -237,9 +256,16 @@ function proofFor(project: Project, issue: Issue, run: Execution, current: Retur
   }
 }
 const qualifiedAttribution = /^(测试用例|功能地图(?:（E2E）)?|REVIEW\.md|拦不住)\s*([，、：:；;—·(（\s]+)(.+)$/;
-export function issueViews(project: Project, list: Issue[]) {
-  return list.map(issue => {
-    const source = ref(issue.file), reasons: string[] = [], evidence: Ref[] = [], run = fixRun(project,issue);
+export function issueViews(project: Project, list: Issue[], originals?: ReadonlyMap<string,string>) {
+  const bindings = list.map(issue=>({issue,run:fixRun(project,issue)}));
+  const batchIssues = new Map<Batch, Set<string>>();
+  for (const {issue,run} of bindings) if (run?.batch) {
+    const ids = batchIssues.get(run.batch) || new Set<string>();
+    for (const id of issue.ids) ids.add(id);
+    batchIssues.set(run.batch,ids);
+  }
+  return bindings.map(({issue,run}) => {
+    const source = ref(issue.file), reasons: string[] = [], evidence: Ref[] = [];
     const view = {file:issue.file, name:issue.name, storedStatus:issue.status || null, state:issue.status || "待修复", history:issue.history,
       execution:run?.id ?? null, batch:run?.batch?.key ?? null, reasons, evidence, source, ready:false};
     if (issue.history || closed.test(issue.status) || !issue.bug) {
@@ -261,13 +287,18 @@ export function issueViews(project: Project, list: Issue[]) {
     const proof = attribution?.[1] !== "拦不住" && current.passed ? proofFor(project,issue,run,current) : undefined;
     if (attribution?.[1] !== "拦不住" && !proof) reasons.push("缺此单目标检查的两版防复发证明");
     if (proof) evidence.push(proof.source,...(proof.check ? [proof.check] : []),...proof.logs.map(p=>ref(p)));
-    const auths = authorizationFor(run), acceptance = project.read.text(run.batch.acceptance) || "";
+    const auths = authorizationFor(run), criteria = batchAuthorization(project,run,run.batch,originals);
     // 批次整体「通过」不等于本人做过这一项。精确到本执行、条目编号及正式答复/本人实做。
-    const actual = decisionsIn(acceptance,run.batch.acceptance).filter(d=>d.decision.endsWith("已做"));
+    const actual = decisionsIn(criteria.acceptance,run.batch.acceptance).filter(d=>d.decision.endsWith("已做"));
     const targets = [plain(field(issue.header,"防复发检查")), proof?.target || "", ...sceneIds(issue.attribution),
       ...array(run.task.proofs).map(object).filter(d=>issue.ids.includes(str(d.issue))).map(targetName)];
-    const auth = authorizationRequirements(project,issue,run,acceptance,targets,proof?.auth || "");
+    const auth = authorizationRequirements(issue,criteria.rows,targets,proof?.auth || "",batchIssues.get(run.batch) ?? new Set());
     if (auth.unknown) reasons.push("授权要求没有可核对的验收条目编号");
+    if (auth.missing.length) reasons.push(`批次验收材料缺本单明确引用的条目：${auth.missing.join("、")}`);
+    if (criteria.unreadable.length) {
+      reasons.push(`授权要求来源不可读${auth.references.length ? `，无法核对 ${auth.references.join("、")}` : ""}`);
+      evidence.push(...criteria.unreadable);
+    }
     if (auth.unclear.length) { reasons.push("批次授权条目与本单的关系不明确；缺验收编号或目标对应"); evidence.push(...auth.unclear); }
     for (const [id,requirements] of auth.required) {
       evidence.push(...requirements);

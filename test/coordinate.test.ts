@@ -186,6 +186,47 @@ test("关单区分检查结论、合入部署及批次反馈；校验目标、�
   assert.equal(f.run("查询").acceptances[0].state,"不通过");
 });
 
+test("显式验收项读取独立标准的子节；缺项或材料不可读时保留原单",t=>{
+  const f=fixture(t), b=f.batch("独立验收"), criteria=join(b.d,"检查标准.md");
+  const text = "# 本批检查\n\n## 验收标准\n\n### 真实账号\n\n#### 手工核对\nA2. [授权] 使用正式账号\n\n## 附录示例\nA2. 示例，不是验收条目\n";
+  const run=f.execution(b,"nested-criteria",now-days(2),{task:{acceptance:criteria}});
+  const issue=f.issue("仅引用编号",b.name,"验收项：A2"), original=read(issue);
+  const check = (s:string)=>{
+    write(criteria,s); run.check("复测","通过",{acceptanceHash:hash(s)}); run.check("评审","通过",{acceptanceHash:hash(s)});
+  };
+  const view=()=>mustFind(f.run("查询").issues,v=>v.file===issue);
+  write(b.acceptance,"状态：通过\n");
+  check(text);
+  assert.match(view().reasons.join("\n"),/A2 缺本人/);
+  assert(view().evidence.some(s=>s.file===criteria && s.line===8));
+  jsonl(join(run.dir,"answers.jsonl"),[{at:at(now-days(1)),text:"同意授权：A2"}]);
+  assert(view().ready);
+  check(text.replace("A2. [授权]","A3. [授权]"));
+  assert.match(view().reasons.join("\n"),/缺本单明确引用的条目：A2/);
+  rmSync(criteria);
+  assert.match(view().reasons.join("\n"),/授权要求来源不可读，无法核对 A2/);
+  assert.equal(read(issue),original);
+});
+
+test("同批两单中只需取得本单的明确授权；无归属仍保守保留",t=>{
+  const f=fixture(t), b=f.batch("同批两单"), r=f.execution(b,"same-fix",now-days(1)); r.pass();
+  const plainIssue=f.issue("自动定向验证",b.name,"编号：PA046\n防复发检查：S3 / 原单重投","功能地图，场景 S3");
+  const restricted=f.issue("真实账号检查",b.name,"编号：PA099");
+  recordProof(r);
+  const criteria="状态：待验\n\nA9. [授权] 仅用于 PA099 的正式账号检查\n";
+  write(b.acceptance,criteria);
+  const report=f.run("查询");
+  assert.deepEqual(report.changes.map(c=>c.from),[plainIssue]);
+  assert.match(mustFind(report.issues,v=>v.file===restricted).reasons.join("\n"),/A9 缺本人/);
+  appendFileSync(b.acceptance,"\nA10. [授权] 未明确属于哪一单\n");
+  assert(f.run("查询").issues.filter(v=>[plainIssue,restricted].includes(v.file)).every(v=>v.reasons.some(r=>r.includes("关系不明确"))));
+  write(b.acceptance,criteria);
+  f.apply("查询",f.run("查询"));
+  assert(!existsSync(plainIssue)); assert(existsSync(restricted));
+  jsonl(join(r.dir,"answers.jsonl"),[{at:at(now-1),text:"同意授权：A9"}]);
+  assert(mustFind(f.run("查询").issues,v=>v.file===restricted).ready);
+});
+
 test("结构化证明必须使用登记的旧版；未声明旧版只认开工基线",t=>{
   const f=fixture(t), b=f.batch("补证明"), historical="5".repeat(40), wrong="6".repeat(40);
   const declaration = {issue:"PA046",scenario:"S3",checkpoint:"原单重投",before:historical};
@@ -258,11 +299,44 @@ test("同一卡未部署的重试不抹掉旧部署；退回和无时间的新�
   assert.equal(view().deploymentAt,deployedAt,"失败的另一次尝试不能抹掉原部署");
   d.check("退回","已退回",{commit:merged,endedAt:at(now-days(1))});
   assert.equal(view().deployment,"已退回"); assert.equal(view().sevenDaysAt,null); assert(!view().due);
-  newer.check("部署","已部署",{endedAt:""});
+  newer.check("部署","已部署",{startedAt:at(now-days(0.75)),endedAt:""});
   assert.equal(view().deploymentExecution,newer.id); assert.equal(view().deploymentAt,null); assert(!view().due);
   doc(join(newer.dir,"status.json"),{executionId:newer.id,state:"completed",loop:{commit}});
   write(b.results,`## ${at(now-days(1))}\n执行：${newer.id}\n版本：${commit}\n部署时间：${at(now-days(1))}\n`);
   assert.equal(view().deploymentAt,null,"同一执行有多次部署，不能用未定位到单次的旧结果补时");
+});
+
+for (const failure of ["部署失败，回退也失败","部署失败，未回退"]) test(`较新${failure}不能沿用旧部署的七天时间；下次开工独立`,t=>{
+  const f=fixture(t), b=f.batch("旧版仍待验"), first=f.execution(b,"published",now-days(10),{state:"working"}); first.pass();
+  first.check("部署","已部署",{endedAt:at(now-days(8))});
+  write(b.acceptance,"状态：待验\nA1. [人工] 确认页面\n");
+  const newer=f.execution(b,"retry-failed",now-days(2),{state:"working"}); newer.pass();
+  // 试合并版本尚未写入合入流水，仍要保留已实际执行的失败尝试。
+  newer.check("部署",failure,{commit:merged,endedAt:at(now-days(1))});
+  const args=["--acceptance-ready"], p=f.run("查询",args), v=p.acceptances[0];
+  assert.equal(v.deployment,failure); assert.equal(v.deploymentExecution,newer.id); assert.equal(v.deploymentCommit,merged);
+  assert.equal(v.sevenDaysAt,null); assert(!v.due); assert(!p.changes.some(c=>c.to===b.acceptance));
+  assert(v.sources.some(s=>s.file===newer.index && s.line===3));
+  const next=f.batch("下一张卡"), opening=f.run("开工",[...args,"--card",next.card]);
+  assert.equal(opening.acceptances[0].reason,"同项目下次开工");
+  assert(opening.changes.some(c=>c.to===b.acceptance));
+});
+
+test("旧部署无时间但退回有时间；更晚已部署版照常计算七天",t=>{
+  const f=fixture(t), b=f.batch("两次部署"), older=f.execution(b,"old-without-time",now-days(12)); older.pass();
+  older.check("部署","已部署",{endedAt:""});
+  const later=f.execution(b,"later-release",now-days(10),{loop:{commit:merged,delivery:{commit:merged}}});
+  later.check("部署","已部署",{commit:merged,endedAt:at(now-days(8))});
+  write(b.acceptance,"状态：待验\nA1. [人工] 核对最新版本\n");
+  const args=["--acceptance-ready"], unknown=f.run("查询",args).acceptances[0];
+  assert.equal(unknown.deployment,"部署先后不明"); assert(!unknown.due);
+  older.check("退回","已退回",{endedAt:at(now-days(9))});
+  const p=f.run("查询",args), v=p.acceptances[0];
+  assert.equal(v.deployment,"已部署"); assert.equal(v.deploymentExecution,later.id); assert.equal(v.deploymentCommit,merged);
+  assert.equal(v.deploymentAt,at(now-days(8))); assert.equal(v.reason,"部署满七天");
+  assert(v.sources.some(s=>s.file===older.index && s.line===4));
+  f.apply("查询",p,args);
+  assert.match(read(b.acceptance),/^状态：未确认（无反馈）/);
 });
 
 test("体检支持实际 PA Markdown 与旧平铺卡；提示漏跑、脚本失配和删除路径",t=>{
@@ -298,6 +372,7 @@ test("月报口径含分母、未知、审核出处和剪枝；当月重复开�
   const f=fixture(t), a=f.batch("first"), b=f.batch("second"), legacy=f.batch("legacy");
   const stop={at:at(now-days(8)),reason:"模型出错",step:"开发中",resolvedBy:"续跑"};
   const r1=f.execution(a,"a",now-days(8),{loop:{facts:{stops:[stop],resumes:1}}}); r1.reviewed(1,true); r1.check("复测","通过"); r1.reviewed(2);
+  r1.check("合入","已合入",{detail:JSON.stringify({devAfter:merged})});
   const r2=f.execution(b,"b",now-days(7)); r2.pass();
   f.execution(legacy,"old",now-days(6),{loop:{facts:undefined,durations:{}}});
   write(join(f.repo,"issues/【history】/【bug】漏网.md"),`# 【bug】漏网\n状态：已解决\n引入批次：a，${commit}\n`);
@@ -307,6 +382,7 @@ test("月报口径含分母、未知、审核出处和剪枝；当月重复开�
   const p=f.run("开工"), m=p.month?.snapshot;
   assert(m); assert.equal(m.intervention.value,1); assert.equal(m.intervention.unknown,1); assert.equal(m.flowFailures.byReason.模型出错,1);
   assert.equal(m.firstMustFix.value,0.5); assert.equal(m.repairRounds.value,1.5); assert.equal(m.escapes.count,1);
+  assert.equal(m.escapes.evidence[0].enteredDev.kind,"合入流水");
   assert.equal(m.durationMs.total.value,2000); assert.equal(m.durationMs.total.unknown,1); assert.equal(m.falsePositives.denominator,1);
   assert.equal(m.falsePositives.value,1); assert(m.pruning.some(c=>c.kind==="地图剪枝"));
   f.apply("开工",p); assert.equal(f.run("开工",[],now+days(1)).changes.filter(c=>c.kind==="月报").length,0);
@@ -314,25 +390,41 @@ test("月报口径含分母、未知、审核出处和剪枝；当月重复开�
   f.apply("月报",q,[],now+days(1)); assert.equal(readdirSync(join(f.repo,".dev-loop-coord/monthly")).length,2);
 });
 
-test("漏网归因区分带日期的执行编号与引入 SHA，旧提交失败仍可随通过的后继交付",t=>{
+test("漏网同时核对引入祖先和进入 dev；接力合入计入，放弃分支不计",t=>{
   const f=fixture(t), b=f.batch("PA可信状态-20261109");
   f.git("init","--template=","-b","dev"); f.git("config","user.name","协调测试"); f.git("config","user.email","coord@example.invalid");
   const file = join(f.repo,"sample.txt");
   const save = (data:string)=>{ write(file,data); f.git("add","sample.txt"); f.git("commit","-m",data.trim()); return f.git("rev-parse","HEAD"); };
-  const base=save("base\n"), early=save("introduced\n"), final=save("still present in delivery\n");
-  f.git("switch","-c","not-delivered",base);
-  const separate=save("different history\n");
+  const base=save("base\n"); f.git("switch","-c","first-run");
+  const early=save("introduced\n"), final=save("still present in delivery\n");
+  f.git("switch","-c","abandoned",base);
+  const discardedEarly=save("introduced but abandoned\n"), separate=save("not delivered\n");
+  f.git("switch","-c","successor",final);
+  const later=save("successor delivery\n");
+  const laterBatch=f.batch("接力最后一批");
+  const laterRun=f.execution(laterBatch,"successor-run",now-days(2),{task:{baseCommit:final},loop:{commit:later,delivery:{commit:later}}});
+  laterRun.check("复测","通过",{commit:later}); laterRun.check("评审","通过",{commit:later});
+  const abandoned=f.execution(f.batch("放弃的卡"),"abandoned-run",now-days(1),{state:"cancelled",task:{baseCommit:base},loop:{commit:separate,delivery:{commit:separate}}});
+  abandoned.check("复测","失败",{commit:discardedEarly});
+  abandoned.check("复测","通过",{commit:separate}); abandoned.check("评审","通过",{commit:separate});
   const r=f.execution(b,"personal-agent-PA--20261109-1a393814-b28159",now-days(3),
     {task:{baseCommit:base},loop:{commit:final,delivery:{commit:final}}});
   r.check("复测","失败",{commit:early}); r.check("复测","失败",{commit:separate});
   r.check("复测","通过",{commit:final}); r.check("评审","通过",{commit:final});
   const bug = (name:string,entry:string)=>write(join(f.repo,"issues",`【bug】${name}.md`),`# 【bug】${name}\n状态：待修复\n引入批次：${entry}\n`);
   const known=bug("首轮引入",`${r.id} + \`${early.slice(0,7)}\``);
-  bug("未继承",`${r.id}，${separate}`); bug("缺提交",r.id);
+  bug("未继承",`${r.id}，${separate}`); bug("缺提交",r.id); bug("仅放弃分支",`${abandoned.id}，${discardedEarly.slice(0,7)}`);
+  // rev-parse 必须用本地 dev，而不是当前 HEAD（此时 HEAD 在接力分支）。
+  assert.equal(f.run("月报").month?.snapshot?.escapes.count,0);
+  f.git("switch","dev"); f.git("merge","--no-ff","-m","Merge successor",later);
+  const devTip=f.git("rev-parse","dev");
+  laterRun.check("合入","已合入",{commit:later,detail:JSON.stringify({devAfter:devTip})});
   const escapes=f.run("月报").month?.snapshot?.escapes;
-  assert.equal(escapes?.count,1); assert.equal(escapes?.unknownAttribution,2);
+  assert.equal(escapes?.count,1); assert.equal(escapes?.unknownAttribution,3);
   assert.deepEqual(escapes?.evidence.map(e=>[e.source.file,e.execution,e.introducedCommit,e.deliveryCommit]),[[known,r.id,early,final]]);
-  assert(escapes?.evidence[0].sources.some(s=>s.file===r.index && s.line===1));
+  const evidence=escapes?.evidence[0];
+  assert(evidence?.sources.some(s=>s.file===r.index && s.line===1));
+  assert.deepEqual(evidence?.enteredDev,{kind:"dev 历史",commit:devTip,source:{file:f.repo,field:"refs/heads/dev"}});
 });
 
 test("预览后用户改过就不覆盖；SIGKILL 接棒与双进程重试后原件、证据只记一份",async t=>{
