@@ -4,7 +4,7 @@ import { APP_ROOT, tasksRoot } from "../infra/paths.ts";
 import { appendJson, jsonLines, withLock } from "../infra/files.ts";
 import { createTask, taskOf, statusOf, allTasks, locate, LoopError, type Task } from "../core/store.ts";
 import { InputError, UnsupportedError } from "../core/card.ts";
-import { deliver } from "../core/deliver.ts";
+import { confirmDelivery, deliver } from "../core/deliver.ts";
 import { resume, stop } from "../core/lifecycle.ts";
 import { merge } from "../steps/merge.ts";
 import { push, type PushResult } from "../steps/push.ts";
@@ -14,8 +14,8 @@ import { finish } from "./finish.ts";
 import { queued } from "./queue.ts";
 import { background } from "./background.ts";
 import { companion } from "./companion.ts";
-import { comparison, releaseWorktree } from "./inspect.ts";
-interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; words?: string; commit?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
+import { comparison, publicStatus, releaseWorktree } from "./inspect.ts";
+interface Options { command: string; target?: string; other?: string; all: boolean; brief: boolean; json: boolean; task?: string; dispatch?: string; instruction?: string; note: string; words?: string; commit?: string; deliveryCommit?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
 function options(args: string[]): Options {
   const out: Options = { command: args.shift() || "帮助", all: false, brief: false, json: false, note: "", acceptUnverified: false, push: false, automatic: false };
   while (args.length) {
@@ -25,7 +25,8 @@ function options(args: string[]): Options {
     if (arg === "--推送" && out.command === "合入") { out.push = true; continue; }
     if (arg === "--auto" && out.command === "收尾") { out.automatic = true; continue; }
     if (arg === "--commit" && !["合入", "部署"].includes(out.command)) throw new InputError("未知选项：" + arg);
-    const field = {"--commit":"commit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--话":"words","--text-file":"file"}[arg];
+    if (arg === "--交付提交" && (out.command !== "续跑" || out.deliveryCommit)) throw new InputError("仅可在续跑时指定一次 --交付提交");
+    const field = {"--commit":"commit","--交付提交":"deliveryCommit","--task":"task","--派单编号":"dispatch","--指令编号":"instruction","--说明":"note","--话":"words","--text-file":"file"}[arg];
     if (field) {
       const value = args.shift(); if (value === undefined || (field !== "words" && (!value || value.startsWith("--")))) throw new InputError(arg + " 缺值");
       if (field === "file") out[["续跑", "答复"].includes(out.command) ? "words" : "note"] = readFileSync(resolve(value),"utf8"); else (out as any)[field] = value;
@@ -33,6 +34,7 @@ function options(args: string[]): Options {
     else if (out.target) { if(out.command==="对比" && !out.other)out.other=arg; else throw new InputError("只能指定一个卡或执行编号（对比最多两个）"); }
     else out.target = arg;
   }
+  if (out.deliveryCommit && (out.words !== undefined || out.note)) throw new InputError("--交付提交 不能与 --话、--text-file 或 --说明 同时使用");
   if (out.command !== "启动" && (out.instruction || out.dispatch)) throw new UnsupportedError("第 4 步才支持续跑/停止等 PA 指令编号；本步编号只用于启动回执");
   return out;
 }
@@ -52,19 +54,16 @@ const help = `bin/loop 启动 <version:1 单任务卡> [--派单编号 X] [--指
 bin/loop 交付 [--说明 文本 | --text-file 文件] [--json]
 bin/loop 查询 [<卡或执行编号> | --all] [--brief] [--json]
 bin/loop 续跑 <卡或执行编号> [--话 文本 | --text-file 文件] [--task 名] [--json]
+bin/loop 续跑 <执行编号> --交付提交 <完整SHA> [--json]
 bin/loop 答复 <卡或执行编号> (--话 文本 | --text-file 文件) [--task 名] [--json]
 bin/loop 停止|放弃 <卡或执行编号> [--task 名] [--json]
 bin/loop 合入 <执行编号或卡路径> [--commit <sha>] [--接受未验证] [--推送] [--json]
 bin/loop 部署 <执行编号或卡路径> [--commit <sha>] [--json]
 bin/loop 收尾|退回|陪跑|释放 <执行编号或卡路径> [--json]
 bin/loop 对比 <执行编号或卡路径> [<另一个执行编号或卡路径>] [--json]
-flow 按 开发评审, 测试, 合入, 部署, 推送 的子序列；next 相对卡目录，最后一批才收尾。
-合入默认仅本地；手工仅 --推送 才扫描并推送 origin/dev；部署须登记 .autoreview.json 的 deploy.cmd。
-自动部署还须 check/rollback；deploy.env 为当前配置的大写字符串环境变量（禁止 LOOP_）。
-收尾走卡并脱离开发会话；退回只动线上不动 dev；陪跑/snapshot 失败不阻断；验收后可释放工作区。
-LOOP_TASKS_ROOT：执行根目录；开发方优先通过 LOOP_TASK_DIR 定位任务。
-答复仅等你时接收，原文追加 answers.jsonl 并带话续跑；Claude/Codex 未送达，需在窗口里说。
-多任务/整合/验收（第3步）尚不支持。`;
+flow 按卡执行；next 相对卡目录，最后一批才合入、部署。手工合入默认仅本地；部署的 deploy.cmd、check/rollback、deploy.env 见 README。
+LOOP_TASKS_ROOT 指向执行根目录，开发方优先用 LOOP_TASK_DIR 定位任务。
+仅「等你」时可答复；Claude/Codex 未送达，需在窗口里说。「停下没交付」且查询给出 loop.deliveryConfirmation 时，可确认已有提交并在后台检查。完整用法见 README.md。`;
 export async function main(args = process.argv.slice(2)): Promise<unknown> {
   const o=options([...args]), root=tasksRoot();
   if (["帮助","help","--help","-h"].includes(o.command)) return help;
@@ -88,18 +87,25 @@ export async function main(args = process.argv.slice(2)): Promise<unknown> {
   if(o.command==="查询") {
     if(o.all && o.target)throw new InputError("--all 与卡/执行编号不能同时使用");
     const dirs=o.all?allTasks(root):matching(o.target);
-    return {complete:true,executions:dirs.map(statusOf)};
+    return {complete:true,executions:dirs.map(publicStatus)};
   }
   if(o.command==="交付") {
     const dir=locate(process.cwd()); if(!dir)throw new InputError("当前目录没有任务；请在登记的 worktree 内交付或设置 LOOP_TASK_DIR");
     return deliver(dir,o.note);
   }
   if(o.command==="续跑" || o.command==="答复") {
-    const dir=select(o), result=resume(dir,o.words,o.command==="答复");
-    if(result.reviewOnly)await background(taskOf(dir),"review");
-    else if(result.status.loop.phase==="收尾中")await background(taskOf(dir),false,true);
-    else if(!result.reused && !result.running)await background(taskOf(dir),true);
-    return {executionId:taskOf(dir).executionId,...result};
+    const dir=select(o), t=taskOf(dir);
+    if(o.deliveryCommit) {
+      if(o.target!==t.executionId)throw new InputError("--交付提交 须指定查询给出的执行编号");
+      const receipt=confirmDelivery(dir,o.deliveryCommit);
+      if(receipt.status.loop.phase==="已交付")await background(t,{delivery:receipt.commit});
+      return {executionId:t.executionId,...receipt};
+    }
+    const result=resume(dir,o.words,o.command==="答复");
+    if(result.reviewOnly)await background(t,"review");
+    else if(result.status.loop.phase==="收尾中")await background(t,"finish");
+    else if(!result.reused && !result.running)await background(t,"resume");
+    return {executionId:t.executionId,...result};
   }
   if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");
   if(o.command==="对比") return comparison(select(o),o.other?select({...o,target:o.other}):undefined);

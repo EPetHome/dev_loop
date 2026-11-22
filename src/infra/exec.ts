@@ -1,14 +1,12 @@
-/** 从旧 createChildExec 精简：保留进程组、超时、取消和输出；不做释放账本。 */
 import { spawn, execFileSync } from "node:child_process";
+import { openSync, closeSync } from "node:fs";
 export interface Identity { pid: number; startedAt: string }
-export function identity(pid = process.pid): Identity {
-  let startedAt = "";
-  try { startedAt = execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8" }).trim(); } catch {}
-  return { pid, startedAt };
+let ownStart = ""; // 只缓存本进程；外部 PID 可能复用。
+function processStart(pid: number) {
+  try { return execFileSync("ps",["-p",String(pid),"-o","lstart="],{encoding:"utf8"}).trim(); } catch { return ""; }
 }
-export function alive(p?: Identity | null): boolean {
-  return Boolean(p?.pid && p.startedAt && identity(p.pid).startedAt === p.startedAt);
-}
+export const identity = (pid = process.pid): Identity => ({pid, startedAt: pid === process.pid ? (ownStart ||= processStart(pid)) : processStart(pid)});
+export const alive = (p?: Identity | null) => Boolean(p?.pid && p.startedAt && identity(p.pid).startedAt === p.startedAt);
 export function signalProcess(p?: Identity | null, group = false): void {
   if (!p || p.pid === process.pid || !alive(p)) return;
   try { process.kill(group ? -p.pid : p.pid, "SIGKILL"); }
@@ -24,12 +22,9 @@ export function signalProcess(p?: Identity | null, group = false): void {
   }
 }
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
-export interface ExecOptions {
-  cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal;
-  onSpawn?: (p: Identity) => void;
-}
-export function createChildExec() {
-  return (command: string, args: string[], options: ExecOptions): Promise<ExecResult> => new Promise((accept) => {
+export interface ExecOptions { cwd: string; timeoutMs: number; env?: NodeJS.ProcessEnv; signal?: AbortSignal; onSpawn?: (p: Identity) => void }
+export function childExec(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
+  return new Promise((accept) => {
     let stdout = "", stderr = "", output = "", killed = false, done = false;
     let timer: ReturnType<typeof setTimeout> | undefined, reap: ReturnType<typeof setTimeout> | undefined;
     const child = spawn(command, args, { cwd: options.cwd, env: { ...process.env, ...options.env },
@@ -59,4 +54,14 @@ export function createChildExec() {
     if (options.signal?.aborted) kill();
   });
 }
-export const childExec = createChildExec();
+export async function detach(command: string, args: string[], log: string, cwd: string, env: NodeJS.ProcessEnv, acknowledge = false) {
+  const fd = openSync(log,"a");
+  try {
+    const child = spawn(command,args,{cwd,env,detached:true,stdio:acknowledge?["ignore",fd,fd,"ipc"]:["ignore",fd,fd]});
+    await new Promise<void>((ok,no) => {
+      child.once("error",no); child.once(acknowledge ? "message" : "spawn",ok);
+      if (acknowledge) child.once("exit",(code,signal)=>no(new Error("下一卡启动未登记："+(signal || code))));
+    });
+    if (child.connected) child.disconnect(); child.unref();
+  } finally { closeSync(fd); }
+}

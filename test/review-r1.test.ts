@@ -4,12 +4,13 @@ import { join } from "node:path";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { fixture, write, NODE, ROOT, getJson } from "./helpers.ts";
+import { fixture, write, until, NODE, ROOT, getJson } from "./helpers.ts";
 import { gitText, head, changes } from "../src/infra/git.ts";
 import { identity, signalProcess } from "../src/infra/exec.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
-import { statusOf } from "../src/core/store.ts";
+import { statusOf, checksOf } from "../src/core/store.ts";
+import { handleHook } from "../src/hosts/hook.ts";
 import { registerSession } from "../src/core/lifecycle.ts";
 import { readCard } from "../src/core/card.ts";
 import { launchMain, terminalSession } from "../src/hosts/launch.ts";
@@ -115,6 +116,31 @@ for (const host of ["claude", "codex"]) test("r1 必修3：" + host + " 超出 h
   assert.equal((card.limits.测试.timeoutMin + card.limits.开发评审.timeoutMin) * 60 + HOOK_OVERHEAD_SEC, HOOK_TIMEOUT_SEC);
   f.raw.limits.开发评审.timeoutMin = 71; write(f.card, JSON.stringify(f.raw));
   assert.throws(() => readCard(f.card), /不支持此配置/);
+});
+for (const host of ["claude", "codex"]) test("W1 r2 必修2：合法 " + host + " 卡的隔离准备与复测共用预算", async t => {
+  const f = fixture(t,{card:{host},config:{setup:"node gate.cjs setup"},test:"node gate.cjs test"});
+  write(join(f.repo,"gate.cjs"), `
+const fs=require('fs'), p=process.env.LOOP_TASK_DIR, stage=process.argv[2];
+if (!fs.existsSync(p+'/gate-on')) process.exit(0);
+const ready=()=>{if(fs.existsSync(p+'/'+stage+'-go'))w.close();};
+const w=fs.watch(p,ready);fs.writeFileSync(p+'/'+stage+'-started','');ready();
+`);
+  f.git("add","gate.cjs"); f.git("commit","-m","time-controlled setup and test");
+  const task = await f.prepare(), {commit} = deliver(task.dir);
+  const now = Date.now(), limits = task.limits;
+  assert.equal((limits.测试.timeoutMin + limits.开发评审.timeoutMin) * 60 + HOOK_OVERHEAD_SEC, HOOK_TIMEOUT_SEC);
+  t.mock.timers.enable({apis:["Date","setTimeout"], now});
+  write(join(task.dir,"gate-on"),"");
+  const active = handleHook({cwd:task.worktree,last_assistant_message:"已经交付"},"Stop",{...f.env,LOOP_TASK_DIR:task.dir,LOOP_HOST:host});
+  await until(task.dir,()=>existsSync(join(task.dir,"setup-started")),Boolean);
+  t.mock.timers.tick(5 * 60000); write(join(task.dir,"setup-go"),"");
+  await until(task.dir,()=>existsSync(join(task.dir,"test-started")),Boolean);
+  t.mock.timers.tick(15 * 60000); write(join(task.dir,"test-go"),"");
+  const response = await active, test = checksOf(task.dir).findLast(c=>c.step==="复测");
+  t.diagnostic(JSON.stringify({host,commit,elapsedMs:Date.now()-now, test:test?.result, review:statusOf(task.dir).loop.reviewRounds, response:response.slice(0,240)}));
+  assert.equal(test?.commit,commit); assert.equal(test?.result,"失败"); assert.match(response,/复测失败.*超时/);
+  assert.equal(statusOf(task.dir).loop.reviewRounds,0);
+  assert.ok(Date.now()-now < HOOK_TIMEOUT_SEC * 1000);
 });
 test("r1 必修3：pi 不受固定 Stop hook 时限约束，120 分钟覆盖保持可用", (t) => {
   const f = fixture(t, {card: {host: "pi", limits: {开发评审: {timeoutMin: 120}}}});

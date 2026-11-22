@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { fixture, write, sq, PASS, MUST, until } from "./helpers.ts";
+import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { fixture, write, sq, PASS, MUST, until, NODE } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { resume, registerSession } from "../src/core/lifecycle.ts";
@@ -39,6 +39,77 @@ test("A3/A4：临时失败记事实；续跑立即回执，后台只评审，不
   assert.equal(existsSync(join(task.dir, "opened.json")), false);
   assert.deepEqual(checksOf(task.dir).filter(c => c.step === "复测"), before);
   assert.match(readFileSync(join(task.dir, "review-input-r2.md"), "utf8"), /结果：通过/);
+});
+test("W1 r2 必修1：只补评审沿用同次复测生成的覆盖率报告", async t => {
+  const f = fixture(t, {test: 'echo test >> "$LOOP_TASK_DIR/order"; mkdir -p dist; cp src/app.txt dist/coverage.json',
+    config: {setup: 'echo setup >> "$LOOP_TASK_DIR/setup-count"'}, reviewer: `
+    if ! grep -q 'report from B' dist/coverage.json; then echo '原复测报告缺失' >&2; exit 8; fi
+    pwd > "$LOOP_TASK_DIR/review-worktree"
+    if [ ! -e "$LOOP_TASK_DIR/retry-go" ]; then echo '临时断连' >&2; exit 7; fi
+    printf %s ${sq(PASS)}`});
+  const task = await f.prepare(); write(join(task.worktree,"src/app.txt"), "report from B\n");
+  const {commit} = deliver(task.dir); await settle(task.dir);
+  const failed = statusOf(task.dir), before = checksOf(task.dir).filter(c => c.step === "复测");
+  const cwd = readFileSync(join(task.dir,"review-worktree"), "utf8").trim();
+  assert.equal(failed.error?.category,"临时故障"); assert.match(failed.error.raw,/临时断连/); assert.notEqual(cwd,task.worktree);
+  // 开发工作区以内的忽略产物也不能冒充原复测报告。
+  write(join(task.worktree,"dist/coverage.json"),"report from C\n"); write(join(task.dir,"retry-go"),"");
+  const receipt = JSON.parse((await f.cli(["续跑",task.executionId,"--json"])).stdout);
+  const s = await until(task.dir, () => statusOf(task.dir), s => !s.loop.launcher && s.state !== "working");
+  const order = readFileSync(join(task.dir,"order"),"utf8"), setups = readFileSync(join(task.dir,"setup-count"),"utf8");
+  t.diagnostic(JSON.stringify({commit, initial:failed.state, retry:receipt.reviewOnly, final:s.state, error:s.error, order, setups}));
+  assert.equal(receipt.reviewOnly,true); assert.equal(s.state,"completed");
+  assert.equal(readFileSync(join(task.dir,"review-worktree"),"utf8").trim(),cwd);
+  assert.equal(order,"test\nreview\nreview\nreview\n"); assert.equal(setups,"setup\nsetup\n");
+  assert.deepEqual(checksOf(task.dir).filter(c => c.step === "复测"),before);
+  assert.equal(readFileSync(join(task.worktree,"dist/coverage.json"),"utf8"),"report from C\n");
+  assert.equal(existsSync(cwd),false);
+});
+const oldOverflow = "Codex error: Your input exceeds the context window of this model. Please adjust your input and try again.";
+for (const [name, raw, overflow] of [
+  ["Codex", oldOverflow, true],
+  ["Gemini", "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)", true],
+  ["限流", "429 rate_limit_exceeded: Rate limit reached for tokens per minute (TPM)", false],
+  ["临时断连", "连接暂时中断，稍后再试", false],
+] as const) test("W1 A17 / 问题单 A3：只读本次 Pi 评审结束原因 · " + name, async t => {
+  const f = fixture(t, {config: {reviewerCmd: ""}}), task = await f.prepare(), bin = join(f.base, "fake-review-pi.cjs");
+  write(bin, "#!" + NODE + "\n" + `
+const fs = require("fs"), path = require("path"), t = process.env.LOOP_TASK_DIR;
+const arg = name => process.argv[process.argv.indexOf(name)+1];
+const id = arg("--session-id"), dir = process.argv.includes("--session-dir") ? arg("--session-dir") : path.join(t,"legacy-review-sessions");
+const err = errorMessage => ({type:"message",message:{role:"assistant",stopReason:"error",errorMessage}});
+const oldOverflow = ${JSON.stringify(oldOverflow)}, raw = ${JSON.stringify(raw)};
+const log = (filename, id, ...lines) => fs.writeFileSync(path.join(dir,filename), [{type:"session",id}, ...lines].map(x=>JSON.stringify(x)).join("\\n")+"\\n");
+fs.mkdirSync(dir,{recursive:true});
+log("other-review.jsonl", "another-attempt", err(oldOverflow));
+log("2026-test_"+id+".jsonl", id, err(oldOverflow), err(raw));
+fs.appendFileSync(path.join(t,"order"), "review\\n");
+console.log("评审未生成报告");
+`);
+  chmodSync(bin, 0o755);
+  const old = process.env.PI_BIN;
+  try { process.env.PI_BIN = bin; deliver(task.dir); await settle(task.dir); await settle(task.dir); }
+  finally { if (old === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = old; }
+  const {error} = JSON.parse((await f.cli(["查询", task.executionId, "--json"])).stdout).executions[0];
+  const s = statusOf(task.dir), review = checksOf(task.dir).findLast(c => c.step === "评审")!;
+  const order = readFileSync(join(task.dir, "order"), "utf8");
+  const files = review.evidence.map(path => ({path, bytes: readFileSync(path).byteLength}));
+  t.diagnostic(JSON.stringify({commit: review.commit, phase: s.loop.phase, error, order, evidence: files, materialBytes: readFileSync(join(task.dir, "review-input-r1.md")).byteLength}));
+  assert.equal(s.state, "failed");
+  assert.equal(review.result, "失败");
+  assert.equal(s.loop.reviewReturns, 0);
+  if (overflow) {
+    assert.equal(error.category, "评审上下文超限");
+    assert.equal(error.raw, raw);
+    assert.equal(review.detail, raw);
+    assert.equal(readFileSync(review.evidence[0], "utf8").includes(raw), false);
+    assert.ok(review.evidence.slice(1).some(path => readFileSync(path, "utf8").includes(raw)));
+    assert.equal(order, "test\nreview\n");
+  } else {
+    assert.equal(error.category, "临时故障");
+    assert.match(error.raw, /缺少「## 必修」标题/);
+    assert.equal(order, "test\nreview\nreview\n");
+  }
 });
 test("复测没验证且日志已丢也可只补评审，通过后照常收尾", async t => {
   const f = await failed(t, {test: "无：文档无可运行检查", card: {flow: ["开发评审", "测试", "合入"]}}), {task} = f;

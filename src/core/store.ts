@@ -30,9 +30,10 @@ export interface Task {
   baseCommit: string; branch: string; worktree: string; createdAt: string; dispatchId: string | null; after?: string[]; next?: string;
 }
 export interface Check {
-  commit: string; tree: string; step: string; result: string; startedAt: string; endedAt: string; durationMs: number;
-  evidence: string[]; promptHash: string; acceptanceHash: string; detail?: string;
+  commit: string; tree: string; step: string; result: string; promptHash: string; acceptanceHash: string;
+  startedAt: string; endedAt: string; durationMs: number; evidence: string[]; detail?: string;
 }
+export interface ReleasePending { at: string; auto?: true; target?: {gitDir: string; id: string} }
 export interface Status {
   protocol: string; source: {worker: string; instance: string}; executionId: string; dispatchId: string | null; batchId: null;
   state: State; message: string; updatedAt: string; seq: number; generation: number; heartbeatSec: number; timeLimitSec: number | null;
@@ -40,42 +41,38 @@ export interface Status {
   evidence: string[]; actions: string[];
   loop: {
     phase: Phase; wait?: WaitReason | null; facts?: Facts; commit: string | null; testReturns: number; reviewRounds: number; reviewReturns: number;
-    session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null;
-    startingSession: (Identity & {launchId: string}) | null;
-    finisher?: Identity | null; afterCommit?: string | null; deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string; released?: boolean;
-    activeProcess: Identity | null; launcher: Identity | null; ready: boolean; prepared: boolean; abandoned: boolean;
+    session: (Identity & {host: string; id: string; file?: string; endedAt?: string}) | null; startingSession: (Identity & {launchId: string}) | null;
+    finisher?: Identity | null; afterCommit?: string | null; activeProcess: Identity | null; launcher: Identity | null; launchStarted?: boolean;
+    deployReturns?: number; pendingReturn?: string | null; pendingOpening?: boolean; answerCount?: number; next?: string;
+    ready: boolean; prepared: boolean; abandoned: boolean; released?: boolean; releasePending?: ReleasePending | null;
     durations: Record<Bucket, number>; bucket: Bucket | null; clockAt: number; stepStartedAt: number;
     delivery: {commit: string; tree: string; note: string; at: string} | null;
-    warned: boolean; previousMustFix: string[]; previousReviewCommit: string | null;
+    remindedCandidates?: string[]; previousMustFix: string[]; previousReviewCommit: string | null;
     testAllowance: number; reviewAllowance: number; reused: boolean;
   };
 }
 export const taskOf = (dir: string) => readJson<Task>(join(dir, "task.json"));
 export const answersOf = (dir: string) => jsonLines<{at: string; text: string}>(join(dir, "answers.jsonl"));
 export const statusOf = (dir: string) => { const s = readJson<Status>(join(dir, "status.json")); s.loop.answerCount = answersOf(dir).length; return s; };
+export const launchStarted = ({loop}: Status) => Boolean(loop.launchStarted || loop.prepared || loop.launcher || loop.session);
 export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.jsonl"));
 export const appendCheck = (dir: string, check: Check) => appendJson(join(dir, "checks.jsonl"), check);
 export function summary(dir: string, s = statusOf(dir)): void {
   const labels: Record<Bucket, string> = { developmentMs: "开发", testMs: "复测", reviewMs: "评审", inputMs: "等你", selfMs: "dev-loop 自身" };
-  const checks = checksOf(dir), lines = ["# " + s.executionId, "", s.loop.phase + "：" + s.message.replace(/\s+/g, " ").slice(0, 220),
+  const steps = new Map<string,{result:string; ms:number}>();
+  for (const {step,result,durationMs} of checksOf(dir)) steps.set(step,{result,ms:(steps.get(step)?.ms || 0)+durationMs});
+  const lines = ["# " + s.executionId, "", s.loop.phase + "：" + s.message.replace(/\s+/g, " ").slice(0, 220),
     s.loop.reused ? "结论：沿用此 commit 的已有检查。" : "", "", "| 步骤 | 结论 | 累计耗时 |", "|---|---|---|"];
   for (const [bucket, label] of Object.entries(labels)) {
-    if (bucket === "selfMs") for (const extra of new Set(checks.map(c => c.step).filter(step => !Object.values(labels).includes(step)))) {
-      const records = checks.filter(c => c.step === extra);
-      lines.push("| " + extra + " | " + records.at(-1)!.result + " | " + (records.reduce((n, c) => n + c.durationMs, 0) / 1000).toFixed(2) + "s |");
-    }
-    const step = bucket === "testMs" ? "复测" : bucket === "reviewMs" ? "评审" : label;
-    const last = checks.filter((c) => c.step === step).at(-1);
-    const result = last?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
+    if (bucket === "selfMs") for (const [step,{result,ms}] of steps) if (!Object.values(labels).includes(step)) lines.push(`| ${step} | ${result} | ${(ms/1000).toFixed(2)}s |`);
+    const result = steps.get(label)?.result || (bucket === "inputMs" ? s.state === "input_required" ? "等待决定" : "—" : bucket === "developmentMs" ? s.loop.delivery ? "已交付" : "未交付" : s.loop.ready ? "就绪" : s.state);
     lines.push("| " + label + " | " + result + " | " + (s.loop.durations[bucket as Bucket] / 1000).toFixed(2) + "s |");
   }
-  lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl"));
-  writeFileSync(join(dir, "summary.md"), lines.filter((s, i, a) => s || a[i - 1] !== "").join("\n") + "\n");
+  lines.push("", "commit：" + (s.loop.commit || "未交付"), "详情：" + join(dir, "checks.jsonl")); writeFileSync(join(dir,"summary.md"),lines.filter((s,i,a)=>s || a[i-1]!=="").join("\n") + "\n");
 }
 export function update(dir: string, action: (s: Status) => void, resolvedBy: Resolution = "续跑"): Status {
   return withLock(join(dir, "status.lock"), () => {
-    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase};
-    s.loop.facts ||= newFacts(taskOf(dir));
+    const s = statusOf(dir), now = Date.now(), previousBucket = s.loop.bucket, before = {state: s.state, phase: s.loop.phase}; s.loop.facts ||= newFacts(taskOf(dir));
     if (s.loop.bucket) s.loop.durations[s.loop.bucket] += Math.max(0, now - s.loop.clockAt);
     s.loop.clockAt = now; action(s);
     const stopped = ["input_required", "failed", "cancelled"].includes(s.state), at = new Date(now).toISOString();
@@ -92,92 +89,68 @@ export function update(dir: string, action: (s: Status) => void, resolvedBy: Res
     writeJson(join(dir, "status.json"), s); idleSleep(dir, s.state === "working", now, process.env, owner); summary(dir, s); return s;
   });
 }
-export function transition(dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null): Status {
-  return update(dir, (s) => {
-    if (s.state === "cancelled" && state !== "cancelled") return;
-    s.state = state; s.loop.phase = phase; s.message = message; s.loop.bucket = bucket; s.timeLimitSec = timeLimitSec;
-    s.error = null; if (phase !== "等你") s.loop.wait = null;
-  });
+export function move(s: Status, state: State, phase: Phase, message: string, bucket: Bucket | null, timeLimitSec: number | null = null) {
+  if (s.state === "cancelled" && state !== "cancelled") return false;
+  Object.assign(s, {state, message, error:null, timeLimitSec}); Object.assign(s.loop, {phase, bucket, wait:null}); return true;
 }
-export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void {
-  update(dir, s => {
-    if (s.state === "cancelled") return;
-    s.state = "input_required"; s.loop.phase = "等你"; s.loop.wait = reason; s.message = message;
-    s.loop.bucket = "inputMs"; s.timeLimitSec = null; s.error = null;
-    if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn;
-  });
-}
+export const transition = (dir: string, state: State, phase: Phase, message: string, bucket: Bucket | null, timeout?: number | null) => update(dir, s => { move(s,state,phase,message,bucket,timeout); });
+export function waitFor(dir: string, reason: WaitReason, message: string, pendingReturn?: string): void { update(dir, s => {
+  if (move(s,"input_required","等你",message,"inputMs")) { s.loop.wait = reason; if (pendingReturn !== undefined) s.loop.pendingReturn = pendingReturn; }
+}); }
 export function fail(dir: string, error: unknown, category?: string): void {
-  const raw = error instanceof Error ? error.message : String(error);
-  update(dir, (s) => {
-    if (s.state === "cancelled") return;
-    s.state = "failed"; s.loop.phase = "失败"; s.loop.wait = null; s.message = raw; s.loop.bucket = null; s.timeLimitSec = null;
-    s.error = { category: category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知"), raw };
-  });
+  const raw = error instanceof Error ? error.message : String(error), kind = category || (/EACCES|EPERM|Permission denied|权限/.test(raw) ? "权限不足" : error instanceof Error ? "工具内部错误" : "未知");
+  update(dir,s => { if (!s.loop.releasePending && !s.loop.released && move(s,"failed","失败",raw,null)) s.error = {category:kind,raw}; });
 }
 const ascii = (s: string) => s.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-|-$/g, "").slice(0, 25) || digest(s).slice(0, 8);
 export function createTask(file: string, root = tasksRoot(), dispatchId: string | null = null, baseCommit?: string): Task {
-  const parsed = readCard(file), { repo, card } = parsed, task = card.tasks[0];
-  let config: Config;
+  const parsed = readCard(file), {repo,card} = parsed, task = card.tasks[0]; let config: Config;
   try { config = loadConfig(repo); } catch (e) { throw new InputError(e instanceof Error ? e.message : String(e)); }
   mkdirSync(root, { recursive: true }); root = realpathSync(root);
   const executionId = [basename(repo), card.name, task.name].map(ascii).join("-") + "-" + randomBytes(3).toString("hex");
-  const dir = join(root, executionId), createdAt = new Date().toISOString();
-  const t: Task = { executionId, dir, repo, card: parsed.file, cardHash: parsed.cardHash, name: task.name,
+  const dir = join(root, executionId), createdAt = new Date().toISOString(), t: Task = { executionId, dir, repo, card: parsed.file, cardHash: parsed.cardHash, name: task.name,
     prompt: task.prompt, acceptance: card.acceptance, scope: task.scope, test: task.test, host: card.host, limits: card.limits, config,
     after: card.after, ...(card.next ? {next: card.next} : {}),
     baseCommit: baseCommit || gitText(repo, ["rev-parse", "refs/heads/" + card.base]), branch: "dev-loop/" + executionId,
     worktree: join(dir, "worktree"), createdAt, dispatchId };
-  mkdirSync(dir); // 随机编号若碰撞，拒绝而不是覆盖已有执行。
-  writeJson(join(dir, "task.json"), t);
+  mkdirSync(dir); writeJson(join(dir, "task.json"), t); // 编号碰撞时 mkdir 拒绝覆盖。
   const s: Status = { protocol: "loop-status/1", source: {worker: "loop", instance: hostname()}, executionId, dispatchId, batchId: null,
     state: "working", message: "已接收，后台准备工作区", updatedAt: createdAt, seq: 1, generation: 1, heartbeatSec: 60, timeLimitSec: null,
     refs: { prompt: t.prompt, acceptance: t.acceptance || null, card: t.card }, error: null,
     evidence: [join(dir, "summary.md"), join(dir, "checks.jsonl")], actions: ["查询","续跑","答复","停止","放弃"],
     loop: { phase: "准备中", wait: null, facts: newFacts(t), commit: null, testReturns: 0, reviewRounds: 0, reviewReturns: 0, session: null, startingSession: null, activeProcess: null, launcher: null, finisher: null, afterCommit: null, deployReturns: 0, pendingReturn: null, answerCount: 0,
-      ready: false, prepared: false, abandoned: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
-      bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, warned: false, previousMustFix: [], previousReviewCommit: null,
+      ready: false, prepared: false, abandoned: false, released: false, durations: { developmentMs: 0, testMs: 0, reviewMs: 0, inputMs: 0, selfMs: 0 },
+      bucket: "selfMs", clockAt: Date.now(), stepStartedAt: Date.now(), delivery: null, previousMustFix: [], previousReviewCommit: null,
       testAllowance: card.limits.测试.maxRepairs, reviewAllowance: card.limits.开发评审.maxRepairs, reused: false } };
-  writeJson(join(dir, "status.json"), s); idleSleep(dir, true);
-  writeFileSync(join(dir, "checks.jsonl"), ""); writeFileSync(join(dir, "instructions.jsonl"), ""); summary(dir, s);
+  writeJson(join(dir,"status.json"),s); idleSleep(dir,true); writeFileSync(join(dir,"checks.jsonl"),""); writeFileSync(join(dir,"instructions.jsonl"),""); summary(dir,s);
   return t;
 }
 export function allTasks(root = tasksRoot()): string[] {
-  try { return readdirSync(root, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => join(root, e.name)); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  try { return readdirSync(root,{withFileTypes:true}).flatMap(e=>e.isDirectory()?[join(root,e.name)]:[]); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
 }
 export function locate(cwd: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (env.LOOP_TASK_DIR) { taskOf(env.LOOP_TASK_DIR); return resolve(env.LOOP_TASK_DIR); }
-  const current = realpathSync(cwd);
-  return allTasks(tasksRoot(env)).find((d) => inside(taskOf(d).worktree, current));
+  const current = realpathSync(cwd); return allTasks(tasksRoot(env)).find(d=>inside(taskOf(d).worktree,current));
 }
 export function inputs(t: Task) {
-  const prompt = readFileSync(t.prompt, "utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance, "utf8") : "";
-  return { prompt, acceptance, promptHash: digest(prompt), acceptanceHash: digest(acceptance) };
+  const prompt = readFileSync(t.prompt,"utf8"), acceptance = t.acceptance ? readFileSync(t.acceptance,"utf8") : ""; return {prompt,acceptance,promptHash:digest(prompt),acceptanceHash:digest(acceptance)};
 }
-export function missingChecks(dir: string, commit: string, hashes = inputs(taskOf(dir))): string[] {
-  const records = checksOf(dir).filter(c => c.commit === commit && ["复测", "评审"].includes(c.step));
-  const same = records.filter(c => c.promptHash === hashes.promptHash && c.acceptanceHash === hashes.acceptanceHash), missing: string[] = [];
-  if (!same.some(c => c.step === "复测" && ["通过", "没验证"].includes(c.result))) missing.push("复测：没有通过记录");
-  if (!same.some(c => c.step === "评审" && c.result === "通过")) missing.push("评审：没有通过记录");
+export function missingChecks(dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))): string[] {
+  const records = checksOf(dir).filter(c=>c.commit===commit && ["复测","评审"].includes(c.step)), same = records.filter(c=>c.promptHash===hashes.promptHash && c.acceptanceHash===hashes.acceptanceHash);
+  const missing = ["复测", "评审"].filter(step => !same.some(c => c.step === step && (c.result === "通过" || step === "复测" && c.result === "没验证"))).map(step => step + "：没有通过记录");
   if (missing.length && records.length !== same.length) missing.push("提示词或验收标准已变化，原检查不再算数");
   return missing;
 }
-export const checked = (dir: string, commit: string, hashes = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
+export const checked = (dir: string, commit: string, hashes: Pick<Check, "promptHash" | "acceptanceHash"> = inputs(taskOf(dir))) => missingChecks(dir, commit, hashes).length === 0;
 interface StepView { phase: Phase; message: string; complete?: boolean }
 function stepView(dir: string, view: StepView): void {
   update(dir, s => {
-    if (s.state !== "completed" && !(s.state === "input_required" && view.complete) && !(s.state === "working" && s.loop.finisher)) return;
-    if (s.state !== "working") { s.state = "completed"; s.loop.bucket = null; }
-    s.loop.wait = null; s.timeLimitSec = null; s.error = null;
-    s.loop.phase = view.phase; s.message = view.message;
+    if (s.state === "completed" || (s.state === "input_required" && view.complete)) move(s,"completed",view.phase,view.message,null);
+    else if (s.state === "working" && s.loop.finisher) move(s,"working",view.phase,view.message,s.loop.bucket);
   }, "合入（接受未验证）");
 }
 export function annotate(dir: string, phase: Phase, message: string): void { stepView(dir, {phase, message}); }
 export function recordStep(dir: string, entry: Omit<Check, "tree" | "promptHash" | "acceptanceHash">, view?: StepView): void {
-  const t = taskOf(dir); let hashes = {promptHash: "", acceptanceHash: ""};
-  try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
+  const t = taskOf(dir); let hashes = {promptHash:"",acceptanceHash:""}; try { hashes = inputs(t); } catch {} // 附加步骤不依赖提示词仍然存在。
   appendCheck(dir, {...entry, tree: gitText(t.repo, ["rev-parse", entry.commit + "^{tree}"]), promptHash: hashes.promptHash, acceptanceHash: hashes.acceptanceHash});
-  if (view) stepView(dir, view);
-  summary(dir);
+  if (view) stepView(dir, view); else summary(dir);
 }

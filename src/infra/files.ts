@@ -8,15 +8,13 @@ export function optionalJson<T>(path: string): T | undefined {
   try { return readJson<T>(path); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return; throw e; }
 }
 export function atomicWrite(path: string, text: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = path + "." + randomUUID() + ".tmp";
+  const temp = path + "." + randomUUID() + ".tmp"; mkdirSync(dirname(path), {recursive:true});
   try { writeFileSync(temp, text); renameSync(temp, path); } finally { rmSync(temp, { force: true }); }
 }
 export const writeJson = (path: string, value: unknown) => atomicWrite(path, JSON.stringify(value, null, 2) + "\n");
 export const appendJson = (path: string, value: unknown) => appendFileSync(path, JSON.stringify(value) + "\n");
 export function jsonLines<T>(path: string): T[] {
-  try { return readFileSync(path, "utf8").split("\n").filter(Boolean).map((s) => JSON.parse(s)); }
-  catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
+  try { return readFileSync(path, "utf8").split("\n").filter(Boolean).map((s) => JSON.parse(s)); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return []; throw e; }
 }
 export class BusyError extends Error {}
 /** 长锁用于同任务交付/停下，短锁保护状态读改写。失去进程的锁可恢复，释放要核对 token。 */
@@ -37,7 +35,6 @@ export function lock(path: string, waitMs = 0): () => void {
     }
   }
 }
-export function withLock<T>(path: string, action: () => T): T {
-  const release = lock(path, 2000);
-  try { return action(); } finally { release(); }
+export function withLock<T>(path: string, action: () => T, waitMs = 2000): T {
+  const release = lock(path, waitMs); try { return action(); } finally { release(); }
 }

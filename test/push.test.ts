@@ -118,7 +118,7 @@ for(const outcome of ["accepted","unknown","timeout"])test("推送：报错后�
   const path=shim(f,code),old=process.env.PATH;process.env.PATH=path;
   try {
     if(outcome==="accepted")assert.equal((await push(f.task.dir)).result,"已推送");
-    else await assert.rejects(push(f.task.dir,{timeoutMs:200}),(e:any)=>{assert.equal(e.result.result,outcome==="unknown"?"推送结果不确定":"推送失败");assert.equal(e.category,outcome==="unknown"?"未知":"临时故障");if(outcome==="unknown")assert.match(e.result.verify,/ls-remote origin refs\/heads\/dev/);return true;});
+    else await assert.rejects(push(f.task.dir,outcome==="timeout"?{timeoutMs:200}:undefined),(e:any)=>{assert.equal(e.result.result,outcome==="unknown"?"推送结果不确定":"推送失败");assert.equal(e.category,outcome==="unknown"?"未知":"临时故障");if(outcome==="unknown")assert.match(e.result.verify,/ls-remote origin refs\/heads\/dev/);return true;});
   } finally {process.env.PATH=old;}
   assert.equal(readFileSync(counter,"utf8"),outcome==="timeout"?"fetch\n":"fetch\npush\nls-remote\n");
   if(outcome==="accepted")assert.equal(gitText(remote,["rev-parse","dev"]),f.git("rev-parse","dev"));

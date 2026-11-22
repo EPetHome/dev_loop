@@ -1,4 +1,4 @@
-import { locate, fail, taskOf, statusOf, update } from "../core/store.ts";
+import { locate, fail, taskOf, statusOf, update, move } from "../core/store.ts";
 import { convention } from "./convention.ts";
 import { registerSession, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
@@ -11,8 +11,7 @@ function takeReturn(dir: string): string {
   update(dir, s => {
     if (!(s.state === "working" && s.loop.phase === "开发中") && !(s.state === "input_required" && s.loop.wait === "需手动接入会话")) return;
     reason = s.loop.pendingReturn || ""; if (!reason) return;
-    s.loop.pendingReturn = null; s.state = "working"; s.loop.phase = "开发中"; s.loop.wait = null;
-    s.loop.bucket = "developmentMs"; s.timeLimitSec = null; s.error = null; s.message = "返修要求已通过 hook 交接。\n" + reason;
+    s.loop.pendingReturn = null; move(s,"working","开发中","返修要求已通过 hook 交接。\n" + reason,"developmentMs");
   });
   return reason;
 }
@@ -26,7 +25,7 @@ export async function handleHook(event: HookEvent, eventName = event.hook_event_
       const pid = Number(event.session_pid || event.pid || process.ppid);
       if (!registerSession(dir, host, sessionIdOf(event), pid, event.transcript_path)) return "";
       return JSON.stringify({hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:
-        convention(taskOf(dir)) + "聊天不改变检查结论。\n" + takeReturn(dir)}});
+        convention(taskOf(dir)) + "\n聊天不改变检查结论。\n" + takeReturn(dir)}});
     }
     if (eventName === "PostToolUse") {
       heartbeat(dir, Date.now(), true); const reason = takeReturn(dir);

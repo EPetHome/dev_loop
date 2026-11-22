@@ -7,7 +7,7 @@ import { APP_ROOT, shellQuote } from "../infra/paths.ts";
 import { childExec, identity, alive, signalProcess, type Identity } from "../infra/exec.ts";
 import { readJson, optionalJson, writeJson } from "../infra/files.ts";
 import { randomUUID } from "node:crypto";
-import { taskOf, statusOf, waitFor, update, fail, inputs } from "../core/store.ts";
+import { taskOf, statusOf, waitFor, update, fail, inputs, launchStarted } from "../core/store.ts";
 import { prepare, heartbeat } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { startCompanion, startFinish } from "./after-settle.ts";
@@ -17,6 +17,7 @@ interface LaunchOptions {
   startupTimeoutMs?: number;
   env?: NodeJS.ProcessEnv;
   reviewOnly?: boolean;
+  confirmedCommit?: string; handoff?: boolean;
 }
 const launchFiles = (dir: string, id: string) => ({
   request: join(dir, "launch-" + id + ".json"), pid: join(dir, "launch-" + id + "-pid.json"),
@@ -87,11 +88,10 @@ function waitForSession(dir: string, id: string, timeoutMs: number): Promise<voi
   });
 }
 export async function launchSession(dir: string, resuming = false, options: LaunchOptions = {}): Promise<void> {
-  const t = taskOf(dir);
-  if (statusOf(dir).state === "cancelled") return;
-  const prompt = join(dir, "developer-prompt.md"), s = statusOf(dir);
+  const t = taskOf(dir), s = statusOf(dir), prompt = join(dir, "developer-prompt.md");
+  if (s.state === "cancelled") return;
   const opening = resuming && s.loop.pendingOpening ? s.loop.pendingReturn : null;
-  writeFileSync(prompt, convention(t) + "\n交付只提交并登记。\n\n" + inputs(t).prompt + (opening ? "\n\n## 续跑带话\n" + opening : ""));
+  writeFileSync(prompt, convention(t) + "\n\n" + inputs(t).prompt + (opening ? "\n\n## 续跑带话\n" + opening : ""));
   const session = s.loop.session;
   const args = ["--cwd", t.worktree, "--name", t.executionId,
     ...(resuming && session?.id ? ["--session", session.file || session.id] : ["--session-id", t.executionId]), prompt];
@@ -123,14 +123,20 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   update(dir, (s) => { if (s.state === "working") { s.message = "pi 开发会话已登记"; s.loop.bucket = "developmentMs"; s.timeLimitSec = null; } });
 }
 export async function launchMain(dir: string, resuming: boolean, options: LaunchOptions = {}): Promise<void> {
-  update(dir, (s) => { s.loop.launcher = identity(); });
+  let claimed = false;
+  const s = update(dir, s => {
+    if (options.handoff && (s.state !== "working" || launchStarted(s))) return;
+    s.loop.launcher = identity(); s.loop.launchStarted = claimed = true;
+  });
+  if (options.handoff && launchStarted(s)) process.send?.("started", () => {}); // 持久领取之后才应答。
+  if (!claimed) return;
   const timer = setInterval(() => heartbeat(dir),60000); timer.unref();
   try {
-    if (options.reviewOnly) {
-      const result = await settle(dir, "", undefined, true);
+    if (options.reviewOnly || options.confirmedCommit) {
+      const result = await settle(dir, "", {reviewOnly: options.reviewOnly, confirmedCommit: options.confirmedCommit});
       if (!result.continue) { await startFinish(dir, options.env || process.env); return; }
       if (taskOf(dir).host !== "pi") {
-        waitFor(dir, "需手动接入会话", "补评审需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
+        waitFor(dir, "需手动接入会话", (options.reviewOnly ? "补评审" : "确认交付后检查") + "需返修，尚未送达。请在已接入 hook 的原会话继续，或重新接入；下一次 hook 会交接返修要求。\n" + result.reason, result.reason); return;
       }
       update(dir, s => { s.loop.pendingReturn = result.reason; });
       const session = statusOf(dir).loop.session;
@@ -146,8 +152,8 @@ export async function launchMain(dir: string, resuming: boolean, options: Launch
   }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const main = process.argv[2] === "--terminal"
-    ? terminalSession(resolve(process.argv[3]), process.argv[4]).then((code) => { process.exitCode = code; })
-    : launchMain(resolve(process.argv[2]), process.argv.includes("--resume"), {reviewOnly: process.argv.includes("--review")});
+  const [target, mode, value] = process.argv.slice(2);
+  const main = target === "--terminal" ? terminalSession(resolve(mode), value).then(code => { process.exitCode = code; })
+    : launchMain(resolve(target), mode === "--resume", {reviewOnly: mode === "--review", confirmedCommit: mode === "--delivery" ? value : undefined, handoff: mode === "--handoff"});
   main.catch((e)=>{console.error(e);process.exitCode=1;});
 }
