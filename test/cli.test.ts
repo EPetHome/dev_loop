@@ -99,3 +99,15 @@ test("bin/pi-dev：sol/max、权限扩展及自己的扩展，精确恢复参数
   const resumed=execFileSync(join(ROOT,"bin/pi-dev"),["--cwd",f.repo,"--session","exact-id","--dry-run"],{env:f.env,encoding:"utf8"});
   assert.match(resumed,/--session exact-id/);assert.doesNotMatch(resumed,/--continue/);
 });
+test("bin/pi-dev：受管工作区仅有项目技能时免信任弹窗，其他项目配置沿用原流程", t => {
+  const f = fixture(t), worktree = join(f.root, "worktree");
+  write(join(worktree, ".pi/skills/verify/SKILL.md"), "# Verify\n");
+  const startup = (taskDir: string) => execFileSync(join(ROOT, "bin/pi-dev"),
+    ["--cwd", worktree, "--session", "exact-id", "--dry-run"],
+    {env: {...f.env, LOOP_TASK_DIR: taskDir}, encoding: "utf8"});
+  assert.match(startup(f.root), /--no-approve\b/);
+  assert.doesNotMatch(startup(""), /--(?:no-)?approve\b/);
+  assert.doesNotMatch(startup(f.repo), /--(?:no-)?approve\b/);
+  write(join(worktree, ".pi/extensions/pi-permission-system/config.json"), '{"yoloMode":false}');
+  assert.doesNotMatch(startup(f.root), /--(?:no-)?approve\b/);
+});

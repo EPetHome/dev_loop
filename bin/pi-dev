@@ -33,6 +33,16 @@ fi
 args=(--offline --model "$model" --thinking "$thinking"
   --no-extensions --no-mcp --no-skills --no-prompt-templates --no-themes
   --tools read,edit,write,bash -e "$permission" -e "$here/src/hosts/pi.ts")
+# Pi checks folder trust before applying --no-skills. Skip that prompt only
+# when skills are the sole project resource in this task's own worktree.
+if [[ -n "${LOOP_TASK_DIR:-}" && "$cwd" -ef "$LOOP_TASK_DIR/worktree" && -d "$cwd/.pi/skills" ]]; then
+  shopt -s dotglob
+  project_resources=("$cwd"/.pi/*)
+  shopt -u dotglob
+  if [[ ${#project_resources[@]} -eq 1 && "${project_resources[0]}" == "$cwd/.pi/skills" ]]; then
+    args+=(--no-approve)
+  fi
+fi
 [[ -z "$session" ]] || args+=(--session "$session")
 [[ -z "$sid" ]] || args+=(--session-id "$sid")
 [[ -z "$name" ]] || args+=(--name "$name")
