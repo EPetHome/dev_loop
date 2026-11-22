@@ -2,7 +2,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import childProcess, { execFileSync, spawn } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { once } from "node:events";
 import { fixture, getJson, until, write, ROOT, NODE, PASS, MUST, sq } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
@@ -291,6 +292,33 @@ setInterval(()=>{},60000);`;
   await g.run("停止");
   await until(g.dir,() => [...old.members,...next.members].every(p => !running(p)),Boolean,"等待新旧评审进程退出");
   assert.equal(g.status().state,"cancelled"); assert.deepEqual(g.tests(),originalTests);
+});
+
+test("评审必修：补评审跳过已复用的 PID/PGID，不发信号也不等无关组", async t => {
+  const g = await scene(t,{reviewer:`test -e "$LOOP_TASK_DIR/reviewer-ready" || exit 7\nprintf %s ${sq(PASS)}`});
+  g.submit(); await settle(g.dir); assert.equal(g.status().error?.category,"临时故障");
+  const originalTests = g.tests(), {reviewRequest} = resume(g.dir).status.loop; assert.ok(reviewRequest);
+  const old = {pid:700001,startedAt:"Sat Nov 21 00:00:01 2026"};
+  update(g.dir,s => { s.loop.activeProcess = old; }); write(join(g.dir,"reviewer-ready"),"");
+  const exec = childProcess.execFileSync, kill = process.kill, signals: number[] = [];
+  let leaderProbes = 0, groupProbes = 0;
+  const fakePs = t.mock.method(childProcess,"execFileSync",(...args: any[]) => {
+    const [file,argv] = args;
+    if (file === "ps" && argv[1] === String(old.pid)) { leaderProbes++; return "Sat Nov 21 00:00:02 2026\n"; }
+    if (file === "ps" && argv[0] === "-Ao") { groupProbes++; return `${old.pid} S\n`; }
+    return Reflect.apply(exec,childProcess,args);
+  });
+  const guard = t.mock.method(process,"kill",(pid: number, signal?: NodeJS.Signals | number) => {
+    if (Math.abs(pid) !== old.pid) return kill(pid,signal);
+    signals.push(pid); return true; // 只允许观察，绝不向假 PID 或 PGID 发信号。
+  });
+  syncBuiltinESMExports();
+  try { await launchMain(g.dir,false,{env:g.env,reviewRequest}); }
+  finally { fakePs.mock.restore(); guard.mock.restore(); syncBuiltinESMExports(); }
+  assert.deepEqual(signals,[]); assert.ok(leaderProbes > 0); assert.equal(groupProbes,0);
+  assert.equal(g.status().state,"completed"); assert.equal(g.status().loop.activeProcess,null);
+  assert.deepEqual(g.tests(),originalTests); assert.equal(readFileSync(join(g.dir,"order"),"utf8"),"test\nreview\nreview\nreview\n");
+  assert.equal(existsSync(join(g.dir,"opened.json")),false);
 });
 
 test("接力等复测与对应评审：同输入有旧通过也不跳过本次等待", async t => {

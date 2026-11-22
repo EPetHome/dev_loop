@@ -8,15 +8,15 @@ export const identity = (pid = process.pid): Identity => ({pid,startedAt:pid ===
 export const alive = (p?: Identity | null) => Boolean(p?.pid && p.startedAt && identity(p.pid).startedAt === p.startedAt);
 export function signalProcess(p?: Identity | null, group = false): void {
   if (!p || p.pid === process.pid || !alive(p)) return;
-  try { process.kill(group ? -p.pid : p.pid,"SIGKILL"); } catch (e) {
-    // macOS 僵尸进程组可能返回 EPERM；其他权限错误不能吞掉。
+  try { process.kill(group ? -p.pid : p.pid,"SIGKILL"); } catch (e) { // macOS 僵尸进程组可能返回 EPERM。
     const {code} = e as NodeJS.ErrnoException; if (code !== "ESRCH" && !(code === "EPERM" && ps(p.pid,"stat").startsWith("Z"))) throw e;
   }
 }
 export async function retireGroup(p: Identity) {
-  signalProcess(p,true); const deadline = Date.now()+2000; // 只向核对了身份的进程组发信号。
-  const running = (row: string) => { const [group,stat] = row.trim().split(/\s+/); return Number(group) === p.pid && stat && !stat.startsWith("Z"); };
-  for (; execFileSync("ps",["-Ao","pgid=,stat="],{encoding:"utf8"}).split("\n").some(running); await delay(25))
+  const replaced = () => { const start = identity(p.pid).startedAt; return Boolean(p.startedAt && start && start !== p.startedAt); };
+  if (replaced()) return; signalProcess(p,true); // 查不到组长不等于 PID 已复用，仍要检查旧组。
+  const deadline = Date.now()+2000, running = (row: string) => { const [group,stat] = row.trim().split(/\s+/); return Number(group) === p.pid && stat && !stat.startsWith("Z"); };
+  for (; execFileSync("ps",["-Ao","pgid=,stat="],{encoding:"utf8"}).split("\n").some(running) && !replaced(); await delay(25))
     if (Date.now() >= deadline) throw new Error("旧检查进程组仍未退出："+p.pid);
 }
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
