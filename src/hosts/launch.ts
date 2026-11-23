@@ -22,13 +22,14 @@ function launchFiles(dir: string, id: string) {
 }
 /** 在 Terminal 内保留真实 TTY；只收集 stderr，回报子进程退出及其原始错误。 */
 export async function terminalSession(dir: string, id: string): Promise<number> {
-  const t = taskOf(dir), files = launchFiles(dir,id), request = readJson<{args:string[];deadline:number}>(files.request);
+  const t = taskOf(dir), files = launchFiles(dir,id), request = readJson<{args:string[];deadline:number;sessionId?:string}>(files.request);
   let raw = "", child: ChildProcess | undefined, code = 1;
   const note = (text: string) => { raw += text; appendFileSync(files.log,text); };
   try { // 创建与发布同持状态锁：停止先发生时不会再创建会话。
     update(dir,s => {
       if (s.state !== "working" || Date.now() >= request.deadline) return;
-      child = spawn(join(APP_ROOT,"bin/pi-dev"),request.args,{cwd:t.worktree,env:{...process.env,LOOP_TASK_DIR:dir},stdio:["inherit","inherit","pipe"]});
+      child = spawn(join(APP_ROOT,"bin/pi-dev"),request.args,{cwd:t.worktree,stdio:["inherit","inherit","pipe"],
+        env: {...process.env, LOOP_TASK_DIR: dir, LOOP_PI_WINDOW_OWNER: request.sessionId ? `${process.pid}:${request.sessionId}` : undefined}});
       child.stderr!.setEncoding("utf8").on("data",(text: string) => { note(text); process.stderr.write(text); });
       if (!child.pid) return;
       const p = identity(child.pid);
@@ -80,7 +81,7 @@ export async function launchSession(dir: string, resuming = false, options: Laun
   }
   const id = randomUUID(), files = launchFiles(dir, id), timeoutMs = options.startupTimeoutMs ?? 60000;
   const deadline = Date.now() + timeoutMs, script = join(dir, "open-session.sh");
-  writeJson(files.request, {args, deadline}); writeFileSync(files.log, "");
+  writeJson(files.request, {args, deadline, sessionId: (resuming && session?.id) || t.executionId}); writeFileSync(files.log, "");
   const exports = ["PI_BIN", "PI_NODE_BIN", "PERMISSION_EXTENSION", "LOOP_CAFFEINATE_CMD"].filter((key) => env[key] !== undefined)
     .map((key) => "export " + key + "=" + shellQuote(env[key]!) + "\n").join("");
   writeFileSync(script, "#!/bin/sh\nexport LOOP_TASK_DIR=" + shellQuote(dir) + "\n" + exports + "exec " +

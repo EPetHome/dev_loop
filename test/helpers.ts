@@ -23,6 +23,8 @@ if (process.platform === "darwin") {
 }
 export const ROOT = resolve(import.meta.dirname, "..");
 export const NODE = process.execPath;
+// 仅用于测试驱动防卡死；并发复测时不能比正常多进程交接更早终止。业务超时仍由各测试显式验证。
+const FIXTURE_GUARD_MS = 60_000;
 export const PASS = "## 结论：通过\n## 必修\n无\n## 小问题\n- 建议示例\n## 需求疑问\n- 疑问示例\n## 上轮必修复查\n无\n";
 export const MUST = "## 结论：需返修\n## 必修\n1. 位置：src/app.txt:1\n   触发：输入 bad 时\n   问题：返回错误结果\n   依据：需求 A1\n   建议：修正结果\n## 小问题\n- 不要退回此建议\n## 需求疑问\n- 不要退回此疑问\n## 上轮必修复查\n无\n";
 export const getJson = <T = any>(p: string): T => JSON.parse(readFileSync(p, "utf8"));
@@ -74,7 +76,7 @@ fs.renameSync(file + '.tmp',file);\n`);
   return {base, repo, root, card, raw, git, env,
     async prepare() { task = createTask(card, root); await prepare(task.dir); return task; },
     async cli(args: string[], cwd = repo, extraEnv: NodeJS.ProcessEnv = {}) {
-      return promisify(execFile)(join(ROOT, "bin/loop"), args, {cwd, env: {...env, ...extraEnv}, timeout: options.cliTimeoutMs ?? 15000});
+      return promisify(execFile)(join(ROOT, "bin/loop"), args, {cwd, env: {...env, ...extraEnv}, timeout: options.cliTimeoutMs ?? FIXTURE_GUARD_MS});
     }
   };
 }
@@ -82,7 +84,7 @@ export const sq = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
 /** 真实 hook CLI + 宿主进程替身，不调用模型或安装插件。 */
 export async function hook(f: ReturnType<typeof fixture>, dir: string, eventName: string, event: Record<string, unknown> = {}) {
   return new Promise<{stdout: string; stderr: string}>((accept, reject) => {
-    const child = execFile(NODE, [join(ROOT, "hosts/hook.ts"), eventName], {cwd: f.repo, env: {...f.env, LOOP_TASK_DIR: dir}, timeout: 15000},
+    const child = execFile(NODE, [join(ROOT, "hosts/hook.ts"), eventName], {cwd: f.repo, env: {...f.env, LOOP_TASK_DIR: dir}, timeout: FIXTURE_GUARD_MS},
       (error, stdout, stderr) => error ? reject(error) : accept({stdout, stderr}));
     child.stdin!.end(JSON.stringify(event));
   });
@@ -96,7 +98,7 @@ export async function hostProcess(t: {after: (f: () => any) => any}) {
 // 等待夹具用真实定时器，不跟着测试里的业务时钟一起快进。
 const pollEvery = setInterval, stopPolling = clearInterval;
 /** 目录用事件，跨进程日志和临时文件用条件轮询；保留相同截止时间。 */
-export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string, timeoutMs = 12000): Promise<T> {
+export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string, timeoutMs = FIXTURE_GUARD_MS): Promise<T> {
   return new Promise((accept, reject) => {
     const signal = AbortSignal.timeout(timeoutMs);
     let watcher: ReturnType<typeof watch> | undefined, timer: ReturnType<typeof setInterval> | undefined;

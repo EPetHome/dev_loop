@@ -60,6 +60,8 @@ function initialStatus(t: Task) {
 }
 export const taskOf = (dir: string) => readJson<Task>(join(dir, "task.json"));
 export const answersOf = (dir: string) => jsonLines<{at: string; text: string}>(join(dir, "answers.jsonl"));
+export const windowNotesPath = (dir: string) => join(dir, "窗口原话.jsonl");
+export const appendWindowNote = (dir: string, text: string) => appendJson(windowNotesPath(dir), {source: "pi-tui", at: new Date().toISOString(), text});
 export const statusOf = (dir: string) => { const s = readJson<Status>(join(dir, "status.json")); s.loop.answerCount = answersOf(dir).length; return s; };
 export const launchStarted = ({loop}: Status) => Boolean(loop.launchStarted || loop.prepared || loop.launcher || loop.session);
 export const checksOf = (dir: string) => jsonLines<Check>(join(dir, "checks.jsonl"));

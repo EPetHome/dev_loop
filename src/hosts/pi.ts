@@ -1,25 +1,29 @@
-import { locate, taskOf, statusOf, update, PHASES } from "../core/store.ts";
+import { locate, taskOf, statusOf, update, PHASES, appendWindowNote } from "../core/store.ts";
 import { registerSession, heartbeat, shutdownSession } from "../core/lifecycle.ts";
 import { settle } from "../core/settle.ts";
 import { convention } from "./convention.ts";
 import { alive } from "../infra/exec.ts";
 import { contentText } from "./hook-event.ts";
 import { startFinish } from "./after-settle.ts";
-/** 只用 Pi 的公开生命周期子集；结构类型让核心测试不依赖 pi 包。 */
+import { watchPiEditor, type EditorUI } from "./pi-editor.ts";
 interface Context {
-  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean;
-  ui?: { setStatus(key: string, text?: string): void; setTitle(title: string): void };
+  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean; mode?: string; isIdle?(): boolean;
+  ui?: EditorUI & { setStatus(key: string, text?: string): void; setTitle(title: string): void };
   sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getBranch(): any[] };
 }
 interface PiAPI {
-  on(event: string, handler: (event: any, ctx: Context) => any): unknown;
+  on(event: string, handler: (event: any, ctx: Context) => any): unknown; getCommands?(): {name: string; source: string}[];
   sendMessage(message: {customType: string; content: string; display: boolean}, options?: {triggerTurn: boolean}): void;
 }
 export function registerPi(pi: PiAPI, options: {
   env?: NodeJS.ProcessEnv; every?: (callback: () => void, ms: number) => any; clear?: (timer: any) => void;
 } = {}) {
-  let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "";
-  const clearTimers = () => { for (const id of [timer,viewTimer]) if (id !== undefined) (options.clear || clearInterval)(id); timer = viewTimer = undefined; };
+  let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "", unwatch: (() => void) | undefined;
+  const env = options.env || process.env;
+  const cleanup = () => {
+    for (const id of [timer,viewTimer]) if (id !== undefined) (options.clear || clearInterval)(id);
+    timer = viewTimer = undefined; unwatch?.(); unwatch = undefined;
+  };
   const every = (fn: () => void, ms: number) => { const id = (options.every || setInterval)(fn,ms); id?.unref?.(); return id; };
   const refresh = () => {
     if (!dir) return;
@@ -38,14 +42,14 @@ export function registerPi(pi: PiAPI, options: {
     } catch {} // 外部状态暂不可读时保留显示，不干扰会话。
   };
   pi.on("session_start", (_event, ctx) => {
-    clearTimers(); context = ctx; last = "";
-    dir = locate(ctx.cwd, options.env || process.env);
-    if (!dir) return;
-    const mgr = ctx.sessionManager;
-    if (!registerSession(dir,"pi",mgr.getSessionId(),process.pid,mgr.getSessionFile?.())) { dir = undefined; ctx.shutdown?.(); return; }
-    const taskDir = dir;
+    cleanup(); context = ctx; last = "";
+    const taskDir = dir = locate(ctx.cwd, env); if (!taskDir) return;
+    const id = ctx.sessionManager.getSessionId(); if (!registerSession(taskDir, "pi", id, process.pid, ctx.sessionManager.getSessionFile?.())) { dir = undefined; ctx.shutdown?.(); return; }
+    const task = taskOf(taskDir);
+    if (task.host === "pi" && ctx.mode === "tui" && ctx.cwd === task.worktree && env.LOOP_PI_WINDOW_OWNER === `${process.ppid}:${id}`)
+      unwatch = watchPiEditor(ctx, text => appendWindowNote(taskDir, text), name => pi.getCommands?.().some(c => c.name === name && c.source === "extension") === true);
     timer = every(() => { try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：",e); } },60000);
-    const task = taskOf(dir); name = task.name; refresh(); viewTimer = every(refresh,1000);
+    name = task.name; refresh(); viewTimer = every(refresh,1000);
     pi.sendMessage({customType:"dev-loop-convention",content:convention(task),display:true});
   });
   pi.on("agent_before_settle", async (event, ctx) => {
@@ -54,11 +58,11 @@ export function registerPi(pi: PiAPI, options: {
     const last = messages.findLast((m: any) => m.role === "assistant");
     const result = await settle(dir, contentText(last?.content), {signal: ctx.signal, ending: last});
     refresh();
-    if (!result.continue) await startFinish(dir,options.env || process.env);
     if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};
+    await startFinish(dir,env);
   });
   pi.on("session_shutdown", () => {
-    clearTimers();
+    cleanup();
     if (context?.hasUI !== false) context?.ui?.setStatus("dev-loop", undefined);
     if (dir) shutdownSession(dir); dir = undefined; context = undefined;
   });

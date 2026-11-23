@@ -25,6 +25,7 @@ const object = (v: any, label: string, keys?: string) => {
   if (!isObject(v)) throw new InputError(label + " 须为对象");
   if (keys && Object.keys(v).some(k => !keys.split(" ").includes(k))) throw new InputError(label+" 有未知字段"); return v;
 };
+const only = (o: object, allowed: string[]) => Object.keys(o).every(k => allowed.includes(k));
 const text = (v: any, label: string): string => {
   if (typeof v !== "string" || !v.trim() || /[\0\r\n]/.test(v)) throw new InputError(label+" 须为非空单行字符串"); return v.trim();
 };
@@ -69,7 +70,7 @@ function reference(value: any, file: string, repo: string, label: string): strin
 }
 function limit(v: any, defaults: Limit): Limit {
   const raw = v === undefined ? {} : object(v, "limits"), out = { maxRepairs: raw.maxRepairs ?? defaults.maxRepairs, timeoutMin: raw.timeoutMin ?? defaults.timeoutMin };
-  if (Object.keys(raw).some((k) => !["maxRepairs", "timeoutMin", "maxRecoveries"].includes(k)) ||
+  if (!only(raw, ["maxRepairs", "timeoutMin", "maxRecoveries"]) ||
       !Number.isSafeInteger(out.maxRepairs) || out.maxRepairs < 0 || !Number.isSafeInteger(out.timeoutMin) || out.timeoutMin < 1) throw new InputError("限额 maxRepairs 须为非负整数、timeoutMin 须为正整数");
   return out;
 }

@@ -148,10 +148,22 @@ test("收尾崩溃转等你，可手工接手；提示词变化不重复自动�
   assert.equal(statusOf(f.task.dir).state,"completed");assert.equal(statusOf(f.task.dir).loop.phase,"已部署");assert.equal(received(f.task.dir).length,2);
 });
 test("失败返修时原会话已结束：独立进程精确恢复原 Pi 会话并保留 pendingReturn", async t => {
-  const f=await finishingFixture(t,{check:"console.log('restore reason');process.exit(7);"});update(f.task.dir,s=>{s.loop.session!.endedAt=new Date().toISOString();});
-  await settle(f.task.dir);await startFinish(f.task.dir,f.env);const openedFile=join(f.task.dir,"opened.json");
-  const opened=await until(f.task.dir,()=>getJson<{args:string[]}>(openedFile),Boolean,openedFile);
-  await until(f.task.dir,()=>statusOf(f.task.dir),s=>!s.loop.launcher && !s.loop.finisher);assert.ok(opened.args.includes("--session"));assert.ok(opened.args.includes("fake"));assert.match(statusOf(f.task.dir).loop.pendingReturn!,/restore reason/);assert.equal(statusOf(f.task.dir).loop.phase,"开发中");
+  const f = await finishingFixture(t, {check:"console.log('restore reason');process.exit(7);"}), {dir} = f.task;
+  const sessionFile = join(dir, "原 Pi 会话.jsonl");
+  update(dir, s => { s.loop.session!.endedAt = new Date().toISOString(); s.loop.session!.file = sessionFile; });
+  await settle(dir); assert.equal(statusOf(dir).loop.phase, "收尾中");
+  await startFinish(dir, f.env);
+  // 看实际的回退与重开登记；spawn 回执、工作区内的其他文件变化都不是完成信号。
+  const done = await until(dir, () => statusOf(dir), s => s.state !== "working" ||
+    Boolean(s.loop.launchStarted && !s.loop.launcher && !s.loop.finisher), join(dir,"status.json")).catch(error => {
+    for (const name of ["finish.log", "launcher.log"]) if (existsSync(join(dir, name))) t.diagnostic(`${name}: ${readFileSync(join(dir, name), "utf8").trim()}`);
+    throw error;
+  });
+  assert.equal(done.state, "working", done.error?.raw || done.message); assert.equal(done.loop.phase, "开发中");
+  assert.deepEqual(received(dir).map(c => c.name), ["deploy", "check", "rollback"]);
+  const {args} = getJson<{args:string[]}>(join(dir,"opened.json"));
+  assert.ok(args.includes("--session") && !args.includes("--session-id"));
+  assert.equal(args[args.indexOf("--session") + 1], sessionFile); assert.match(done.loop.pendingReturn!, /restore reason/);
 });
 test("flow 子序列、after/next 快照、基点覆盖；旧卡无收尾", t => {
   const f = fixture(t), first = createTask(f.card, f.root);
