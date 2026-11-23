@@ -175,14 +175,19 @@ test("项目配置错误归输入问题，不创建执行目录",async(t)=>{
   await assert.rejects(f.cli(["启动",f.card,"--json"]),e=>{assert.match((e as any).stderr,/"category":"输入问题"/);return true;});
   assert.deepEqual(readdirSync(f.root),[]);
 });
-test("默认评审调用只读、新上下文、gpt-6.2-astra/xhigh；不会加载旧 loop 或开发扩展",async(t)=>{
-  const f=fixture(t,{config:{reviewerCmd:""}}),task=await f.prepare(),bin=join(f.base,"fake-pi.cjs"),old=process.env.PI_BIN;
+test("有验证手册的项目仍按卡复测，默认评审只读、新上下文、astra/xhigh，不加载开发手册",async(t)=>{
+  const f=fixture(t,{config:{reviewerCmd:""}}), manual=".pi/skills/verify/SKILL.md";
+  write(join(f.repo,manual),"---\nname: verify\ndescription: 开发自查手册\n---\n");
+  f.git("add",manual);f.git("commit","-m","register verify skill");
+  const task=await f.prepare(),bin=join(f.base,"fake-pi.cjs"),old=process.env.PI_BIN;
   writeFixtureScript(bin,"node",'const fs=require("fs");fs.writeFileSync(process.env.LOOP_TASK_DIR+"/review-argv.json",JSON.stringify(process.argv.slice(2)));console.log('+JSON.stringify(PASS)+');\n');
   process.env.PI_BIN=bin;
   try {deliver(task.dir);await settle(task.dir);} finally {if(old===undefined)delete process.env.PI_BIN;else process.env.PI_BIN=old;}
   const args=getJson<string[]>(join(task.dir,"review-argv.json"));
   assert.equal(args[args.indexOf("--model")+1],"openai-codex/gpt-6.2-astra");assert.equal(args[args.indexOf("--thinking")+1],"xhigh");
   assert.equal(args[args.indexOf("--tools")+1],"read,grep,find,ls");
-  for(const flag of ["-p","--session-id","--no-extensions","--no-context-files","--no-mcp","--append-system-prompt"])assert.ok(args.includes(flag));
+  for(const flag of ["-p","--session-id","--no-extensions","--no-context-files","--no-skills","--no-mcp","--append-system-prompt"])assert.ok(args.includes(flag));
+  for(const flag of ["--skill","--extension","-e"])assert.ok(!args.includes(flag));
   assert.ok(args.includes(join(ROOT,"src/core/review-prompt.md")));
+  assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"test\n");
 });

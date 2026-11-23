@@ -34,8 +34,8 @@ export function writeFixtureScript(file: string, interpreter: "sh" | "node", bod
   write(file, shebang + "\n" + (direct ? "" : (sh ? "# " : "// ") + fixtureMarker + "\n") + body);
   chmodSync(file,0o755);
 }
-export function fixture(t: {after: (f: () => any) => any}, options: {test?: string; reviewer?: string; config?: any; card?: any; cliTimeoutMs?: number} = {}) {
-  const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, "tasks");
+export function fixture(t: {after: (f: () => any) => any}, options: {test?: string; reviewer?: string; config?: any; card?: any; cliTimeoutMs?: number; tasksName?: string} = {}) {
+  const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, options.tasksName ?? "tasks");
   mkdirSync(repo); mkdirSync(root);
   const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
   git("init", "--template=", "-b", "dev");

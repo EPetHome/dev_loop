@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
-import { fixture, write, until, getJson, ROOT } from "./helpers.ts";
+import { readFileSync, readdirSync, existsSync, rmSync, realpathSync, symlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fixture, write, writeFixtureScript, until, getJson, NODE, ROOT } from "./helpers.ts";
 import { statusOf, checksOf, taskOf } from "../src/core/store.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
@@ -104,23 +104,75 @@ test("停止/续跑/放弃：沿用执行号，保留分支证据，删除 workt
   assert.ok(f.git("show-ref","--verify","refs/heads/"+task.branch));assert.ok(existsSync(join(task.dir,"checks.jsonl")));
   await assert.rejects(f.cli(["续跑",id,"--json"]),/Command failed/);
 });
-test("bin/pi-dev：sol/max、权限扩展及自己的扩展，精确恢复参数，无真实模型调用",async(t)=>{
-  const f=fixture(t);
-  const text=execFileSync(join(ROOT,"bin/pi-dev"),["--cwd",f.repo,"--dry-run",join(f.repo,"prompt.md")],{env:f.env,encoding:"utf8"});
-  assert.match(text,/--model openai-codex\/gpt-6\.2-sol/);assert.match(text,/--thinking max/);assert.match(text,/pi-permission-system/);
-  assert.match(text,/src\/hosts\/pi.ts/);assert.match(text,/--no-extensions/);assert.doesNotMatch(text,/ponytail|autoreview.ts/);
-  const resumed=execFileSync(join(ROOT,"bin/pi-dev"),["--cwd",f.repo,"--session","exact-id","--dry-run"],{env:f.env,encoding:"utf8"});
-  assert.match(resumed,/--session exact-id/);assert.doesNotMatch(resumed,/--continue/);
+const piDev = join(ROOT, "bin/pi-dev"), verifyRel = ".pi/skills/verify/SKILL.md";
+const skillDoc = (name: string) => `---\nname: ${name}\ndescription: ${name} fixture\n---\n`;
+function piFixture(f: ReturnType<typeof fixture>) {
+  const bin = join(f.base, "fake-pi.cjs"), permission = join(f.base, "permission.ts");
+  write(permission, "// fixture only\n");
+  writeFixtureScript(bin, "node", `const fs = require("node:fs");
+(async () => {
+  const {registerSession, shutdownSession} = await import(${JSON.stringify(join(ROOT, "src/core/lifecycle.ts"))});
+  const task = process.env.LOOP_TASK_DIR, file = task + "/pi-argv.json";
+  if (!registerSession(task, "pi", "exact-id", process.pid, task + "/session with 空格.jsonl")) throw new Error("替身未能登记");
+  shutdownSession(task);
+  fs.writeFileSync(file + ".tmp", JSON.stringify({cwd:process.cwd(), args:process.argv.slice(2), task}));
+  fs.renameSync(file + ".tmp", file);
+})().catch(e => { console.error(e); process.exitCode = 1; });\n`);
+  const home = join(f.base, "home"), agentDir = join(home, ".pi/agent");
+  write(join(agentDir, "skills/global-only/SKILL.md"), skillDoc("global-only"));
+  return {permission, env: {...f.env, LOOP_LAUNCH_CMD:piDev, PI_BIN:bin, PI_NODE_BIN:dirname(NODE),
+    PERMISSION_EXTENSION:permission, PI_DEV_DRY_RUN:"0", HOME:home, PI_CODING_AGENT_DIR:agentDir}};
+}
+for (const hasManual of [true, false]) test(hasManual ? "开工和续跑：Pi 只收到任务工作区里已登记的验证手册（路径有空格）" : "旧项目开工：没有本工作区手册照常启动，不加载其他技能", async t => {
+  const f = fixture(t, {tasksName:"tasks with 空格"}), {env, permission} = piFixture(f);
+  write(join(f.repo, ".pi/skills/another/SKILL.md"), skillDoc("another"));
+  if (hasManual) write(join(f.repo, verifyRel), skillDoc("verify"));
+  f.git("add", ".pi"); f.git("commit", "-m", "project skills");
+  if (!hasManual) write(join(f.repo, verifyRel), skillDoc("verify")); // 原项目目录里的文件不在任务 worktree。
+  const {taskDir:dir, executionId:id} = JSON.parse((await f.cli(["启动", f.card, "--json"], f.repo, env)).stdout);
+  const worktree = taskOf(dir).worktree, file = join(dir, "pi-argv.json");
+  assert.match(worktree, / /);
+  const checkLaunch = async (session: string[]) => {
+    const got = await until(dir, () => getJson<{cwd:string; args:string[]; task:string}>(file), () => true, file);
+    assert.equal(got.cwd, realpathSync(worktree)); assert.equal(got.task, dir);
+    assert.equal(existsSync(join(worktree, verifyRel)), hasManual);
+    assert.deepEqual(got.args, ["--offline", "--model", "openai-codex/gpt-6.2-sol", "--thinking", "max",
+      "--no-extensions", "--no-mcp", "--no-skills", "--no-prompt-templates", "--no-themes",
+      "--tools", "read,edit,write,bash", "-e", permission, "-e", join(ROOT, "src/hosts/pi.ts"), "--no-approve",
+      ...(hasManual ? ["--skill", join(realpathSync(worktree), verifyRel)] : []),
+      ...session, "--name", id, "@" + join(dir, "developer-prompt.md")]);
+    const status = await until(dir, () => statusOf(dir), s => s.loop.launcher === null);
+    assert.equal(status.state, "working");
+  };
+  await checkLaunch(["--session-id", id]);
+  if (hasManual) {
+    rmSync(file);
+    await f.cli(["续跑", id, "--json"], f.repo, env);
+    await checkLaunch(["--session", join(dir, "session with 空格.jsonl")]);
+  }
 });
-test("bin/pi-dev：受管工作区仅有项目技能时免信任弹窗，其他项目配置沿用原流程", t => {
-  const f = fixture(t), worktree = join(f.root, "worktree");
-  write(join(worktree, ".pi/skills/verify/SKILL.md"), "# Verify\n");
-  const startup = (taskDir: string) => execFileSync(join(ROOT, "bin/pi-dev"),
-    ["--cwd", worktree, "--session", "exact-id", "--dry-run"],
-    {env: {...f.env, LOOP_TASK_DIR: taskDir}, encoding: "utf8"});
-  assert.match(startup(f.root), /--no-approve\b/);
-  assert.doesNotMatch(startup(""), /--(?:no-)?approve\b/);
-  assert.doesNotMatch(startup(f.repo), /--(?:no-)?approve\b/);
+test("bin/pi-dev：只选受管工作区内已提交的普通手册文件，项目权限配置不变", async t => {
+  const f = fixture(t), {env} = piFixture(f), source = join(f.repo, verifyRel);
+  write(source, skillDoc("verify")); f.git("add", verifyRel); f.git("commit", "-m", "register verify skill");
+  const {dir, worktree} = await f.prepare(), manual = join(worktree, verifyRel);
+  const startup = (taskDir: string) => execFileSync(piDev, ["--cwd", worktree, "--session", "exact-id", "--dry-run"],
+    {env: {...env, LOOP_TASK_DIR:taskDir}, encoding:"utf8"});
+  assert.match(startup(dir), /--no-approve\b/);
+  assert.match(startup(dir), /--skill /);
+  for (const taskDir of ["", f.repo]) assert.doesNotMatch(startup(taskDir), /--(?:no-)?approve\b|--skill /);
   write(join(worktree, ".pi/extensions/pi-permission-system/config.json"), '{"yoloMode":false}');
-  assert.doesNotMatch(startup(f.root), /--(?:no-)?approve\b/);
+  assert.doesNotMatch(startup(dir), /--(?:no-)?approve\b/);
+  assert.match(startup(dir), /--skill /);
+  rmSync(manual);
+  assert.doesNotMatch(startup(dir), /--skill /);
+  symlinkSync(source, manual);
+  assert.doesNotMatch(startup(dir), /--skill /);
+  rmSync(dirname(manual), {recursive:true});
+  symlinkSync(dirname(source), dirname(manual));
+  assert.doesNotMatch(startup(dir), /--skill /);
+  rmSync(dirname(manual));
+  execFileSync("git", ["rm", verifyRel], {cwd:worktree});
+  execFileSync("git", ["commit", "-m", "unregister verify skill"], {cwd:worktree});
+  write(manual, skillDoc("verify"));
+  assert.doesNotMatch(startup(dir), /--skill /);
 });
