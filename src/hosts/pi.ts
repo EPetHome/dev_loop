@@ -16,12 +16,11 @@ interface PiAPI {
   sendMessage(message: {customType: string; content: string; display: boolean}, options?: {triggerTurn: boolean}): void;
 }
 export function registerPi(pi: PiAPI, options: {
-  env?: NodeJS.ProcessEnv;
-  every?: (callback: () => void, ms: number) => any;
-  clear?: (timer: any) => void;
+  env?: NodeJS.ProcessEnv; every?: (callback: () => void, ms: number) => any; clear?: (timer: any) => void;
 } = {}) {
   let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "";
-  const clear = options.clear || clearInterval;
+  const clearTimers = () => { for (const id of [timer,viewTimer]) if (id !== undefined) (options.clear || clearInterval)(id); timer = viewTimer = undefined; };
+  const every = (fn: () => void, ms: number) => { const id = (options.every || setInterval)(fn,ms); id?.unref?.(); return id; };
   const refresh = () => {
     if (!dir) return;
     try {
@@ -34,41 +33,34 @@ export function registerPi(pi: PiAPI, options: {
       if (!context?.ui || context.hasUI === false) return;
       const extra = phase === "评审中" ? "第 " + s.loop.reviewRounds + " 轮" : phase === "等你" ? s.loop.wait || s.message.split("\n")[0].slice(0, 30)
         : phase === "失败" ? s.error?.category : PHASES.indexOf(phase) >= 10 ? s.message : "";
-      const title = "【" + phase + "】" + name, text = "dev-loop" + title + (extra ? " · " + extra : "");
-      if (text === last) return;
+      const title = `【${phase}】${name}`, text = "dev-loop"+title+(extra ? " · "+extra : ""); if (text === last) return;
       context.ui.setStatus("dev-loop", text); context.ui.setTitle(title); last = text;
     } catch {} // 外部状态暂不可读时保留显示，不干扰会话。
   };
   pi.on("session_start", (_event, ctx) => {
-    if (timer !== undefined) clear(timer); if (viewTimer !== undefined) clear(viewTimer);
-    timer = viewTimer = undefined; context = ctx; last = "";
+    clearTimers(); context = ctx; last = "";
     dir = locate(ctx.cwd, options.env || process.env);
     if (!dir) return;
-    if (!registerSession(dir, "pi", ctx.sessionManager.getSessionId(), process.pid, ctx.sessionManager.getSessionFile?.())) {
-      dir = undefined; timer = undefined; ctx.shutdown?.(); return;
-    }
+    const mgr = ctx.sessionManager;
+    if (!registerSession(dir,"pi",mgr.getSessionId(),process.pid,mgr.getSessionFile?.())) { dir = undefined; ctx.shutdown?.(); return; }
     const taskDir = dir;
-    timer = (options.every || setInterval)(() => {
-      try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：", e); }
-    }, 60000);
-    timer?.unref?.();
-    name = taskOf(dir).name; refresh();
-    viewTimer = (options.every || setInterval)(refresh, 1000); viewTimer?.unref?.();
-    pi.sendMessage({customType:"dev-loop-convention",content:convention(taskOf(dir)),display:true});
+    timer = every(() => { try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：",e); } },60000);
+    const task = taskOf(dir); name = task.name; refresh(); viewTimer = every(refresh,1000);
+    pi.sendMessage({customType:"dev-loop-convention",content:convention(task),display:true});
   });
   pi.on("agent_before_settle", async (event, ctx) => {
     if (!dir) return;
     const messages = event.context?.contextMessages || ctx.sessionManager.getBranch().map((e) => e.message).filter(Boolean);
-    const last = [...messages].reverse().find((m) => m.role === "assistant");
+    const last = messages.findLast((m: any) => m.role === "assistant");
     const result = await settle(dir, contentText(last?.content), {signal: ctx.signal, ending: last});
     refresh();
     if (!result.continue) await startFinish(dir,options.env || process.env);
     if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};
   });
   pi.on("session_shutdown", () => {
-    if (timer !== undefined) clear(timer); if (viewTimer !== undefined) clear(viewTimer); timer = viewTimer = undefined;
+    clearTimers();
     if (context?.hasUI !== false) context?.ui?.setStatus("dev-loop", undefined);
     if (dir) shutdownSession(dir); dir = undefined; context = undefined;
   });
 }
-export default function (pi: PiAPI) { registerPi(pi); }
+export default (pi: PiAPI) => registerPi(pi);

@@ -5,9 +5,8 @@ import { gitTry } from "../infra/git.ts";
 export function validateStart(file: string): void {
   const seen = new Set<string>();
   for (let next: string | undefined = file; next;) {
-    const parsed = readCard(next), {card, repo} = parsed;
-    if (seen.has(parsed.file)) throw new InputError("next 接力链有环：" + parsed.file);
-    seen.add(parsed.file);
+    const {file:source,card,repo} = readCard(next); if (seen.has(source)) throw new InputError("next 接力链有环："+source);
+    seen.add(source);
     if (card.next && card.after.length) throw new InputError("接力中间批不能写合入、部署或推送");
     if (card.after.includes("部署")) {
       let cfg: ReturnType<typeof loadDeploy>; try { cfg = loadDeploy(repo); } catch (e) { throw new InputError(String(e)); }

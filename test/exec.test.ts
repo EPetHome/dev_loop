@@ -4,7 +4,7 @@ import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { alive, identity, signalProcess } from "../src/infra/exec.ts";
+import { alive, identity, retireGroup, signalProcess } from "../src/infra/exec.ts";
 import { stop } from "../src/core/lifecycle.ts";
 import { update, statusOf } from "../src/core/store.ts";
 import { fixture, write } from "./helpers.ts";
@@ -50,6 +50,20 @@ test("进程身份只缓存本进程，外部 PID 更换仍重新核对", t => {
   assert.deepEqual(identity(), self); assert.equal(selfReads, 0);
   const first = identity(p.pid); assert.equal(alive(first), true);
   start = "reused PID"; assert.equal(alive(first), false);
+});
+for (const replaced of [false,true]) test("retireGroup：组长起初不可见，"+(replaced ? "等候时确认复用则退出" : "组内有活进程仍不放行"), async t => {
+  let groupProbes = 0;
+  const ps = t.mock.method(childProcess,"execFileSync",(file: string, args: string[]) => {
+    assert.equal(file,"ps");
+    if (args[0] === "-p") { assert.deepEqual(args,["-p",String(p.pid),"-o","lstart="]); return replaced && groupProbes ? "new identity" : ""; }
+    assert.deepEqual(args,["-Ao","pgid=,stat="]); groupProbes++; return `${p.pid} S\n`;
+  });
+  const kill = t.mock.method(process,"kill",() => assert.fail("不能向身份不明的组发信号"));
+  let now = 0; const clock = t.mock.method(Date,"now",() => now+=2000);
+  syncBuiltinESMExports();
+  try { if (replaced) await retireGroup(p); else await assert.rejects(retireGroup(p),/旧检查进程组仍未退出/); }
+  finally { clock.mock.restore(); ps.mock.restore(); kill.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(groupProbes,1);
 });
 test("signalProcess：ESRCH 仍忽略，不查询 stat", t => {
   const queried = mockPs(t, "S");

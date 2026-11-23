@@ -1,14 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
-import { fixture, write, sq, PASS, MUST, until, NODE } from "./helpers.ts";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
+import { fixture, write, writeFixtureScript, sq, PASS, MUST, until, NODE, ROOT } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { resume, registerSession } from "../src/core/lifecycle.ts";
 import { statusOf, checksOf, update, inputs, appendCheck } from "../src/core/store.ts";
 import { gitText } from "../src/infra/git.ts";
 import { launchMain } from "../src/hosts/launch.ts";
+import { lock } from "../src/infra/files.ts";
+import { operationPath } from "../src/core/run.ts";
 
 async function failed(t: Parameters<typeof fixture>[0], options: Parameters<typeof fixture>[1] = {}) {
   const f = fixture(t, {reviewer: 'if [ ! -e "$LOOP_TASK_DIR/retry-go" ]; then echo "Bad Request original" >&2; exit 7; fi; printf %s ' + sq(PASS), ...options});
@@ -73,7 +77,7 @@ for (const [name, raw, overflow] of [
   ["临时断连", "连接暂时中断，稍后再试", false],
 ] as const) test("W1 A17 / 问题单 A3：只读本次 Pi 评审结束原因 · " + name, async t => {
   const f = fixture(t, {config: {reviewerCmd: ""}}), task = await f.prepare(), bin = join(f.base, "fake-review-pi.cjs");
-  write(bin, "#!" + NODE + "\n" + `
+  writeFixtureScript(bin,"node",`
 const fs = require("fs"), path = require("path"), t = process.env.LOOP_TASK_DIR;
 const arg = name => process.argv[process.argv.indexOf(name)+1];
 const id = arg("--session-id"), dir = process.argv.includes("--session-dir") ? arg("--session-dir") : path.join(t,"legacy-review-sessions");
@@ -86,7 +90,6 @@ log("2026-test_"+id+".jsonl", id, err(oldOverflow), err(raw));
 fs.appendFileSync(path.join(t,"order"), "review\\n");
 console.log("评审未生成报告");
 `);
-  chmodSync(bin, 0o755);
   const old = process.env.PI_BIN;
   try { process.env.PI_BIN = bin; deliver(task.dir); await settle(task.dir); await settle(task.dir); }
   finally { if (old === undefined) delete process.env.PI_BIN; else process.env.PI_BIN = old; }
@@ -111,6 +114,52 @@ console.log("评审未生成报告");
     assert.equal(order, "test\nreview\nreview\n");
   }
 });
+test("评审必修：Stop 先持执行锁，当前补评审等锁后只执行一次", async t => {
+  const f = await failed(t), {dir} = f.task, {reviewRequest} = resume(dir).status.loop;
+  assert.ok(reviewRequest); write(join(dir,"retry-go"),"");
+  const held = join(dir,"stop-holds-lock"), gate = join(f.base,"stop-gate"); execFileSync("mkfifo",[gate]);
+  const stopCode = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const [path,held,gate] = process.argv.slice(1), link = fs.linkSync;
+fs.linkSync = (pending,destination) => {
+  link(pending,destination);
+  if (destination === path) { fs.writeFileSync(held,''); fs.readFileSync(gate); }
+};
+syncBuiltinESMExports();
+const {handleHook} = await import(${JSON.stringify(join(ROOT,"src/hosts/hook.ts"))});
+if (await handleHook({},'Stop')) process.exitCode=71;`;
+  const stop = spawn(NODE,["--input-type=module","-e",stopCode,operationPath(dir),held,gate],{cwd:f.repo,env:{...f.env,LOOP_TASK_DIR:dir},stdio:"inherit"});
+  const closed = once(stop,"close"); let released = false;
+  const releaseStop = () => { if (!released) { released=true; write(gate,"continue"); } };
+  try {
+    await until(dir,() => existsSync(held),Boolean);
+    assert.equal(JSON.parse(readFileSync(operationPath(dir),"utf8")).pid,stop.pid);
+    const wait = Atomics.wait, gateWait = t.mock.method(Atomics,"wait",(...args: Parameters<typeof wait>) => {
+      if (!released) { assert.equal(statusOf(dir).loop.launcher?.pid,process.pid); releaseStop(); }
+      return wait(...args);
+    });
+    try { await launchMain(dir,false,{env:f.env,reviewRequest}); } finally { gateWait.mock.restore(); releaseStop(); }
+  } finally { if (!released) stop.kill("SIGKILL"); }
+  assert.deepEqual(await closed,[0,null]);
+  assert.equal(statusOf(dir).state,"completed"); assert.equal(statusOf(dir).loop.reviewRounds,2);
+  assert.equal(readFileSync(join(dir,"order"),"utf8"),"test\nreview\nreview\nreview\n");
+  assert.equal(existsSync(join(dir,"opened.json")),false);
+});
+
+test("评审必修：补评审等待锁超时，无 launcher 时续跑沿用原请求", async t => {
+  const f = await failed(t), {dir,executionId} = f.task, {reviewRequest} = resume(dir).status.loop; assert.ok(reviewRequest);
+  const release = lock(operationPath(dir)); let now = Date.now();
+  const clock = t.mock.method(Date,"now",() => now+=3000); // 只推进等待预算，不等真实时限。
+  try { await launchMain(dir,false,{env:f.env,reviewRequest}); } finally { clock.mock.restore(); release(); }
+  const pending = statusOf(dir);
+  assert.equal(pending.loop.phase,"评审中"); assert.equal(pending.loop.launcher,null); assert.equal(pending.loop.reviewRequest,reviewRequest);
+  write(join(dir,"retry-go"),"");
+  const receipt = JSON.parse((await f.cli(["续跑",executionId,"--json"])).stdout);
+  assert.equal(receipt.reviewOnly,true); assert.equal(receipt.status.loop.reviewRequest,reviewRequest);
+  await until(dir,() => statusOf(dir),s => s.state === "completed" && !s.loop.launcher);
+  assert.equal(readFileSync(join(dir,"order"),"utf8"),"test\nreview\nreview\nreview\n");
+  assert.equal(existsSync(join(dir,"opened.json")),false);
+});
+
 test("复测没验证且日志已丢也可只补评审，通过后照常收尾", async t => {
   const f = await failed(t, {test: "无：文档无可运行检查", card: {flow: ["开发评审", "测试", "合入"]}}), {task} = f;
   rmSync(join(task.dir, "test-" + statusOf(task.dir).loop.commit + ".log")); write(join(task.dir, "retry-go"), "");
@@ -150,10 +199,22 @@ for (const live of [false, true]) test("补评审给出必修后照常返修，�
 });
 test("回执后提示词再变化，后台重核资格回开发，不补评审也不复测", async t => {
   const f = await failed(t), {task} = f;
-  assert.equal(resume(task.dir).reviewOnly, true); write(join(f.repo, "prompt.md"), "后台启动前需求又变化");
-  await launchMain(task.dir, false, {env: f.env, reviewOnly: true});
+  const request = resume(task.dir); assert.equal(request.reviewOnly,true); assert.ok(request.status.loop.reviewRequest);
+  write(join(f.repo,"prompt.md"),"后台启动前需求又变化");
+  await launchMain(task.dir,false,{env:f.env,reviewRequest:request.status.loop.reviewRequest});
   assert.equal(statusOf(task.dir).loop.phase, "开发中"); assert.ok(existsSync(join(task.dir, "opened.json")));
   assert.equal(checksOf(task.dir).filter(c => c.step === "复测").length, 1); assert.equal(statusOf(task.dir).loop.reviewRounds, 1);
+});
+test("同为评审中，旧补评审请求也不能代替新请求", async t => {
+  const f = await failed(t), {dir} = f.task, a = resume(dir).status.loop.reviewRequest; assert.ok(a);
+  await launchMain(dir,false,{env:f.env,reviewRequest:a}); assert.equal(statusOf(dir).state,"failed");
+  const b = resume(dir).status; assert.equal(b.loop.phase,"评审中");
+  assert.ok(b.loop.reviewRequest); assert.notEqual(b.loop.reviewRequest,a);
+  const checks = checksOf(dir); await launchMain(dir,false,{env:f.env,reviewRequest:a});
+  assert.deepEqual(statusOf(dir),b); assert.deepEqual(checksOf(dir),checks);
+  write(join(dir,"retry-go"),""); await launchMain(dir,false,{env:f.env,reviewRequest:b.loop.reviewRequest});
+  assert.equal(statusOf(dir).state,"completed"); assert.equal(checksOf(dir).filter(c => c.step === "复测").length,1);
+  assert.equal(existsSync(join(dir,"opened.json")),false);
 });
 test("补评审的必修仍遵守原退回上限", async t => {
   const f = await failed(t, {reviewer: 'if [ ! -e "$LOOP_TASK_DIR/retry-go" ]; then exit 7; fi; printf %s ' + sq(MUST), card: {limits: {开发评审: {maxRepairs: 1, timeoutMin: 1}}}}), {task} = f;

@@ -2,15 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync, existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { fixture, write, until, getJson, ROOT, NODE } from "./helpers.ts";
+import { fixture, write, until, getJson, ROOT } from "./helpers.ts";
 import { statusOf, checksOf, taskOf } from "../src/core/store.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
-import { resume, stop } from "../src/core/lifecycle.ts";
+import { resume } from "../src/core/lifecycle.ts";
 import { execFileSync } from "node:child_process";
 test("A1：启动先返回回执/status，后台 worktree、localFiles、setup、会话",async(t)=>{
   const f=fixture(t,{config:{setup:"node setup.cjs"},cliTimeoutMs:30000});
-  write(join(f.repo,"setup.cjs"),'const fs=require("fs");const p=process.env.LOOP_TASK_DIR;fs.writeFileSync(p+"/setup-started","yes");const done=()=>{if(fs.existsSync(p+"/release-setup")){w.close();process.exit(0);}};const w=fs.watch(p,done);done();\n');
+  write(join(f.repo,"setup.cjs"),'const fs=require("fs");const p=process.env.LOOP_TASK_DIR;const done=()=>{if(fs.existsSync(p+"/release-setup")){w.close();fs.writeFileSync(p+"/setup-finished","yes");}};const w=fs.watch(p,done);fs.writeFileSync(p+"/setup-started","yes");done();\n');
   f.git("add","setup.cjs");f.git("commit","-m","controlled setup");
   // 不计测试检出中 bin/loop 的首次执行开销；帮助不启动任务，计时仍覆盖完整的启动命令。
   await f.cli(["帮助"]);
@@ -26,6 +26,7 @@ test("A1：启动先返回回执/status，后台 worktree、localFiles、setup�
   assert.equal(initial.loop.ready,false,"收到回执时没有放行 setup");
   const started=join(dir,"setup-started");
   await until(dir,()=>existsSync(started),Boolean,started);
+  assert.equal(existsSync(join(dir,"setup-finished")),false,"回执已到，而 setup 仍被闸住");
   assert.equal(existsSync(join(dir,"opened.json")),false);
   const task=taskOf(dir);assert.ok(existsSync(join(task.worktree,".git")));
   assert.equal(f.git("show-ref","--verify","refs/heads/"+task.branch).split(" ")[0],task.baseCommit);
@@ -34,6 +35,7 @@ test("A1：启动先返回回执/status，后台 worktree、localFiles、setup�
   const openedFile=join(dir,"opened.json");
   const opened=await until(dir,()=>getJson(openedFile),v=>Boolean(v.task),openedFile);
   assert.equal(opened.cwd,task.worktree);assert.equal(opened.task,dir);
+  assert.equal(existsSync(join(dir,"setup-finished")),true,"会话只能在 setup 结束后打开");
   assert.match(readFileSync(join(dir,"developer-prompt.md"),"utf8"),new RegExp(ROOT+"/bin/loop 交付"));
   const second=JSON.parse((await f.cli(["启动",f.card,"--指令编号","start-1","--json"])).stdout);
   assert.equal(second.executionId,receipt.executionId);assert.equal(readdirSync(f.root).filter(n=>!n.endsWith(".lock")).length,1);
