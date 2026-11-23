@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawn, execFileSync } from "node:child_process";
 import { once } from "node:events";
-import { fixture, write, sq, PASS, MUST, until, getJson, NODE, ROOT } from "./helpers.ts";
+import { fixture, write, writeFixtureScript, sq, PASS, MUST, until, getJson, NODE, ROOT } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { createTask, statusOf, checksOf, update, checked } from "../src/core/store.ts";
@@ -51,14 +51,19 @@ test("连续调用失败和残缺输出都归临时故障，不放行",async(t)=
   let s=statusOf(task.dir);assert.equal(s.state,"failed");assert.equal(s.error?.category,"临时故障");assert.match(s.error!.raw,/network failure, raw detail/);
   assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"test\nreview\nreview\n");
   // 同一临时仓库的新执行验证结构残缺也不会被当作「无必修」。
-  write(join(f.repo,"reviewer.sh"),"#!/bin/sh\nprintf '## 必修\\n- src/app.txt:1 触发：bad\\n'\n");
+  writeFixtureScript(join(f.repo,"reviewer.sh"),"sh","printf '## 必修\\n- src/app.txt:1 触发：bad\\n'\n");
   f.git("add","reviewer.sh");f.git("commit","-m","malformed reviewer");
   const other=await f.prepare();deliver(other.dir);await settle(other.dir);s=statusOf(other.dir);
   assert.equal(s.state,"failed");assert.equal(s.error?.category,"临时故障");assert.equal(checked(other.dir,statusOf(other.dir).loop.commit!),false);
 });
 test("并发停下仅执行一圈；锁忙不重复检查",async(t)=>{
   const f=fixture(t,{test:"node controlled.cjs"});
-  write(join(f.repo,"controlled.cjs"),'const fs=require("fs"),p=process.env.LOOP_TASK_DIR;fs.appendFileSync(p+"/order","test\\n");fs.writeFileSync(p+"/started","yes");const w=fs.watch(p,()=>{if(fs.existsSync(p+"/release")){w.close();process.exit(0);}});\n');
+  write(join(f.repo,"controlled.cjs"),`const fs = require('node:fs'), dir = process.env.LOOP_TASK_DIR;
+fs.appendFileSync(dir + '/order','test\\n');
+const check = () => { if (fs.existsSync(dir + '/release')) watcher.close(); };
+const watcher = fs.watch(dir,check);
+fs.writeFileSync(dir + '/started','yes'); check();
+`);
   f.git("add","controlled.cjs");f.git("commit","-m","controlled test");
   const task=await f.prepare();deliver(task.dir);
   const first=settle(task.dir);await until(task.dir,()=>existsSync(join(task.dir,"started")),Boolean);
@@ -102,6 +107,28 @@ test("两进程状态并发更新，seq 不丢增量；死进程的操作锁可�
   const path=join(f.base,"dead.lock");
   execFileSync(NODE,["--input-type=module","-e",'const {lock}=await import('+JSON.stringify(join(ROOT,"src/infra/files.ts"))+');lock(process.argv[1]);',path]);
   const release=lock(path);assert.throws(()=>lock(path),BusyError);release();assert.equal(existsSync(path),false);
+  write(path,""); // 无法确认老版本留下的空锁归属，不猜测、不强删。
+  assert.throws(()=>lock(path),BusyError); assert.equal(readFileSync(path,"utf8"),"");
+});
+test("状态锁写入持有者前进程退出，不留下阻塞后续状态更新的空锁", async t => {
+  const f = fixture(t), task = await f.prepare(), before = statusOf(task.dir), path = join(task.dir,"status.lock");
+  const cut = `import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const {update} = await import(${JSON.stringify(join(ROOT,"src/core/store.ts"))});
+const write = fs.writeFileSync;
+fs.writeFileSync = (file,data,...args) => {
+  if (typeof data === 'string' && data.includes('"token":') && data.includes('"pid":') && data.includes('"startedAt":')) process.exit(71);
+  return write(file,data,...args);
+};
+syncBuiltinESMExports();
+update(process.argv[1],()=>{throw new Error('未中断锁写入');});`;
+  const worker = spawn(NODE,["--input-type=module","-e",cut,task.dir],{cwd:f.repo,env:f.env,stdio:"inherit"});
+  assert.deepEqual(await once(worker,"close"),[71,null]);
+  assert.equal(existsSync(path),false,"未写完持有者时不能发布正式锁");
+  assert.deepEqual(statusOf(task.dir),before);
+  update(task.dir,s => { s.message = "可继续"; });
+  assert.equal(statusOf(task.dir).seq,before.seq+1);
+  assert.equal(statusOf(task.dir).message,"可继续");
+  assert.equal(existsSync(path),false);
 });
 test("子进程中文长输出跨块仍保留原文",async(t)=>{
   const f=fixture(t),value="错误✓".repeat(50000),exec=childExec;
@@ -148,14 +175,19 @@ test("项目配置错误归输入问题，不创建执行目录",async(t)=>{
   await assert.rejects(f.cli(["启动",f.card,"--json"]),e=>{assert.match((e as any).stderr,/"category":"输入问题"/);return true;});
   assert.deepEqual(readdirSync(f.root),[]);
 });
-test("默认评审调用只读、新上下文、gpt-6.2-astra/xhigh；不会加载旧 loop 或开发扩展",async(t)=>{
-  const f=fixture(t,{config:{reviewerCmd:""}}),task=await f.prepare(),bin=join(f.base,"fake-pi.cjs"),old=process.env.PI_BIN;
-  write(bin,"#!"+NODE+'\nconst fs=require("fs");fs.writeFileSync(process.env.LOOP_TASK_DIR+"/review-argv.json",JSON.stringify(process.argv.slice(2)));console.log('+JSON.stringify(PASS)+');\n');
-  execFileSync("chmod",["+x",bin]);process.env.PI_BIN=bin;
+test("有验证手册的项目仍按卡复测，默认评审只读、新上下文、astra/xhigh，不加载开发手册",async(t)=>{
+  const f=fixture(t,{config:{reviewerCmd:""}}), manual=".pi/skills/verify/SKILL.md";
+  write(join(f.repo,manual),"---\nname: verify\ndescription: 开发自查手册\n---\n");
+  f.git("add",manual);f.git("commit","-m","register verify skill");
+  const task=await f.prepare(),bin=join(f.base,"fake-pi.cjs"),old=process.env.PI_BIN;
+  writeFixtureScript(bin,"node",'const fs=require("fs");fs.writeFileSync(process.env.LOOP_TASK_DIR+"/review-argv.json",JSON.stringify(process.argv.slice(2)));console.log('+JSON.stringify(PASS)+');\n');
+  process.env.PI_BIN=bin;
   try {deliver(task.dir);await settle(task.dir);} finally {if(old===undefined)delete process.env.PI_BIN;else process.env.PI_BIN=old;}
   const args=getJson<string[]>(join(task.dir,"review-argv.json"));
   assert.equal(args[args.indexOf("--model")+1],"openai-codex/gpt-6.2-astra");assert.equal(args[args.indexOf("--thinking")+1],"xhigh");
   assert.equal(args[args.indexOf("--tools")+1],"read,grep,find,ls");
-  for(const flag of ["-p","--session-id","--no-extensions","--no-context-files","--no-mcp","--append-system-prompt"])assert.ok(args.includes(flag));
+  for(const flag of ["-p","--session-id","--no-extensions","--no-context-files","--no-skills","--no-mcp","--append-system-prompt"])assert.ok(args.includes(flag));
+  for(const flag of ["--skill","--extension","-e"])assert.ok(!args.includes(flag));
   assert.ok(args.includes(join(ROOT,"src/core/review-prompt.md")));
+  assert.equal(readFileSync(join(task.dir,"order"),"utf8"),"test\n");
 });

@@ -3,6 +3,7 @@ import { taskOf, annotate, recordStep, LoopError, type Phase } from "../core/sto
 import { InputError } from "../core/card.ts";
 import { git, gitText, gitTry } from "../infra/git.ts";
 import { childExec } from "../infra/exec.ts";
+import { span } from "../infra/files.ts";
 import { shellQuote } from "../infra/paths.ts";
 const RULES: [string, RegExp][] = [
   ["私钥", /-{5}BEGIN [A-Z ]*PRIVATE KEY-{5}/],
@@ -16,11 +17,10 @@ const RULES: [string, RegExp][] = [
 export function scan(repo: string, commits: string[]): string[] {
   const hits: string[] = [];
   for (const sha of commits) {
-    const patch = git(repo, ["-c", "core.quotePath=false", "diff-tree", "-p", "-U0", "--no-renames", "--no-ext-diff", "--no-textconv", "--root", sha]);
-    const added = git(repo, ["-c", "core.quotePath=false", "diff-tree", "-r", "--name-only", "-z", "--diff-filter=A", "--no-commit-id", "--root", sha]);
-    for (const file of added.split("\0").filter(Boolean)) {
-      const name = basename(file);
-      if (/^\.env(?:\.|$)/.test(name) && ![".env.example", ".env.sample", ".env.template"].includes(name)) hits.push(sha.slice(0, 7) + " " + file + ":1 .env 文件");
+    const diff = (...args: string[]) => git(repo,["-c","core.quotePath=false","diff-tree","--root",...args,sha]), short = sha.slice(0,7);
+    const patch = diff("-p","-U0","--no-renames","--no-ext-diff","--no-textconv"), added = diff("-r","--name-only","-z","--diff-filter=A","--no-commit-id");
+    for (const file of added.split("\0")) {
+      const name = basename(file); if (/^\.env(?:\.|$)/.test(name) && ![".env.example",".env.sample",".env.template"].includes(name)) hits.push(`${short} ${file}:1 .env 文件`);
     }
     let file = "", line = 0, hunk = false;
     for (const text of patch.split("\n")) {
@@ -29,11 +29,10 @@ export function scan(repo: string, commits: string[]): string[] {
         const raw = text.slice(4), path: string = raw.startsWith('"') ? JSON.parse(raw) : raw.replace(/\t$/, "");
         file = path.startsWith("b/") ? path.slice(2) : "";
       } else if (/^@@ /.test(text)) {
-        const match = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-        if (!match) throw new Error("无法解析补丁行号");
+        const match = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text); if (!match) throw new Error("无法解析补丁行号");
         line = Number(match[1]); hunk = true;
       } else if (hunk && text.startsWith("+")) {
-        for (const [name, pattern] of RULES) if (pattern.test(text.slice(1))) hits.push(sha.slice(0, 7) + " " + file + ":" + line + " " + name);
+        for (const [name, pattern] of RULES) if (pattern.test(text.slice(1))) hits.push(`${short} ${file}:${line} ${name}`);
         line++;
       } else if (hunk && text.startsWith(" ")) line++;
     }
@@ -47,10 +46,9 @@ export async function push(dir: string, o: {timeoutMs?: number} = {}): Promise<P
   const commit = gitText(t.repo, ["rev-parse", "refs/heads/dev"]), short = commit.slice(0, 7);
   annotate(dir, "推送中", short);
   const finish = (result: string, phase: Phase, message: string, detail = "", category?: string, verify?: string): PushResult => {
-    const ended = Date.now(), r = {executionId: t.executionId, commit, result, seconds: (ended - start) / 1000, detail, ...(verify ? {verify} : {})};
-    recordStep(dir, {step: "推送", result, commit, startedAt: new Date(start).toISOString(), endedAt: new Date(ended).toISOString(), durationMs: ended - start, evidence: [], detail}, {phase, message});
-    if (category) throw new LoopError(category, detail || message, r);
-    return r;
+    const timing = span(start), r = {executionId:t.executionId,commit,result,seconds:timing.durationMs/1000,detail,...(verify ? {verify} : {})};
+    recordStep(dir,{step:"推送",result,commit,...timing,evidence:[],detail},{phase,message});
+    if (category) throw new LoopError(category,detail || message,r); return r;
   };
   const network = (args: string[], limit = timeoutMs) => childExec("git", args, {cwd: t.repo, timeoutMs: limit});
   const fetched = await network(["fetch", "--no-tags", "--prune", "--no-prune-tags", "--refmap=", "origin", "+refs/heads/*:refs/remotes/origin/*"]);

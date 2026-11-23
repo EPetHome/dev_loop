@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import fs, { chmodSync, existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
+import fs, { existsSync, readFileSync, readdirSync, unlinkSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { finish } from "../src/cli/finish.ts";
 import { join } from "node:path";
-import { fixture, write, getJson, NODE, until, PASS, sq } from "./helpers.ts";
+import { fixture, write, writeFixtureScript, getJson, until, PASS, sq } from "./helpers.ts";
 import { companion } from "../src/cli/companion.ts";
 import { comparison, releaseWorktree } from "../src/cli/inspect.ts";
 import { createTask, statusOf, checksOf, transition } from "../src/core/store.ts";
@@ -23,7 +23,7 @@ function snapshotFixture(t: Parameters<typeof fixture>[0], body?: string) {
     "snapshot.cjs":body || "const value=e.LOOP_SNAPSHOT_MODE==='scenario'?fs.readFileSync('src/app.txt','utf8').trim():fs.readFileSync(e.LOOP_REPO+'/live-value','utf8');fs.writeFileSync(e.LOOP_SNAPSHOT_OUT,JSON.stringify({value,mode:e.LOOP_SNAPSHOT_MODE}));",
     "deploy.cjs":"fs.writeFileSync(e.LOOP_REPO+'/live-value',e.LOOP_DEPLOY_COMMIT);",
     "check.cjs":""};
-  for(const [path,code] of Object.entries(scripts)){write(join(f.repo,path),"#!"+NODE+"\nconst fs=require('fs'),e=process.env;"+code+"\n");chmodSync(join(f.repo,path),0o755);}
+  for (const [path,code] of Object.entries(scripts)) writeFixtureScript(join(f.repo,path),"node","const fs=require('fs'),e=process.env;"+code+"\n");
   write(join(f.repo,"package-lock.json"),"{\"lockfileVersion\":3}\n");f.git("add",".");f.git("commit","-m","snapshot substitutes");write(join(f.repo,"live-value"),"live base");
   return f;
 }
@@ -191,7 +191,7 @@ test("W1 r2 必修3：留痕改写已跟踪源码和复测产物后失败，评�
     if (fs.readFileSync('dist/report','utf8') !== 'B\\n') throw Error('未拿到原复测产物');
     fs.writeFileSync('src/app.txt','C\\n'); fs.writeFileSync('dist/report','C\\n'); console.error('snapshot 真实失败'); process.exit(7);`);
   const repo = f.repo;
-  write(join(repo,"reviewer.sh"), '#!/bin/sh\ncat src/app.txt dist/report > "$LOOP_TASK_DIR/review-read"\n' +
+  writeFixtureScript(join(repo,"reviewer.sh"),"sh",'cat src/app.txt dist/report > "$LOOP_TASK_DIR/review-read"\n' +
     'grep -qx B src/app.txt && grep -qx B dist/report || exit 11\nprintf %s ' + sq(PASS) + '\n');
   f.raw.tasks[0].test = "mkdir -p dist; cp src/app.txt dist/report"; write(f.card,JSON.stringify(f.raw));
   f.git("add","reviewer.sh"); f.git("commit","-m","review from source and report");
@@ -216,7 +216,7 @@ for (const target of ["内部", "外部"]) test("W1 r3 必修1：留痕绝对软
   const external = join(f.base,"external-report"); write(external,"外部原文\n");
   f.raw.tasks[0].test = 'mkdir -p dist; printf "B\\n" > dist/report; ln -s ' + (target === "内部" ? '"$PWD/dist/report"' : sq(external)) + ' dist/latest';
   write(f.card,JSON.stringify(f.raw));
-  write(join(f.repo,"reviewer.sh"), '#!/bin/sh\ncat dist/report > "$LOOP_TASK_DIR/review-read"\ngrep -qx B dist/report || exit 11\nprintf %s ' + sq(PASS) + '\n');
+  writeFixtureScript(join(f.repo,"reviewer.sh"),"sh",'cat dist/report > "$LOOP_TASK_DIR/review-read"\ngrep -qx B dist/report || exit 11\nprintf %s ' + sq(PASS) + '\n');
   f.git("add","reviewer.sh"); f.git("commit","-m","review reads raw coverage report");
   const task = await f.prepare(), {commit} = deliver(task.dir); await settle(task.dir);
   const s = statusOf(task.dir), read = (name: string) => existsSync(join(task.dir,name)) ? readFileSync(join(task.dir,name),"utf8") : null;
@@ -244,7 +244,7 @@ if(process.argv.includes('--snapshot-copy')) {
   syncBuiltinESMExports();
 }`);
   const oldOptions = process.env.NODE_OPTIONS, original = fs.cpSync, epoch = Date.now();
-  process.env.NODE_OPTIONS = "--import=" + preload;
+  process.env.NODE_OPTIONS = [oldOptions,"--import="+preload].filter(Boolean).join(" ");
   t.after(() => { if (oldOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS=oldOptions; t.mock.restoreAll(); syncBuiltinESMExports(); });
   t.mock.timers.enable({apis:["Date","setTimeout"],now:epoch});
   t.mock.method(fs,"cpSync",(...args:Parameters<typeof original>)=>{

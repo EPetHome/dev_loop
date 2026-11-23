@@ -33,14 +33,22 @@ fi
 args=(--offline --model "$model" --thinking "$thinking"
   --no-extensions --no-mcp --no-skills --no-prompt-templates --no-themes
   --tools read,edit,write,bash -e "$permission" -e "$here/src/hosts/pi.ts")
-# Pi checks folder trust before applying --no-skills. Skip that prompt only
-# when skills are the sole project resource in this task's own worktree.
 if [[ -n "${LOOP_TASK_DIR:-}" && "$cwd" -ef "$LOOP_TASK_DIR/worktree" && -d "$cwd/.pi/skills" ]]; then
+  # Pi checks folder trust before applying --no-skills. Skip that prompt only
+  # when skills are the sole project resource in this task's own worktree.
   shopt -s dotglob
   project_resources=("$cwd"/.pi/*)
   shopt -u dotglob
   if [[ ${#project_resources[@]} -eq 1 && "${project_resources[0]}" == "$cwd/.pi/skills" ]]; then
     args+=(--no-approve)
+  fi
+  # Committing this one path opts in; Pi 1.3 loads it explicitly even with --no-skills.
+  verify=.pi/skills/verify/SKILL.md
+  if [[ -f "$cwd/$verify" && -r "$cwd/$verify" && -e "$cwd/.git" &&
+        ! -L "$cwd/.pi" && ! -L "$cwd/.pi/skills" && ! -L "$cwd/.pi/skills/verify" && ! -L "$cwd/$verify" ]]; then
+    case "$(git -C "$cwd" ls-tree --full-tree HEAD -- "$verify" 2>/dev/null)" in
+      100644\ blob\ *|100755\ blob\ *) args+=(--skill "$cwd/$verify");;
+    esac
   fi
 fi
 [[ -z "$session" ]] || args+=(--session "$session")

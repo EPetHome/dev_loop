@@ -2,28 +2,29 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join, dirname } from "node:path";
 import { chmodSync, existsSync, readFileSync, symlinkSync } from "node:fs";
-import { fixture, write, NODE, getJson, until } from "./helpers.ts";
+import { fixture, write, writeFixtureScript, getJson, until } from "./helpers.ts";
 import { deploy } from "../src/steps/deploy.ts";
 import { deliver } from "../src/core/deliver.ts";
-import { createTask, checksOf, statusOf, transition, type State } from "../src/core/store.ts";
+import { createTask, checksOf, statusOf, transition } from "../src/core/store.ts";
 import { loadDeploy, loadConfig } from "../src/infra/config.ts";
 function script(name: string, body = "") {
-  return "#!"+NODE+"\nconst fs=require('fs');fs.appendFileSync(process.env.LOOP_EVIDENCE_DIR+'/calls.jsonl',JSON.stringify({name:"+JSON.stringify(name)+",commit:process.env.LOOP_DEPLOY_COMMIT,repo:process.env.LOOP_REPO,evidence:process.env.LOOP_EVIDENCE_DIR,failed:process.env.LOOP_DEPLOY_FAILED,cwd:process.cwd()})+'\\n');console.log('stdout '+"+JSON.stringify(name)+");console.error('stderr '+"+JSON.stringify(name)+");\n"+body+"\n";
+  return "const fs=require('fs');fs.appendFileSync(process.env.LOOP_EVIDENCE_DIR+'/calls.jsonl',JSON.stringify({name:"+JSON.stringify(name)+",commit:process.env.LOOP_DEPLOY_COMMIT,repo:process.env.LOOP_REPO,evidence:process.env.LOOP_EVIDENCE_DIR,failed:process.env.LOOP_DEPLOY_FAILED,cwd:process.cwd()})+'\\n');console.log('stdout '+"+JSON.stringify(name)+");console.error('stderr '+"+JSON.stringify(name)+");\n"+body+"\n";
 }
-async function setup(t: Parameters<typeof fixture>[0], bodies: {cmd?: string; check?: string | false; rollback?: string | false} = {}) {
-  const cfg={cmd:"scripts/deploy.sh",...(bodies.check===false?{}:{check:"scripts/check.sh"}),...(bodies.rollback===false?{}:{rollback:"scripts/rollback.sh"})};
+async function setup(t: Parameters<typeof fixture>[0], bodies: {cmd?: string; check?: string | false; rollback?: string | false; direct?: boolean} = {}) {
+  const cfg={cmd:"scripts/deploy.cjs",...(bodies.check===false?{}:{check:"scripts/check.cjs"}),...(bodies.rollback===false?{}:{rollback:"scripts/rollback.cjs"})};
   // 客户端须等 cmd/check/rollback 三个独立进程和检出清理。这里只放宽测试外层上限，不改脚本时限。
   const f=fixture(t,{config:{deploy:cfg},cliTimeoutMs:45000});
   for(const name of ["cmd","check","rollback"] as const){
     const path=cfg[name];if(!path)continue;
-    write(join(f.repo,path),script(name,typeof bodies[name]==="string"?bodies[name]:""));chmodSync(join(f.repo,path),0o755);
+    writeFixtureScript(join(f.repo,path),"node",script(name,typeof bodies[name]==="string" ? bodies[name] : ""),{direct:bodies.direct});
   }
   f.git("add",".");f.git("commit","-m","deployment scripts");const task=await f.prepare();
   transition(task.dir,"completed","完成","ready",null);return {...f,task,cfg};
 }
 const calls=(dir: string)=>readFileSync(join(dir,"calls.jsonl"),"utf8").trim().split("\n").map(s=>JSON.parse(s));
 test("部署 A7：cmd/check 各一次、环境/日志正确、独立检出销毁，不改 dev/任务分支",async(t)=>{
-  const f=await setup(t),before=f.git("rev-parse","dev"),trees=f.git("worktree","list","--porcelain");
+  // Leave cmd/check unmarked here to retain a real executable check from CLI to Git checkout.
+  const f=await setup(t,{direct:true}),before=f.git("rev-parse","dev"),trees=f.git("worktree","list","--porcelain");
   // 当前目录脚本变更不能替代 commit 中的脚本。
   write(join(f.repo,f.cfg.cmd),"#!/bin/sh\nexit 91\n");
   const r=JSON.parse((await f.cli(["部署",f.task.executionId,"--json"])).stdout);
@@ -32,7 +33,7 @@ test("部署 A7：cmd/check 各一次、环境/日志正确、独立检出销毁
   const received=calls(r.evidenceDir);assert.deepEqual(received.map(x=>x.name),["cmd","check"]);
   for(const c of received){assert.equal(c.commit,before);assert.equal(c.repo,f.task.repo);assert.equal(c.evidence,r.evidenceDir);assert.equal(c.failed,undefined);assert.equal(existsSync(c.cwd),false);assert.equal(existsSync(dirname(c.cwd)),false);}
   assert.equal(f.git("worktree","list","--porcelain"),trees);assert.equal(f.git("rev-parse","dev"),before);assert.equal(f.git("rev-parse",f.task.branch),before);
-  const log=readFileSync(r.log,"utf8");assert.match(log,/\$ scripts\/deploy.sh[\s\S]*stdout cmd[\s\S]*stderr cmd/);assert.match(log,/\$ scripts\/check.sh/);assert.match(log,/退出码 0/);
+  const log=readFileSync(r.log,"utf8");assert.match(log,/\$ scripts\/deploy\.cjs[\s\S]*stdout cmd[\s\S]*stderr cmd/);assert.match(log,/\$ scripts\/check\.cjs/);assert.match(log,/退出码 0/);
   assert.equal(statusOf(f.task.dir).loop.phase,"已部署");assert.equal(checksOf(f.task.dir).at(-1)!.step,"部署");assert.deepEqual(checksOf(f.task.dir).at(-1)!.evidence,[r.log,r.evidenceDir]);
   assert.match(readFileSync(join(f.task.dir,"summary.md"),"utf8"),/\| 部署 \| 已部署 \|/);assert.equal(existsSync(join(f.task.dir,"order")),false);assert.equal(existsSync(join(f.task.dir,"opened.json")),false);
 });
@@ -64,7 +65,7 @@ test("部署：未登记/脚本不可执行/缺失均拒绝，不留记录或临
   const f=await setup(t),before=f.git("worktree","list","--porcelain");
   chmodSync(join(f.repo,f.cfg.cmd),0o644);f.git("add",f.cfg.cmd);f.git("commit","-m","not executable");
   const length=checksOf(f.task.dir).length,seq=statusOf(f.task.dir).seq;
-  await assert.rejects(deploy(f.task.dir),/脚本不存在或不可执行：scripts\/deploy.sh/);
+  await assert.rejects(deploy(f.task.dir),/脚本不存在或不可执行：scripts\/deploy\.cjs/);
   assert.equal(checksOf(f.task.dir).length,length);assert.equal(statusOf(f.task.dir).seq,seq);
   assert.equal(f.git("worktree","list","--porcelain").split("\n").filter(l=>l.startsWith("worktree ")).join("\n"),before.split("\n").filter(l=>l.startsWith("worktree ")).join("\n"));
   write(join(f.repo,".autoreview.json"),JSON.stringify({deploy:{cmd:"scripts/missing.sh"}}));

@@ -167,7 +167,7 @@ for (const replace of [false,true]) test("释放中断后识别工作区已移�
   assert.equal(checks.filter(c=>c.step==="合入").length,1); assert.doesNotMatch(done.message,/工作区已释放/);
 });
 test("关闭宿主不结束收尾；停止不打断部署脚本，之后不合入或推送", async t => {
-  const f = await finishingFixture(t,{cmd:"fs.writeFileSync(dir+'/started','');const w=fs.watch(dir,()=>{if(fs.existsSync(dir+'/go')){fs.writeFileSync(dir+'/script-finished','');w.close();}});"});
+  const f = await finishingFixture(t,{cmd:"const check=()=>{if(fs.existsSync(dir+'/go')){w.close();fs.writeFileSync(dir+'/script-finished','');}};const w=fs.watch(dir,check);fs.writeFileSync(dir+'/started','');check();"});
   await settle(f.task.dir);
   const host = spawn(NODE,["--input-type=module","-e",`import {startFinish} from ${JSON.stringify(join(ROOT,"src/hosts/after-settle.ts"))};await startFinish(process.env.LOOP_TASK_DIR);process.stdout.write('started');setInterval(()=>{},60000);`],{env:{...f.env,LOOP_TASK_DIR:f.task.dir},stdio:["ignore","pipe","pipe"]});
   await until(f.task.dir,()=>existsSync(join(f.task.dir,"started")),Boolean); host.kill("SIGKILL");
