@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "name": "R1-评审收敛与项目规则读取-20261124",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试"
+  ],
+  "tasks": [
+    {
+      "name": "R1-评审收敛与项目规则读取",
+      "prompt": "../../prompt/提示词-R1-评审收敛与项目规则读取.md",
+      "scope": {
+        "allow": [
+          "src/core/review-prompt.md",
+          "src/core/review-call.ts",
+          "src/core/settle.ts",
+          "src/infra/git.ts",
+          "tools/**",
+          "test/**",
+          "docs/评审/**",
+          "README.md",
+          "docs/参考-运行细节.md"
+        ]
+      },
+      "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+    }
+  ],
+  "limits": {
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20
+    },
+    "开发评审": {
+      "maxRepairs": 4,
+      "timeoutMin": 60
+    }
+  }
+}
