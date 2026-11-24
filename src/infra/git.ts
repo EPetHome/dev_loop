@@ -26,6 +26,12 @@ export const repoRoot = (cwd: string) => gitText(cwd, ["rev-parse", "--show-topl
 export const head = (cwd: string, env?: NodeJS.ProcessEnv) => gitText(cwd,["rev-parse","HEAD"],env);
 export const commitOf = (repo: string, ref: string, env?: NodeJS.ProcessEnv) => gitText(repo,["rev-parse","--verify","--end-of-options",ref+"^{commit}"],env);
 export const tree = (cwd: string, ref = "HEAD") => gitText(cwd, ["rev-parse", ref + "^{tree}"]);
+/** 只读历史树中的普通文件，不从工作区、符号链接或子模块取内容。 */
+export function historicalFile(repo: string, commit: string, path: string, env = historyEnv()): string | undefined {
+  const entry = git(repo,["ls-tree","--full-tree","-z",commit,"--",path],env);
+  const blob = /^100(?:644|755) blob ([0-9a-f]+)\t/.exec(entry);
+  if (blob && entry.slice(blob[0].length) === path+"\0") return git(repo,["cat-file","blob",blob[1]],env);
+}
 const paths = (s: string) => s.split("\0").filter(Boolean);
 const status = (cwd: string, options: string[] = [], env?: NodeJS.ProcessEnv, trackedOnly = Boolean(env)) => paths(git(cwd,
   ["--no-optional-locks",...options,"status","--porcelain=v1","-z","--no-renames",trackedOnly ? "--untracked-files=no" : "--untracked-files=all"],env));

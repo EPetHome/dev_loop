@@ -319,6 +319,48 @@ test("授权适用范围按编号集合核对：同场景、简写和已有批�
   assert(others.every(existsSync));
 });
 
+test("R1 A9：专属名单之后明确排除的单号不得借用已有授权",t=>{
+  const f=fixture(t), b=f.batch("授权排除"), criteria=join(b.d,"正式标准.md");
+  const run=f.execution(b,"excluded",now-days(1),{task:{acceptance:criteria}});
+  const excluded=f.issue("已排除",b.name,"编号：PA046\n验收项：A2"), original=read(excluded);
+  const included=["PA099","PA100"].map(id=>f.issue(id,b.name,`编号：${id}`));
+  jsonl(join(run.dir,"answers.jsonl"),[{at:at(now-1),text:"同意授权：A2"}]);
+  const check = (scope: string) => {
+    const text=`## 验收标准\n\nA2. [授权] ${scope}\n`, acceptanceHash=hash(text);
+    write(criteria,text); run.check("复测","通过",{acceptanceHash}); run.check("评审","通过",{acceptanceHash});
+    return f.run("查询");
+  };
+  const preview=check("仅用于 PA099 或 PA100，PA046 不在本次授权范围内");
+  const view=mustFind(preview.issues,v=>v.file===excluded);
+  assert.equal(view.ready,false); assert.match(view.reasons.join("\n"),/A2 .*归属冲突/);
+  assert(view.evidence.some(s=>s.file===excluded && s.line===8));
+  assert(view.evidence.some(s=>s.file===criteria && s.line===3));
+  assert.deepEqual(preview.changes.filter(c=>c.kind==="关单").map(c=>c.from).sort(),included.sort());
+  assert.equal(read(excluded),original);
+  const unclear=check("仅用于 PA099 或 PA100，PA046 是否在本次授权范围内待确认");
+  assert(!unclear.changes.some(c=>c.from===excluded),"未确认的尾句不得当作授权名单续项");
+});
+
+test("R1 A9：账号用途限制不改变条目归属或免除本单的授权",t=>{
+  const f=fixture(t), b=f.batch("授权用途"), criteria=join(b.d,"正式标准.md");
+  const run=f.execution(b,"purpose",now-days(1),{task:{acceptance:criteria}});
+  const independent=f.issue("独立单",b.name,"编号：PA046"), needsAuth=f.issue("正式账号检查",b.name,"编号：PA099");
+  const check = (scope: string) => {
+    const text=`## 验收标准\n\nA2. [授权] ${scope}\n`, acceptanceHash=hash(text);
+    write(criteria,text); run.check("复测","通过",{acceptanceHash}); run.check("评审","通过",{acceptanceHash});
+    return f.run("查询");
+  };
+  const scope="仅用于 PA099；临时账号仅用于读取数据";
+  const preview=check(scope), restricted=mustFind(preview.issues,v=>v.file===needsAuth);
+  assert.deepEqual(preview.changes.filter(c=>c.kind==="关单").map(c=>c.from),[independent]);
+  assert(!restricted.ready); assert.match(restricted.reasons.join("\n"),/A2 缺本人/);
+  assert(restricted.evidence.some(s=>s.file===criteria && s.line===3));
+  assert(!check("仅用于 PA099；本条也仅用于协调方提到的那张单").changes.some(c=>c.from===independent),"归属仍不明确时保留原单");
+  jsonl(join(run.dir,"answers.jsonl"),[{at:at(now-1),text:"同意授权：A2"}]);
+  assert(!check("仅用于 PA099；临时账号仅用于 PA046").changes.some(c=>c.from===needsAuth),"账号限制明确指向另一单时，不能放宽冲突的授权范围");
+  assert(mustFind(check(scope).issues,v=>v.file===needsAuth).ready);
+});
+
 test("结构化证明必须使用登记的旧版；未声明旧版只认开工基线",t=>{
   const f=fixture(t), b=f.batch("补证明"), historical="5".repeat(40), wrong="6".repeat(40);
   const declaration = {issue:"PA046",scenario:"S3",checkpoint:"原单重投",before:historical};
@@ -418,7 +460,8 @@ test("旧部署无时间但退回有时间；更晚已部署版照常计算七�
   const f=fixture(t), b=f.batch("两次部署"), older=f.execution(b,"old-without-time",now-days(12)); older.pass();
   older.check("部署","已部署",{endedAt:""});
   const later=f.execution(b,"later-release",now-days(10),{loop:{commit:merged,delivery:{commit:merged}}});
-  later.check("部署","已部署",{commit:merged,endedAt:at(now-days(8))});
+  // 执行乙可以早已开工；它实际开始部署的时刻晚于甲的退回。
+  later.check("部署","已部署",{commit:merged,startedAt:at(now-days(8.5)),endedAt:at(now-days(8))});
   write(b.acceptance,"状态：待验\nA1. [人工] 核对最新版本\n");
   const args=["--acceptance-ready"], unknown=f.run("查询",args).acceptances[0];
   assert.equal(unknown.deployment,"部署先后不明"); assert(!unknown.due);
@@ -558,6 +601,33 @@ test("多次试部署按尝试逐对重放；同一提交的两次补偿不混�
   }
   write(retry.index,valid); f.apply("查询",ok,args);
   assert.match(read(b.acceptance),/结束人工提醒：部署满七天/);
+});
+
+test("R1 A9：跨执行试部署区间重叠，不可凭补偿恢复七天期限",t=>{
+  const f=fixture(t), b=f.batch("补偿前后重叠"), old=f.execution(b,"live-A",now-days(10));
+  const oldEnd=now-days(8), live=join(old.dir,"deployment-A");
+  old.check("部署","已部署",{startedAt:at(oldEnd-120_000),endedAt:at(oldEnd),evidence:[live+".log",live]});
+  const retry=f.execution(b,"trial-B",now-days(9),{state:"input_required"}), trial=join(retry.dir,"deployment-B");
+  const marker=join(f.tasks,`.deployed-${hash(f.repo).slice(0,20)}.json`);
+  doc(marker,{executionId:old.id,commit,evidenceDir:live});
+  const original="状态：待验\n\nA1. [人工] 核对旧版\n"; write(b.acceptance,original);
+  const get = (start?: number) => {
+    write(retry.index,"");
+    retry.check("部署","已部署",{commit:merged,startedAt:start === undefined ? "" : at(start),endedAt:at(oldEnd+60_000),evidence:[trial+".log",trial]});
+    retry.check("合入","合入失败");
+    retry.check("退回","已退回",{commit:merged,startedAt:at(oldEnd+70_000),endedAt:at(oldEnd+80_000),evidence:[trial,join(trial,"merge-rollback.log")]});
+    return f.run("查询",["--acceptance-ready"]);
+  };
+  for (const start of [oldEnd-60_000, undefined]) {
+    const preview=get(start), view=preview.acceptances[0];
+    assert.equal(view.sevenDaysAt,null); assert(!view.due); assert(!view.deploymentRestored);
+    assert(!preview.changes.some(c=>c.kind==="结束提醒"));
+    assert([old.index,retry.index].every(file=>view.sources.some(s=>s.file===file && s.line===1)));
+    assert.equal(read(b.acceptance),original);
+  }
+  const touching=get(oldEnd).acceptances[0];
+  assert.equal(touching.deploymentExecution,old.id); assert.equal(touching.sevenDaysAt,at(oldEnd+days(7)));
+  assert.equal(touching.reason,"部署满七天");
 });
 
 test("部署缺完成时间时，仅用后续收尾证明下次开工，不推算七天",t=>{

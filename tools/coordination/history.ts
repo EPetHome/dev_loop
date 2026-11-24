@@ -181,13 +181,17 @@ type DeploymentLedger = {run: Execution; records: Deployment[]};
 type DeploymentPoint = {run: Execution; event: Deployment; index: number; earliest?: number; latest?: number};
 function deploymentPoint({run,records}: DeploymentLedger, index: number): DeploymentPoint {
   const event = records[index];
-  const earliest = event.at ?? event.began ?? records.slice(0,index).findLast(d=>d.at !== undefined)?.at ?? run.started;
+  // 跨执行用开始下界和完成上界；只有结束时间不能证明那次操作何时开始。
+  const earliest = event.began ?? records.slice(0,index).findLast(d=>d.at !== undefined)?.at ?? run.started;
   const next = records.slice(index+1).find(d=>d.began !== undefined || d.at !== undefined);
   const latest = event.at ?? next?.began ?? next?.at ?? (deployedOK(event) ? deploymentReadyBy(run,event)?.at : undefined);
-  return {run,event,index,earliest,latest};
+  return earliest !== undefined && latest !== undefined && earliest > latest ? {run,event,index} : {run,event,index,earliest,latest};
 }
 function earlier(a: DeploymentPoint, b: DeploymentPoint) {
-  return a.run === b.run ? a.index < b.index : a.latest !== undefined && b.earliest !== undefined && a.latest < b.earliest;
+  if (a.run === b.run) return a.index < b.index;
+  // 区间首尾相接有序；两个同一时点的记录仍没有唯一的先后。
+  return a.latest !== undefined && b.earliest !== undefined && a.latest <= b.earliest &&
+    !(b.latest !== undefined && a.earliest !== undefined && b.latest <= a.earliest);
 }
 
 function isCompensation(point: DeploymentPoint) {

@@ -184,7 +184,7 @@ test("有验证手册的项目仍按卡复测，默认评审只读、新上下�
   process.env.PI_BIN=bin;
   try {deliver(task.dir);await settle(task.dir);} finally {if(old===undefined)delete process.env.PI_BIN;else process.env.PI_BIN=old;}
   const args=getJson<string[]>(join(task.dir,"review-argv.json"));
-  assert.equal(args[args.indexOf("--model")+1],"openai-codex/gpt-6.2-astra");assert.equal(args[args.indexOf("--thinking")+1],"xhigh");
+  assert.equal(args[args.indexOf("--model")+1],"openai-codex/gpt-6-astra");assert.equal(args[args.indexOf("--thinking")+1],"xhigh");
   assert.equal(args[args.indexOf("--tools")+1],"read,grep,find,ls");
   for(const flag of ["-p","--session-id","--no-extensions","--no-context-files","--no-skills","--no-mcp","--append-system-prompt"])assert.ok(args.includes(flag));
   for(const flag of ["--skill","--extension","-e"])assert.ok(!args.includes(flag));

@@ -9,7 +9,7 @@ import { taskOf, statusOf, update, move, waitFor, waiting, inputs, sameInputs, c
 import { checkAttempt, checkWorktree, clearCheck, operationPath, projectCommand } from "./run.ts";
 import { copyLocalFiles, heartbeat, retryReview, recordedAttempt, environmentMessage, environmentAcceptable } from "./lifecycle.ts";
 import { planE2e, e2eResult } from "./e2e.ts";
-import { executeStaticReview, windowNoteMaterial } from "./review-call.ts";
+import { executeStaticReview, projectReviewMaterial, windowNoteMaterial } from "./review-call.ts";
 import { onTaskBranch, undeliveredCommit } from "./deliver.ts";
 import { reviewTestSummary, clip, legacyResult } from "./test-summary.ts";
 import { snapshot, differences } from "./snapshot.ts";
@@ -131,7 +131,7 @@ export async function settle(dir: string, lastReply = "", {signal, reviewRequest
       const [,lines,...path] = entry.split("\t"); return `${path.join("\t")}（${lines === "-" ? "二进制，行数不适用" : `原 ${lines} 行`}）`;
     });
     const material = ["## 提示词原文", prompt, ...(acceptance ? ["## 验收标准", acceptance] : []),
-      "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff("--no-renames","--diff-filter=d") || "（无改动）",
+      projectReviewMaterial(t.repo,t.baseCommit), "## 本轮改动", !sameRequirement && previous.previousReviewCommit ? "需求已变化，以下为起点至本次交付的完整 diff。" : "", diff("--no-renames","--diff-filter=d") || "（无改动）",
       "## 删除的文件", deleted.join("\n") || "无", "## 新增文件", diff("--name-only","--diff-filter=A","-z").split("\0").filter(Boolean).join("\n") || "无",
       "## 运行差异", git(cwd,["diff","--name-only",t.baseCommit,commit,"--"]), e2e ? "场景证据见复测摘要" : differences(join(dir,"snapshot-base.json"),runtime),
       "## 开发方交付说明", delivery.note || lastReply || "（无）", "## 本人答复", answersOf(dir).map(a => a.at + "\n" + a.text).join("\n\n") || "无",

@@ -114,25 +114,40 @@ type ScopeIds = {issues: Set<string>; scenes: Set<string>};
 const scopeIds = (s: string): ScopeIds => ({issues:new Set(issueIdsIn(s)),scenes:new Set(sceneIds(s))});
 const scopeSelector = /^[\s\[({「『【“"']*(?:(?:问题单|单号|场景|路径)(?:编号)?\s*:?\s*)?[\s\[({「『【“"']*([A-Z]{2,}\d+|S\d+)\b/;
 const scopeSeparator = /^[\s\])}」』】”"']*(?:(?:[、,/+&]|以及|或者|和|与|及|或)[\s\])}」』】”"']*)*/;
-
-/** 普通编号与场景是关联线索；“仅/只”名单单独保留，关联线索不能扩张名单。 */
-function acceptanceScope(text: string) {
-  const normalized = text.normalize("NFKC"), limits: ScopeIds[] = [];
-  let unparsed = false;
-  for (const match of normalized.matchAll(/(?:仅|只)(?:限于?|适用于?|用于|针对|对)\s*:?\s*/g)) {
-    const limit = scopeIds("");
-    let remaining = normalized.slice(match.index + match[0].length), found = scopeSelector.exec(remaining);
-    if (!found) { unparsed = true; continue; }
-    while (found) {
-      const id = found[1];
-      (/^S\d+$/.test(id) ? limit.scenes : limit.issues).add(id);
-      remaining = remaining.slice(found[0].length).replace(scopeSeparator,"");
-      found = scopeSelector.exec(remaining);
-    }
-    if (/^(?:等(?!级)|\.\.\.|…|除外|以外|不含)/.test(remaining)) unparsed = true;
-    limits.push(limit);
+const restriction = /(?:仅|只)(?:限于?|适用于?|用于|针对|对)\s*:?\s*/g;
+function scopeList(remaining: string) {
+  const ids: string[] = [];
+  for (let m; (m = scopeSelector.exec(remaining)); ) {
+    ids.push(m[1]); remaining = remaining.slice(m[0].length).replace(scopeSeparator,"");
   }
-  return {...scopeIds(normalized), limits, unparsed};
+  return {ids:scopeIds(ids.join(" ")), found:ids.length > 0, remaining};
+}
+
+/** 普通编号与场景是关联线索；专属名单、排除项和账号用途各自解释。 */
+function acceptanceScope(text: string) {
+  const excluded = scopeIds(""), limits: ScopeIds[] = [];
+  const normalized = text.normalize("NFKC").replace(criterion,"").replace(authTag,"").replace(/(^|[,;。!?\n])([^,;。!?\n]+)/g, (full, _separator, clause: string) => {
+    const {ids,remaining} = scopeList(clause.replace(/^\s*其中\s*/,""));
+    if (/^(?:不在|不属于)(?:(?:本次|这次|此次|本批)\s*)?授权范围(?:内)?[.\s]*$/.test(remaining)) {
+      for (const id of ids.issues) excluded.issues.add(id);
+      for (const id of ids.scenes) excluded.scenes.add(id);
+      return ";";
+    }
+    const use = [...clause.matchAll(restriction)];
+    if (use.length === 1) {
+      const {index} = use[0], subject = clause.slice(0,index), purpose = clause.slice((index ?? 0)+use[0][0].length);
+      // 只有明确说账号用途、没有指向单号或场景时才与条目归属分开。
+      if (/(?:账号|账户)\s*$/.test(subject) && !/\b(?:[A-Z]{2,}\d+|S\d+)\b|问题单|单号|本单|那张单|场景|授权范围/.test(purpose)) return `;${subject};`;
+    }
+    return full;
+  });
+  let unparsed = false;
+  for (const match of normalized.matchAll(restriction)) {
+    const {ids,found,remaining} = scopeList(normalized.slice(match.index+match[0].length));
+    if (!found || /^(?:等(?!级)|\.\.\.|…|除外|以外|不含|不在|不属于|是否)/.test(remaining)) unparsed = true;
+    if (found) limits.push(ids);
+  }
+  return {...scopeIds(normalized), normalized, limits, excluded, unparsed};
 }
 const criterion = /^(?:[-*+]\s+)?(A\d+)[.．、)）]\s*/;
 const authTag = /\[授权\]|【授权】/;
@@ -189,7 +204,8 @@ function relateScope(text: string, issue: Issue, targets: string[], batchIssueId
   const names = [issue.name, ...targets.flatMap(t=>t.split(" / "))].filter(t=>t && !/^S\d+$/.test(t));
   const ownIssue = (ids: Set<string>) => issue.ids.some(id=>ids.has(id));
   const ownScene = (ids: Set<string>) => [...ids].some(id=>scenes.has(id));
-  const matches = ownIssue(scope.issues) || ownScene(scope.scenes) || names.some(name=>text.includes(name));
+  const matches = ownIssue(scope.issues) || ownScene(scope.scenes) || names.some(name=>scope.normalized.includes(name.normalize("NFKC")));
+  if (ownIssue(scope.excluded.issues) || ownScene(scope.excluded.scenes)) return matches ? "归属冲突" : "明确排除";
   if (scope.unparsed) return matches ? "归属冲突" : "范围无法确认";
   const excludes = scope.limits.some(limit=>limit.issues.size && !ownIssue(limit.issues) || limit.scenes.size && scenes.size && !ownScene(limit.scenes));
   if (excludes) return matches ? "归属冲突" : "明确排除";
