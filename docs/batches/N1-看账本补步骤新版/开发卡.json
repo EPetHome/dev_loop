@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "name": "N1-看账本补步骤新版",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试"
+  ],
+  "tasks": [
+    {
+      "name": "N1-看账本补步骤新版",
+      "prompt": "../../prompt/提示词-N1-看账本补步骤新版.md",
+      "scope": {
+        "allow": [
+          "src/**",
+          "bin/**",
+          "config/**",
+          "test/**",
+          "README.md",
+          "docs/参考-运行细节.md",
+          "package.json"
+        ]
+      },
+      "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+    }
+  ],
+  "limits": {
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20
+    },
+    "开发评审": {
+      "maxRepairs": 5,
+      "timeoutMin": 60
+    }
+  }
+}

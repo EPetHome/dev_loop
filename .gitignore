@@ -1,3 +1,5 @@
 .pi/tasks/
 issues/
 .DS_Store
+
+.dev-loop-coord/
