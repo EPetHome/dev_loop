@@ -1,12 +1,70 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
-import { copyFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { fixture, write, sq, MUST, PASS } from "./helpers.ts";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { fixture, write, sq, MUST, PASS, ROOT } from "./helpers.ts";
 import { deliver } from "../src/core/deliver.ts";
 import { settle } from "../src/core/settle.ts";
 import { checksOf, statusOf } from "../src/core/store.ts";
 import { git } from "../src/infra/git.ts";
+import { parseReview } from "../src/core/review-parse.ts";
+
+test("R1 A5：必修模板与解析器约定的触发标签和路径行号一致", () => {
+  const rules = readFileSync(join(ROOT,"src/core/review-prompt.md"),"utf8");
+  const format = /^- `## 必修`：(.+)\r?\n([^\r\n]+)/m.exec(rules);
+  assert.ok(format, "必修标题下须有格式说明和分行模板");
+  assert.match(format[1], /`触发：`/);
+  assert.match(format[2], /`触发：[^`]+`/);
+  assert.match(format[2], /`位置：相对路径:行(?:或起-止)?`/);
+  const example = [...format[2].matchAll(/`([^`]+)`/g)].map(m=>m[1].replace(/相对路径:行(?:或起-止)?/,"src/app.ts:12-18"));
+  const parsed = parseReview("## 必修\n1. " + example.join("\n   ") + "\n## 小问题\n无\n");
+  assert.deepEqual(parsed, {ok:true, review:{mustFix:[example.join(" ")]}});
+});
+
+const projectRules = (input: string) => input.split("## 项目评审规则\n\n")[1]?.split("\n\n## 本轮改动")[0];
+
+test("R1 A6：评审只拼开工提交的 REVIEW.md 和仓库内相对链接全文", async t => {
+  const f = fixture(t), rules = ["# 起点规则", "", "[规范](./docs/规范.md#一 \"条目\")", "[同文件](docs/./规范.md)",
+    "[引用规范][ref]", "[ref]: <docs/另一 条.md>", "[编码](docs/编码%20名.md)",
+    `[绝对](<${join(f.base,"abs.md")}>)`, "[仓库内绝对](/docs/规范.md)", "[上级](../abs.md)", "[网址](https://example.invalid/ignore)",
+    "[链接文件](docs/symlink.md)", "[目录](docs/)", "`[内联示例](docs/示例.md)`", "```md", "[示例](docs/示例.md)", "```", ""].join("\n");
+  const standard = "# 一\n\n完整规则一\n\n完整规则二（含结尾）\n[不递归](不递归.md)\n";
+  write(join(f.base,"abs.md"),"ABSOLUTE-SECRET");
+  write(join(f.repo,"REVIEW.md"),rules); write(join(f.repo,"docs/规范.md"),standard);
+  write(join(f.repo,"docs/另一 条.md"),"REFERENCE-LINK"); write(join(f.repo,"docs/编码 名.md"),"ENCODED-LINK");
+  write(join(f.repo,"docs/示例.md"),"EXAMPLE-NOT-RULE"); write(join(f.repo,"docs/不递归.md"),"NESTED-NOT-RULE");
+  symlinkSync(join(f.base,"abs.md"),join(f.repo,"docs/symlink.md"));
+  f.git("add","."); f.git("commit","-m","base rules");
+  const task = await f.prepare();
+  write(join(f.repo,"REVIEW.md"),"LATE-REVIEW\n"); write(join(f.repo,"docs/规范.md"),"LATE-LINK\n");
+  f.git("commit","-am","new rules on dev");
+  write(join(task.worktree,"src/app.txt"),"good new delivery\n"); deliver(task.dir); await settle(task.dir);
+  const input = readFileSync(join(task.dir,"review-input-r1.md"),"utf8"), section = projectRules(input);
+  assert.ok(section?.includes(rules)); assert.ok(section.includes(standard));
+  assert.deepEqual(section.match(/^### .+$/gm)?.sort(),["### REVIEW.md","### docs/规范.md","### docs/另一 条.md","### docs/编码 名.md","### docs/symlink.md"].sort());
+  assert.match(section,/REFERENCE-LINK/); assert.match(section,/ENCODED-LINK/);
+  assert.doesNotMatch(input,/LATE-REVIEW|LATE-LINK|ABSOLUTE-SECRET|EXAMPLE-NOT-RULE|NESTED-NOT-RULE/);
+  assert.equal(statusOf(task.dir).state,"completed");
+});
+
+test("R1 A7：没有 REVIEW.md 和起点缺链接文件均继续评审", async t => {
+  for (const hasRoot of [false,true]) {
+    const f = fixture(t);
+    if (hasRoot) {
+      write(join(f.repo,"REVIEW.md"),"[还未提交](rules/later.md)\n"); f.git("add","REVIEW.md"); f.git("commit","-m","missing link");
+    }
+    const task = await f.prepare();
+    write(join(f.repo,"rules/later.md"),"ONLY-IN-LATER-TREE\n");
+    f.git("add","rules/later.md"); f.git("commit","-m","later content");
+    write(join(task.worktree,"src/app.txt"),"good with optional rules\n"); deliver(task.dir); await settle(task.dir);
+    const input = readFileSync(join(task.dir,"review-input-r1.md"),"utf8"), section = projectRules(input);
+    if (hasRoot) assert.match(section!,/### rules\/later\.md\n\n起点版本里没有/);
+    else assert.equal(section,"无");
+    assert.doesNotMatch(input,/ONLY-IN-LATER-TREE/);
+    assert.equal(statusOf(task.dir).state,"completed");
+    assert.equal(checksOf(task.dir).find(c=>c.step === "评审")?.result,"通过");
+  }
+});
 
 function keepMaterial(label: string, paths: string[]) {
   const root = process.env.LOOP_W1_EVIDENCE; if (!root) return;
