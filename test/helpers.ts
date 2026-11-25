@@ -12,6 +12,7 @@ import { report } from "../src/core/view.ts";
 import { binding, evidence } from "../src/core/inputs.ts";
 import { state } from "../src/core/state.ts";
 import { tick } from "../src/cli/tick.ts";
+import { alive } from "../src/infra/exec.ts";
 process.env.LOOP_CAFFEINATE_CMD="/usr/bin/true";
 if (process.platform==="darwin" && execFileSync("/bin/sh",["-c","command -v git"],{encoding:"utf8"}).trim()==="/usr/bin/git") process.env.PATH=dirname(execFileSync("/usr/bin/xcrun",["--find","git"],{encoding:"utf8"}).trim())+":"+process.env.PATH;
 export const ROOT=resolve(import.meta.dirname,".."), NODE=process.execPath;
@@ -89,7 +90,7 @@ export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer
           if (step!==progress) {progress=step;lastChange=now;}
           if (now>=deadline || now-lastChange>=idleMs) break;
           const {running,queued}=state(l,false);
-          if (!running && !queued) await pulse();
+          if (!queued && (!running || running.intent && !alive(running.owner))) await pulse();
           if (generation!==observed) continue;
           // 账本写入立即推进；没写账本就退出的进程及外部就绪文件由低频探测接住。
           await new Promise<void>(resolve=>{

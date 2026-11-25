@@ -40,7 +40,8 @@ export function state(l:Ledger, evaluate=true) {
   const accepted=acceptanceOf(rows,commit), receipt=rows.findLast(r=>r.type==="收货" && r.sha===commit && r.result==="成功" && r.value?.reused);
   const todo=rows.filter(r=>r.todo && r.n>Math.max(last,accepted?.n || 0) && !(r.type==="答复" && r.n<(receipt?.n || 0))),
     sent=rows.filter(r=>r.type==="送达" && r.ref===window?.n), sentIds=new Set(sent.flatMap(r=>r.sent || []));
-  const undelivered=todo.filter(r=>!sentIds.has(r.n)), starts=pendingStarts(l), running=starts.find(r=>r.step!=="收货" && alive(r.owner));
+  const undelivered=todo.filter(r=>!sentIds.has(r.n)), starts=pendingStarts(l);
+  const running=starts.find(r=>r.step!=="收货" && (r.step==="合入" && r.intent || alive(r.owner)));
   const notified=new Set(rows.filter(r=>r.type==="合入送达").map(r=>r.ref));
   const mergeNotices=rows.filter(r=>r.type==="合入" && r.intent && !notified.has(r.n));
   const schedule=rows.findLast(r=>r.type==="调度" && r.owner),

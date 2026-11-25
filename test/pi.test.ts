@@ -1,16 +1,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerPi } from "../src/hosts/pi.ts";
 import { Ledger, locked, type Entry, type Task } from "../src/core/store.ts";
 import { binding } from "../src/core/inputs.ts";
-import { identity } from "../src/infra/exec.ts";
-import { fixture, write, until, PASS, sq } from "./helpers.ts";
+import { alive, identity } from "../src/infra/exec.ts";
+import { fixture, write, writeFixtureScript, until, PASS, sq } from "./helpers.ts";
 
-function windowView(x: Task, receiveMessages = false) {
+function windowView(x: Task, receiveMessages = false, persist = appendFileSync) {
   const start = locked(x.dir, l => l.add({type: "开始", step: "开窗口"}));
+  const file = write(join(x.dir, "sessions", "test-session.jsonl"), '{"type":"session","id":"test-session"}\n');
   let refresh: (() => void) | undefined, title: string | undefined, status: string | undefined;
   const messages: string[] = [], branch: unknown[] = [];
   const ctx = {
@@ -19,7 +20,7 @@ function windowView(x: Task, receiveMessages = false) {
       setTitle: (text: string) => { title = text; },
       setStatus: (key: string, text?: string) => { assert.equal(key, "dev-loop"); status = text; }
     },
-    sessionManager: {getSessionId: () => "test-session", getSessionFile: () => undefined, getBranch: () => branch},
+    sessionManager: {getSessionId: () => "test-session", getSessionFile: () => file, getBranch: () => branch},
     shutdown: () => assert.fail("窗口不应关闭")
   };
   const handlers = new Map<string, (event: unknown, context: typeof ctx) => unknown>();
@@ -27,8 +28,12 @@ function windowView(x: Task, receiveMessages = false) {
     assert(receiveMessages, "本用例只刷新标题");
     assert.equal(m.display, true);
     assert.equal(opts.triggerTurn, false, "通知不应另开模型轮次");
+    // Pi 先更新内存，写入失败由宿主捕获；只有存入会话才发出显示事件。
+    const entry = {type: "custom_message", ...m};
+    branch.push(entry);
+    try { persist(file, JSON.stringify(entry) + "\n"); }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOSPC") return; throw e; }
     messages.push(m.content);
-    branch.push({type: "custom_message", ...m});
   }}, {
     env: {LOOP_TASK_DIR: x.dir, LOOP_WINDOW_JOB: String(start.n), LOOP_PI_WINDOW_OWNER: String(process.ppid),
       LOOP_EXPECT_SESSION: "test-session", LOOP_WAKE: "manual"},
@@ -103,8 +108,8 @@ test("N3 · Pi 显示等你、本人中止和正在运行的工具", async t => 
 });
 
 const quoteIntents = (l: Ledger) => l.rows.filter(r => r.type === "合入意图");
-const receipt = async (f: ReturnType<typeof fixture>) => {
-  const x = await f.prepare(), view = windowView(x, true);
+const receipt = async (f: ReturnType<typeof fixture>, persist?: typeof appendFileSync) => {
+  const x = await f.prepare(), view = windowView(x, true, persist);
   write(join(x.worktree, "src/app.txt"), "window merge candidate\n");
   const {commit} = await f.call(["交付"], x.worktree, {LOOP_TASK_DIR: x.dir});
   await f.call(["复测", x.executionId]);
@@ -157,14 +162,20 @@ for (const applied of [true, false]) test(`N4 返修 2 · 合入 worker 在快�
   const f = fixture(t), tipFile = join(f.base, "intended-merge");
   const shim = write(join(f.base, "kill-window-merge.mjs"), `
 import cp from 'node:child_process'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
-const spawn=cp.spawnSync, tipFile=${JSON.stringify(tipFile)};
-cp.spawnSync=(cmd,args,...opts)=>{
-  if(cmd==='git' && args[0]==='merge' && args.includes('--ff-only') && !fs.existsSync(tipFile)) {
-    ${applied ? "const result=spawn(cmd,args,...opts); if (result.status!==0) return result;" : ""}
-    fs.writeFileSync(tipFile,args.at(-1)); process.kill(process.pid,'SIGKILL');
+const spawn=cp.spawn, append=fs.appendFileSync, tipFile=${JSON.stringify(tipFile)};
+function interrupt(tip) { fs.writeFileSync(tipFile,tip); process.kill(process.pid,'SIGKILL'); }
+${applied ? `fs.appendFileSync=(path,bytes,...opts)=>{
+  if (String(path).endsWith('/ledger.jsonl') && String(bytes).includes('"type":"合入"') && !fs.existsSync(tipFile)) {
+    const row=JSON.parse(bytes);
+    if (row.intent && row.result==='成功') interrupt(row.value.devAfter);
   }
-  return spawn(cmd,args,...opts);
-}; syncBuiltinESMExports();`);
+  return append(path,bytes,...opts);
+};` : `cp.spawn=(cmd,args,opts)=>{
+  const p=spawn(cmd,args,opts);
+  if (args?.[2]==='dev-loop-start' && args[3]==='git' && args.includes('--ff-only') && !fs.existsSync(tipFile)) interrupt(args.at(-1));
+  return p;
+};`}
+syncBuiltinESMExports();`);
   f.env.NODE_OPTIONS = [f.env.NODE_OPTIONS, `--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
   const {x, view, commit} = await receipt(f), before = f.git("rev-parse", "dev");
   await complete(f, x);
@@ -255,6 +266,84 @@ test("N4 · 在等本人或 Esc 中止时说合入，解除等待但不补成合
   assert.equal(l.last("合入"), undefined);
   assert.equal(f.git("rev-parse", "dev"), before);
   assertWindow(view, x, "完成");
+});
+
+test("N4 复审 1 · 合入进程未退出时 tick 不下结论，快进后只补原提交号", async t => {
+  const f = fixture(t), {x, view, commit} = await receipt(f), before = f.git("rev-parse", "dev");
+  await complete(f, x);
+  const ready = join(f.base, "git-holds-ref"), go = join(f.base, "allow-git"), hooks = join(f.base, "hooks");
+  // Git 自己在更新本地 dev 前通知 prepared。暂停的是这一笔真实的引用事务。
+  writeFixtureScript(join(hooks, "reference-transaction"), "sh", `
+if [ "$1" = prepared ]; then
+  while read -r old new ref; do [ "$ref" != refs/heads/dev ] || printf '%s' "$new" > ${sq(ready)}; done
+  if [ -s ${sq(ready)} ]; then while [ ! -e ${sq(go)} ]; do sleep .03; done; fi
+fi
+exit 0
+`);
+  f.git("config", "core.hooksPath", hooks);
+  view.input("合入");
+  let tip = "";
+  try {
+    const l = await f.pump(x.dir, () => existsSync(ready) && !!readFileSync(ready, "utf8"));
+    tip = readFileSync(ready, "utf8");
+    const merge = l.rows.findLast(r => r.type === "开始" && r.step === "合入")!;
+    process.kill(merge.owner!.pid, "SIGKILL");
+    await until(x.dir, () => alive(merge.owner), v => !v);
+    await tickTwice(f);
+    assert.equal(f.git("rev-parse", "dev"), before);
+    const pending = new Ledger(x.dir);
+    assert.equal(pending.last("合入"), undefined, "Git 未退出时不可登记最终结论");
+    const git = pending.rows.find(r => r.type === "子进程" && r.ref === merge.n);
+    assert(alive(git?.owner), "已登记的 Git 仍在执行原快进");
+    assertWindow(view, x, "收尾中", " · 正在合入");
+    assert.deepEqual(view.messages, []);
+  } finally { write(go, ""); }
+  const l = await f.pump(x.dir, l => !!l.last("合入"));
+  assert.equal(l.last("合入")!.result, "成功");
+  assert.equal(l.last("合入")!.value.devAfter, tip);
+  assert.equal(f.git("rev-parse", "dev"), tip);
+  assert.equal(f.git("rev-parse", "dev^2"), commit);
+  assertWindow(view, x, "已合入");
+  assert.equal(view.messages.length, 1);
+  assert(view.messages[0].includes(tip));
+  await tickTwice(f);
+  const again = new Ledger(x.dir);
+  assert.equal(quoteIntents(again).length, 1);
+  assert.equal(again.rows.filter(r => r.type === "开始" && r.step === "合入").length, 1);
+  assert.equal(again.rows.filter(r => r.type === "合入").length, 1);
+  assert.equal(f.git("rev-list", "--count", "--merges", "dev"), "1");
+});
+
+test("N4 复审 2 · Pi 会话写满时不记送达，恢复后实际重发一次", async t => {
+  const f = fixture(t);
+  let full = true, attempts = 0;
+  const {x, view, commit} = await receipt(f, (file, bytes) => {
+    attempts++;
+    if (!full) return appendFileSync(file, bytes);
+    if (attempts === 1) appendFileSync(file, String(bytes).slice(0, -1)); // JSON 写完但换行没写入。
+    throw Object.assign(new Error("disk full"), {code: "ENOSPC"});
+  });
+  locked(x.dir, l => l.add({type: "完成", sha: commit}));
+  view.input("合入");
+  const refused = (await f.pump(x.dir, l => !!l.last("合入") || !!l.last("评审"))).last("合入")!;
+  assert.match(refused.text!, /放行资格不足/);
+  assertWindow(view, x, "合入失败");
+  assert.equal(attempts, 1);
+  assert.equal(new Ledger(x.dir).last("合入送达"), undefined);
+  view.refresh();
+  assert.deepEqual(view.messages, []);
+  assert.equal(new Ledger(x.dir).last("合入送达"), undefined, "会话内存已有也不能提前确认");
+  full = false;
+  view.refresh();
+  assert.equal(view.messages.length, 1);
+  assert(view.messages[0].includes(refused.text!));
+  assert.equal(new Ledger(x.dir).last("合入送达")?.ref, refused.n);
+  view.refresh();
+  assert.equal(view.messages.length, 1);
+  const file = new Ledger(x.dir).last("窗口")!.file!;
+  const messages = readFileSync(file, "utf8").split("\n").filter(line => line.includes('"customType":"dev-loop-merge"') && !line.endsWith("\0"));
+  assert.equal(messages.length, 1);
+  assert.equal(JSON.parse(messages[0]).details, refused.n);
 });
 
 test("N4 A5 · 伪造完成遭合入工具拒绝，窗口说明原因且查询报缺证据", async t => {

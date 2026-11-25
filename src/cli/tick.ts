@@ -134,9 +134,10 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now(),env=process.
       let advance=false;
       for (const dead of state(l,false).starts.filter(r=>!alive(r.owner))) {
         const opened=dead.step==="开窗口" && l.rows.some(r=>r.type==="窗口" && r.status==="开" && r.ref===dead.n);
-        if (!opened) for (const e of l.rows.filter(r=>r.type==="子进程" && r.ref===dead.n)) signalProcess(e.owner,e.status!=="窗口");
+        const windowMerge=dead.step==="合入" && dead.intent;
+        if (!opened && !windowMerge) for (const e of l.rows.filter(r=>r.type==="子进程" && r.ref===dead.n)) signalProcess(e.owner,e.status!=="窗口");
         const fallback=opened ? {result:"成功"} : {result:"失败",kind:"重试" as const,text:"工具进程已退出，未留下结论"};
-        const outcome=dead.step==="合入" && dead.intent ? recoverWindowMerge(l,dead) : fallback;
+        const outcome=windowMerge ? recoverWindowMerge(l,dead) : fallback;
         l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,intent:dead.intent,...outcome},now);
       }
       const decision=decide(l,now); if (decision) {

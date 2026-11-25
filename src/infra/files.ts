@@ -27,12 +27,12 @@ export function ledgerLines<T>(path:string) {
 }
 export const jsonLines = <T>(path: string): T[] => (ifPresent(() => readText(path)) || "").split("\n").filter(Boolean).map(s => JSON.parse(s));
 export class BusyError extends Error {}
-// 锁附着在本进程持有的 fd；进程被杀由内核释放，不能 unlink 锁文件。
-export function lock(path: string, waitMs = 0): () => void {
+// 锁跟随打开的 fd；最后一个持有者退出才释放，不能 unlink 锁文件。
+export function lock(path: string, waitMs = 0) {
   const fd = openSync(path,"a",0o600), mac = process.platform === "darwin", secs = String(Math.ceil(waitMs/1000));
   const {status,error,stderr} = spawnSync(mac ? "/usr/bin/lockf" : "flock",mac ? ["-s","-t",secs,"3"] : ["-E","75","-w",secs,"3"],
     {stdio:["ignore","ignore","pipe",fd]});
-  if (status === 0) return () => closeSync(fd);
+  if (status === 0) return Object.assign(() => closeSync(fd), {fd});
   closeSync(fd); if (status === 75) throw new BusyError("任务正在处理，请稍后重试"); throw error || new Error("不能取得文件锁："+stderr);
 }
 export function withLock<T>(path: string, action: () => T, waitMs = 2000): T {

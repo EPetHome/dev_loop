@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { alive, identity } from "../infra/exec.ts";
-import { atomicWrite, jsonLines, maybe } from "../infra/files.ts";
+import { atomicWrite, readText } from "../infra/files.ts";
 import { APP_ROOT, shellQuote, wake } from "../infra/paths.ts";
 import { Ledger, locked, type Entry } from "../core/store.ts";
 import { state, projectedStop, pendingStarts } from "../core/state.ts";
@@ -16,8 +16,12 @@ export const newContext=(r?:Entry)=>r?.ending==="length" || r?.ending==="error" 
 export async function openWindow(l:Ledger,start:Entry) {
   const s=state(l,false), t=l.task, {window,settled}=s, file=(settled?.ref===window?.n && settled?.file) || window?.file;
   const rotate=settled?.ref===window?.n && (newContext(settled) || (settled?.context || 0)>=t.config.newSessionAtContext);
-  const resume=file && !rotate && !start.file && maybe(()=>
-    realpathSync(file).startsWith(join(t.dir,"sessions")+"/") && jsonLines<{type:string}>(file)[0]?.type==="session");
+  const resume=file && !rotate && !start.file && (()=>{
+    try {
+      // 只验证会话头；尾帧损坏时 Pi 自己跳过该帧，仍续原会话。
+      return realpathSync(file).startsWith(join(t.dir,"sessions")+"/") && JSON.parse(readText(file).split("\n",1)[0])?.type==="session";
+    } catch {return false;}
+  })();
   const id=resume ? window?.value.id : randomUUID(), folder=join(t.dir,"sessions"), opening=join(t.dir,`opening-${start.n}.md`), loop=join(APP_ROOT,"bin/loop");
   const {prompt,acceptance}=inputs(t), last=l.rows.findLast(r=>r.type==="评审" && r.check?.result==="必修"); mkdirSync(folder,{recursive:true});
   atomicWrite(opening,[`受管开发卡 ${t.executionId}。做完运行 ${loop} 交付；疑问用 ${loop} 提问。不要自行验证放行或合入部署。卡完成后，本人在这个窗口单独说「合入」由 dev-loop 处理；开发方不要运行合入命令，也不要让本人去终端执行。`,prompt,acceptance,

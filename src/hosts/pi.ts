@@ -1,20 +1,34 @@
+import { appendFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import { identity } from "../infra/exec.ts";
-import { readText } from "../infra/files.ts";
+import { ifPresent, readText } from "../infra/files.ts";
 import { wake } from "../infra/paths.ts";
 import { Ledger, hasLedger, locked, type Entry } from "../core/store.ts";
 import { projectedStop, pendingStarts, state } from "../core/state.ts";
 import { phaseView } from "../core/view.ts";
 interface Context {
   cwd:string; mode?:string; hasUI?:boolean; isIdle?():boolean; shutdown?():void; getContextUsage?():{percent:number|null}|undefined;
-  ui?:{setStatus(k:string,s?:string):void; setTitle(s:string):void}; sessionManager:{getSessionId():string;getSessionFile():string|undefined;getBranch():any[]};
+  ui?:{setStatus(k:string,s?:string):void; setTitle(s:string):void; setWidget?(k:string,text?:string[]):void};
+  sessionManager:{getSessionId():string;getSessionFile():string|undefined;getBranch():any[]};
 }
 interface Pi {
   on(event:string,handler:(e:any,c:Context)=>any):void;
   sendMessage(message:{customType:string;content:string;display:boolean;details?:number},opts:{triggerTurn:boolean}):void
 }
+const mergeMessage="dev-loop-merge";
+function savedNotice(raw:string,n:number) {
+  const lines=raw.split("\n"); lines.pop(); // 不把未写完的行当送达，包括只缺 LF 的 JSON。
+  return lines.some(line=>{
+    if (!line.includes(mergeMessage)) return false;
+    try {
+      const e=JSON.parse(line);
+      return e?.type==="custom_message" && e.customType===mergeMessage && e.details===n && e.display===true;
+    } catch {return false;}
+  });
+}
 export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clearInterval}={}) {
   const dir=env.LOOP_TASK_DIR, ref=Number(env.LOOP_WINDOW_JOB); if (!dir || !hasLedger(dir) || !ref || env.LOOP_PI_WINDOW_OWNER!==String(process.ppid)) return;
-  let window=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
+  let window=0, widget=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
   const content=(msg:any)=>Array.isArray(msg?.content)
     ? msg.content.filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n") : String(msg?.content || "");
   const event=(data:Partial<Entry>)=>{
@@ -54,15 +68,26 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
           const next=`【${visible}】${s.t.name}${detail ? " · "+detail : ""} · 已用 ${s.returned("评审").length} 评审轮`;
           if (next!==title) {ui.setStatus("dev-loop","dev-loop "+next);ui.setTitle(next);title=next;}
           if (ctx.isIdle?.()!==false) for (const r of mergeNotices) {
-            const customType="dev-loop-merge", shown=()=>ctx.sessionManager.getBranch().some(e=>
-              e.type==="custom_message" && e.customType===customType && e.details===r.n && e.display);
-            if (!shown()) {
-              const text=r.result==="成功" ? `本地 dev ${r.value.result}：${r.value.devAfter}（未推送、未部署）`
-                : `合入失败：${r.text || r.result}`;
-              pi.sendMessage({customType,content:text,display:true,details:r.n},{triggerTurn:false});
+            const text=r.result==="成功" ? `本地 dev ${r.value.result}：${r.value.devAfter}（未推送、未部署）`
+              : `合入失败：${r.text || r.result}`;
+            const file=ctx.sessionManager.getSessionFile(), raw=file && ifPresent(()=>readText(file));
+            if (!file || !raw) {
+              // 新会话还没有磁盘记录时也能看回执；不把临时显示当作会话已保存。
+              if (widget!==r.n) { ui.setWidget?.(mergeMessage,[text]); widget=r.n; }
+              continue;
             }
-            // 若会话写完、账本送达尚未写就崩窗，重开可从会话认出同一条消息。
-            if (shown()) locked(dir,current=>current.add({type:"合入送达",ref:r.n,source:window}));
+            if (!savedNotice(raw,r.n)) {
+              // ENOSPC 可能只留下半行；隔开失效尾帧，使重发能独立落盘，不改已有字节。
+              if (!raw.endsWith("\n")) {
+                const session=realpathSync(file);
+                if (!session.startsWith(join(dir,"sessions")+"/")) continue;
+                appendFileSync(session,"\0\n");
+              }
+              pi.sendMessage({customType:mergeMessage,content:text,display:true,details:r.n},{triggerTurn:false});
+              if (!savedNotice(readText(file),r.n)) continue;
+            }
+            locked(dir,current=>current.add({type:"合入送达",ref:r.n,source:window}));
+            if (widget===r.n) { ui.setWidget?.(mergeMessage); widget=0; }
           }
         }
       } catch(e) {console.error("dev-loop 待办：",e);}

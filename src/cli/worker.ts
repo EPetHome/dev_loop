@@ -82,10 +82,10 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
       publish(l); return {ledger:l};
     }); if (!claim.ledger) return claim.cached;
     const l=claim.ledger,j=start!,t=l.task; process.env.LOOP_JOB=String(j.n);
-    const run=async ():Promise<Outcome>=>{
+    const run=async (lockFd?:number):Promise<Outcome>=>{
       switch (j.step) {
         case "准备":return prepare(l,j); case "开窗口":return openWindow(l,j); case "复测":case "评审":return check(l,j,b!);
-        case "分诊":return triage(l,j); case "合入":return merge(l,j); case "部署":case "退回":return deploy(l,j); case "推送":return push(l,j);
+        case "分诊":return triage(l,j); case "合入":return merge(l,j,lockFd!); case "部署":case "退回":return deploy(l,j); case "推送":return push(l,j);
         case "陪跑":
           await snapshot(t,t.worktree,j.sha!,join(dir,"snapshot-base.json"),"scenario",{deadline:Date.now()+t.config.snapshotTimeoutMin*60000});
           return {result:"成功"};
@@ -113,8 +113,8 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
         out={...out,result:"失败",kind:"重试",text:"检查期间输入变化",check:out.check && {...out.check,result:"失败"}};
       return finish(current,j,out);
     });
-    let release:(()=>void)|undefined, out:Outcome;
-    try {if(finishes.includes(j.step!))release=lock(projectFile(dirname(dir),t.repo,"operations"),2000);out=await run();}
+    let release:ReturnType<typeof lock>|undefined, out:Outcome;
+    try {if(finishes.includes(j.step!))release=lock(projectFile(dirname(dir),t.repo,"operations"),2000);out=await run(release?.fd);}
     catch(e) {
       const text=errorText(e);
       out={result:"失败",kind:j.repair ? "环境"
