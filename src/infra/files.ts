@@ -1,7 +1,7 @@
-import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, openSync, closeSync, linkSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, mkdirSync, appendFileSync, openSync, closeSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname } from "node:path";
 import { randomUUID, createHash } from "node:crypto";
-import { identity, alive } from "./exec.ts";
 export const digest = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
 export const iso = (ms = Date.now()) => new Date(ms).toISOString();
 export const span = (start: number, end = Date.now()) => ({startedAt:iso(start), endedAt:iso(end), durationMs:Math.max(0,end-start)});
@@ -12,37 +12,22 @@ export const optionalJson = <T>(path: string) => ifPresent(() => readJson<T>(pat
 export const maybe = <T>(read: () => T) => { try { return read(); } catch { return undefined; } };
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export function atomicWrite(path: string, text: string | Buffer): void {
-  const temp = path + "." + randomUUID() + ".tmp";
-  try { mkdirSync(dirname(path),{recursive:true}); writeFileSync(temp,text); renameSync(temp,path); } finally { rmSync(temp,{force:true}); }
+  const temp=path+"."+randomUUID()+".tmp"; try {mkdirSync(dirname(path),{recursive:true});writeFileSync(temp,text);renameSync(temp,path);}finally{rmSync(temp,{force:true});}
 }
 export const writeJson = (path: string, value: unknown) => atomicWrite(path, JSON.stringify(value, null, 2) + "\n");
-export const appendJson = (path: string, value: unknown) => appendFileSync(path, JSON.stringify(value) + "\n");
+// 账本的 LF 才提交一帧；用 JSON 不可能产生的 NUL 废弃未提交尾帧，不改写历史字节。
+export const appendJson=(path:string,value:unknown,torn=false)=>appendFileSync(path,(torn ? "\0\n" : "")+JSON.stringify(value)+"\n");
+export function ledgerLines<T>(path:string) {
+  const lines=readText(path).split("\n"),torn=Boolean(lines.pop()); return {torn,rows:lines.filter(s=>s && !s.endsWith("\0")).map(s=>JSON.parse(s) as T)};
+}
 export const jsonLines = <T>(path: string): T[] => (ifPresent(() => readText(path)) || "").split("\n").filter(Boolean).map(s => JSON.parse(s));
 export class BusyError extends Error {}
-/** 长锁用于同任务交付/停下，短锁保护状态读改写。失去进程的锁可恢复，释放要核对 token。 */
+// 锁附着在本进程持有的 fd；进程被杀由内核释放，不能 unlink 锁文件。
 export function lock(path: string, waitMs = 0): () => void {
-  const owner = {...identity(),token:randomUUID()}, deadline = Date.now()+waitMs, sleep = new Int32Array(new SharedArrayBuffer(4));
-  const pending = path + "." + owner.token + ".tmp", fd = openSync(pending,"wx");
-  try {
-    // 先写完持有者，再以不覆盖现有锁的硬链接原子发布；停止不会留下正式空锁。
-    try { writeFileSync(fd,JSON.stringify(owner)); } finally { closeSync(fd); }
-    for (;;) {
-      try {
-        linkSync(pending,path);
-        return () => { if (optionalJson<typeof owner>(path)?.token === owner.token) rmSync(path,{force:true}); };
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-        let previous: typeof owner | undefined; try { previous = readJson(path); } catch {}
-        if (previous?.startedAt && !alive(previous)) { rmSync(path,{force:true}); continue; }
-        if (Date.now() >= deadline) throw new BusyError("任务正在处理，请稍后重试");
-        Atomics.wait(sleep,0,0,5);
-      }
-    }
-  } finally { rmSync(pending,{force:true}); }
+  const fd = openSync(path,"a",0o600), mac = process.platform === "darwin", secs = String(Math.ceil(waitMs/1000));
+  const {status,error,stderr} = spawnSync(mac ? "/usr/bin/lockf" : "flock",mac ? ["-s","-t",secs,"3"] : ["-E","75","-w",secs,"3"],{stdio:["ignore","ignore","pipe",fd]});
+  if (status === 0) return () => closeSync(fd);
+  closeSync(fd); if (status === 75) throw new BusyError("任务正在处理，请稍后重试"); throw error || new Error("不能取得文件锁："+stderr);
 }
 export function withLock<T>(path: string, action: () => T, waitMs = 2000): T { const release = lock(path,waitMs); try { return action(); } finally { release(); } }
-export async function underLock<T>(path: string, action: () => Promise<T>, waitMs = 0) {
-  const release = lock(path,waitMs);
-  try { return await action(); }
-  finally { release(); }
-}
+export async function underLock<T>(path:string,action:()=>Promise<T>,waitMs=0) {const release=lock(path,waitMs);try{return await action();}finally{release();}}

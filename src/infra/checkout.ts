@@ -1,7 +1,7 @@
-import { constants, cpSync, existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { constants, existsSync, lstatSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { cp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { inside, safeRelative } from "./config.ts";
 import { errorText, ifPresent } from "./files.ts";
 import { gitText, gitTry } from "./git.ts";
@@ -12,14 +12,13 @@ export function removeCheckout(repo: string, cwd: string, warning = console.erro
 function removeTree(root: string, warning = console.error) {
   try { rmSync(root,{recursive:true,force:true}); } catch(e) { warning("临时目录删除失败："+String(e)); }
 }
-function removeScratch(repo: string, root: string, warning = console.error, env?: NodeJS.ProcessEnv) {
-  removeCheckout(repo,join(root,"src"),warning,env);
-  removeTree(root,warning);
-}
-export async function checkout<T>(repo: string, commit: string, run: (cwd: string) => Promise<T>, warning?: (text: string) => void, env?: NodeJS.ProcessEnv) {
-  const root = mkdtempSync(join(tmpdir(),"dev-loop-check-")), cwd = join(root,"src");
-  try { gitText(repo,["worktree","add","--detach",cwd,commit],env); return await run(cwd); }
-  finally { removeScratch(repo,root,warning,env); }
+export async function checkout<T>(repo:string,commit:string,run:(cwd:string)=>Promise<T>,warning=console.error,source?:string) {
+  const root=mkdtempSync(join(tmpdir(),"dev-loop-check-")), cwd=join(root,"src");
+  try {
+    gitText(repo,["worktree","add","--detach",...(source?["--no-checkout"]:[]),cwd,commit]);
+    if (source) {gitText(cwd,["read-tree",commit]);await copySnapshot(realpathSync(source),cwd);}
+    return await run(cwd);
+  } finally {removeCheckout(repo,cwd,warning);removeTree(root,warning);}
 }
 function hasParentDependencies(path: string): boolean {
   for (let dir = path;; dir = dirname(dir)) {
@@ -50,18 +49,11 @@ export async function privateCheckout<T>(repo: string, commit: string, excluded:
     return await run(cwd);
   } finally { removeTree(root,warning); }
 }
-function copySnapshot(repo: string, dest: string, commit: string, source: string) {
-  source = realpathSync(source);
-  gitText(repo,["worktree","add","--detach","--no-checkout",dest,commit]); gitText(dest,["read-tree",commit]);
-  cpSync(source,dest,{recursive:true,mode:constants.COPYFILE_FICLONE,filter(from,to) {
+function copySnapshot(source:string,dest:string) {
+  return cp(source,dest,{recursive:true,mode:constants.COPYFILE_FICLONE,filter(from,to) {
     if (basename(from).toLowerCase() === ".git") return false; if (!lstatSync(from).isSymbolicLink()) return true;
     const path = relative(source,realpathSync(from));
     if (!safeRelative(path.toLowerCase() || ".")) throw new Error("留痕链接越出副本范围：" + relative(source,from));
     symlinkSync(relative(dirname(to),join(dest,path)) || ".",to); return false;
   }});
-}
-export const checkoutWorker = fileURLToPath(import.meta.url);
-if (process.argv[1] && resolve(process.argv[1]) === checkoutWorker) {
-  const [, ,mode,repo,root,commit,source] = process.argv;
-  if (mode === "--snapshot-copy") copySnapshot(repo,join(root,"src"),commit,source); else if (mode === "--snapshot-clean") removeScratch(repo,root);
 }

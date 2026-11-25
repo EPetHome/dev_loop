@@ -1,8 +1,9 @@
 import { basename } from "node:path";
-import { taskOf, annotate, recordStep, LoopError, type Phase } from "../core/store.ts";
+import type { Entry, Ledger, Outcome } from "../core/store.ts";
+import { requireGate } from "../core/inputs.ts";
+import { run } from "../core/run.ts";
 import { InputError } from "../core/card.ts";
-import { git, gitText, gitTry } from "../infra/git.ts";
-import { childExec } from "../infra/exec.ts";
+import { git, gitText, gitTry, isAncestor } from "../infra/git.ts";
 import { span } from "../infra/files.ts";
 import { shellQuote } from "../infra/paths.ts";
 const RULES: [string, RegExp][] = [
@@ -40,29 +41,30 @@ export function scan(repo: string, commits: string[]): string[] {
   return hits;
 }
 export interface PushResult { executionId: string; commit: string; result: string; seconds: number; detail: string; verify?: string }
-export async function push(dir: string, o: {timeoutMs?: number} = {}): Promise<PushResult> {
-  const t = taskOf(dir), start = Date.now(), timeoutMs = o.timeoutMs ?? 120000;
+export async function push(l:Ledger,j:Entry):Promise<Outcome> {
+  const t=l.task, start=Date.now(), timeoutMs=t.config.pushTimeoutSec*1000;
+  requireGate(l,j.sha!);
   if (gitTry(t.repo, ["remote", "get-url", "origin"]).code) throw new InputError("没有 origin");
   const commit = gitText(t.repo, ["rev-parse", "refs/heads/dev"]), short = commit.slice(0, 7);
-  annotate(dir, "推送中", short);
-  const finish = (result: string, phase: Phase, message: string, detail = "", category?: string, verify?: string): PushResult => {
-    const timing = span(start), r = {executionId:t.executionId,commit,result,seconds:timing.durationMs/1000,detail,...(verify ? {verify} : {})};
-    recordStep(dir,{step:"推送",result,commit,...timing,evidence:[],detail},{phase,message});
-    if (category) throw new LoopError(category,detail || message,r); return r;
+  if (!isAncestor(t.repo,j.sha!,commit)) throw new InputError("交付提交未在本地 dev 上");
+  const finish=(result:string,detail="",kind?:Outcome["kind"],verify?:string):Outcome=>{
+    const timing=span(start), value={executionId:t.executionId,commit,result,seconds:timing.durationMs/1000,detail,...(verify ? {verify} : {})};
+    return {result:kind ? "失败" : "成功",kind,text:detail,value,check:{step:"推送",result,commit,...timing,evidence:[],detail}} as Outcome;
   };
-  const network = (args: string[], limit = timeoutMs) => childExec("git", args, {cwd: t.repo, timeoutMs: limit});
+  const network=(args:string[],limit=timeoutMs)=>run({...t,worktree:t.repo},"git",args,limit);
+  const auth=(s:string)=>/authentication failed|permission denied|access denied|403|401/i.test(s);
   const fetched = await network(["fetch", "--no-tags", "--prune", "--no-prune-tags", "--refmap=", "origin", "+refs/heads/*:refs/remotes/origin/*"]);
-  if (fetched.code || fetched.killed) return finish("推送失败", "推送失败", "网络失败", fetched.output || "fetch 超时", "临时故障");
-  if (gitTry(t.repo, ["rev-parse", "--verify", "refs/remotes/origin/dev"]).stdout.trim() === commit) return finish("已推送", "已推送", short, "远端已是最新");
+  if (fetched.code || fetched.killed) return finish("推送失败",fetched.output || "fetch 超时",auth(fetched.output) ? "环境" : "重试");
+  if (gitTry(t.repo,["rev-parse","--verify","refs/remotes/origin/dev"]).stdout.trim()===commit) return finish("已推送","远端已是最新");
   let hits: string[];
   try { hits = scan(t.repo, gitText(t.repo, ["rev-list", "--reverse", commit, "--not", "--remotes=origin"]).split("\n").filter(Boolean)); }
-  catch { return finish("扫描出错，未推送", "推送失败", "扫描出错", "密钥扫描出错，未推送（不输出补丁内容）", "工具内部错误"); }
-  if (hits.length) return finish("扫描命中，未推送", "推送失败", "扫描命中 " + hits.length + " 处", hits.join("\n"), "输入问题");
+  catch {return finish("扫描出错，未推送","密钥扫描出错（不输出补丁内容）","环境");}
+  if (hits.length) return finish("扫描命中，未推送",hits.join("\n"),"环境");
   const sent = await network(["push", "--no-follow-tags", "origin", commit + ":refs/heads/dev"]);
-  if (!sent.code && !sent.killed) return finish("已推送", "已推送", short, sent.output);
-  const verified = await network(["ls-remote", "origin", "refs/heads/dev"], Math.min(timeoutMs, 30000));
-  if (verified.code || verified.killed) return finish("推送结果不确定", "推送结果不确定", "用 git ls-remote origin refs/heads/dev 核对", sent.output + "\n" + verified.output, "未知", "git -C " + shellQuote(t.repo) + " ls-remote origin refs/heads/dev");
-  if (verified.stdout.trim().split(/\s+/)[0] === commit) return finish("已推送", "已推送", short, sent.output + "\n已核对远端");
-  const temporary = sent.killed || /could not resolve|unable to access|connection|could not read from remote|network|timed out|remote end hung up/i.test(sent.output);
-  return finish("推送失败", "推送失败", temporary ? "网络失败" : "远端拒绝", sent.output || "push 超时", temporary ? "临时故障" : "权限不足");
+  if (!sent.code && !sent.killed) return finish("已推送",sent.output);
+  const verified=await network(["ls-remote","origin","refs/heads/dev"],Math.min(timeoutMs,t.config.pushVerifyTimeoutSec*1000));
+  if (verified.code || verified.killed) return finish("推送结果不确定",sent.output+"\n"+verified.output,auth(sent.output) ? "环境" : "重试","git -C "+shellQuote(t.repo)+" ls-remote origin refs/heads/dev");
+  if (verified.stdout.trim().split(/\s+/)[0]===commit) return finish("已推送",sent.output+"\n已核对远端");
+  const temporary=sent.killed || /could not resolve|unable to access|connection|could not read from remote|network|timed out|remote end hung up/i.test(sent.output);
+  return finish("推送失败",sent.output || "push 超时",temporary && !auth(sent.output) ? "重试" : "环境");
 }

@@ -1,70 +1,54 @@
-import { locate, taskOf, statusOf, update, PHASES, appendWindowNote } from "../core/store.ts";
-import { registerSession, heartbeat, shutdownSession } from "../core/lifecycle.ts";
-import { settle } from "../core/settle.ts";
-import { convention } from "./convention.ts";
-import { alive } from "../infra/exec.ts";
-import { contentText } from "./hook-event.ts";
-import { startFinish } from "./after-settle.ts";
-import { watchPiEditor, type EditorUI } from "./pi-editor.ts";
+import { identity } from "../infra/exec.ts";
+import { readText } from "../infra/files.ts";
+import { wake } from "../infra/paths.ts";
+import { Ledger, hasLedger, locked, type Entry } from "../core/store.ts";
+import { projectedStop, pendingStarts, state } from "../core/state.ts";
 interface Context {
-  cwd: string; signal?: AbortSignal; shutdown?(): void; hasUI?: boolean; mode?: string; isIdle?(): boolean;
-  ui?: EditorUI & { setStatus(key: string, text?: string): void; setTitle(title: string): void };
-  sessionManager: { getSessionId(): string; getSessionFile?(): string | undefined; getBranch(): any[] };
+  cwd:string; mode?:string; hasUI?:boolean; isIdle?():boolean; shutdown?():void; getContextUsage?():{percent:number|null}|undefined;
+  ui?:{setStatus(k:string,s?:string):void; setTitle(s:string):void}; sessionManager:{getSessionId():string;getSessionFile():string|undefined;getBranch():any[]};
 }
-interface PiAPI {
-  on(event: string, handler: (event: any, ctx: Context) => any): unknown; getCommands?(): {name: string; source: string}[];
-  sendMessage(message: {customType: string; content: string; display: boolean}, options?: {triggerTurn: boolean}): void;
-}
-export function registerPi(pi: PiAPI, options: {
-  env?: NodeJS.ProcessEnv; every?: (callback: () => void, ms: number) => any; clear?: (timer: any) => void;
-} = {}) {
-  let dir: string | undefined, timer: any, viewTimer: any, context: Context | undefined, name = "", last = "", unwatch: (() => void) | undefined;
-  const env = options.env || process.env;
-  const cleanup = () => {
-    for (const id of [timer,viewTimer]) if (id !== undefined) (options.clear || clearInterval)(id);
-    timer = viewTimer = undefined; unwatch?.(); unwatch = undefined;
+interface Pi { on(event:string,handler:(e:any,c:Context)=>any):void; sendMessage(message:{customType:string;content:string;display:boolean},opts:{triggerTurn:boolean}):void }
+export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clearInterval}={}) {
+  const dir=env.LOOP_TASK_DIR, ref=Number(env.LOOP_WINDOW_JOB); if (!dir || !hasLedger(dir) || !ref || env.LOOP_PI_WINDOW_OWNER!==String(process.ppid)) return;
+  let window=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
+  const content=(msg:any)=>Array.isArray(msg?.content) ? msg.content.filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n") : String(msg?.content || "");
+  const event=(data:Partial<Entry>)=>{
+    if (!window) return;
+    locked(dir,l=>{ if (l.rows.findLast(r=>r.type==="窗口" && r.status==="开")?.n===window && !projectedStop(l)) l.add({type:"窗口",ref:window,...data}); }); wake(dir,env);
   };
-  const every = (fn: () => void, ms: number) => { const id = (options.every || setInterval)(fn,ms); id?.unref?.(); return id; };
-  const refresh = () => {
-    if (!dir) return;
-    try {
-      const s = statusOf(dir), phase = s.loop.phase, pending = s.loop.pendingReturn;
-      if (pending && s.state === "working" && phase === "开发中" && !alive(s.loop.finisher)) {
-        // 重开的会话已在开场承载原话；这里只确认消费，不能再触发一次。
-        if (!s.loop.pendingOpening) pi.sendMessage({customType:"dev-loop-return",content:pending,display:true},{triggerTurn:true});
-        update(dir,s=>{if(s.loop.pendingReturn===pending){s.loop.pendingReturn=null;s.loop.pendingOpening=false;}});
-      }
-      if (!context?.ui || context.hasUI === false) return;
-      const extra = phase === "评审中" ? "第 " + s.loop.reviewRounds + " 轮" : phase === "等你" ? s.loop.wait || s.message.split("\n")[0].slice(0, 30)
-        : phase === "失败" ? s.error?.category : PHASES.indexOf(phase) >= 10 ? s.message : "";
-      const title = `【${phase}】${name}`, text = "dev-loop"+title+(extra ? " · "+extra : ""); if (text === last) return;
-      context.ui.setStatus("dev-loop", text); context.ui.setTitle(title); last = text;
-    } catch {} // 外部状态暂不可读时保留显示，不干扰会话。
-  };
-  pi.on("session_start", (_event, ctx) => {
-    cleanup(); context = ctx; last = "";
-    const taskDir = dir = locate(ctx.cwd, env); if (!taskDir) return;
-    const id = ctx.sessionManager.getSessionId(); if (!registerSession(taskDir, "pi", id, process.pid, ctx.sessionManager.getSessionFile?.())) { dir = undefined; ctx.shutdown?.(); return; }
-    const task = taskOf(taskDir);
-    if (task.host === "pi" && ctx.mode === "tui" && ctx.cwd === task.worktree && env.LOOP_PI_WINDOW_OWNER === `${process.ppid}:${id}`)
-      unwatch = watchPiEditor(ctx, text => appendWindowNote(taskDir, text), name => pi.getCommands?.().some(c => c.name === name && c.source === "extension") === true);
-    timer = every(() => { try { heartbeat(taskDir); } catch (e) { console.error("心跳更新失败：",e); } },60000);
-    name = task.name; refresh(); viewTimer = every(refresh,1000);
-    pi.sendMessage({customType:"dev-loop-convention",content:convention(task),display:true});
+  pi.on("session_start",(_e,ctx)=>{
+    const id=ctx.sessionManager.getSessionId();
+    const opened=locked(dir,l=>{
+      if (projectedStop(l) || ctx.cwd!==l.task.worktree || id!==env.LOOP_EXPECT_SESSION || !pendingStarts(l).some(r=>r.step==="开窗口" && r.n===ref) || state(l,false).windowLive) return;
+      return l.add({type:"窗口",status:"开",ref,owner:identity(),file:ctx.sessionManager.getSessionFile(),value:{id}});
+    });
+    if (!opened) {ctx.shutdown?.(); return;} window=opened.n; wake(dir,env);
+    timer=every(()=>{
+      try {
+        const l=new Ledger(dir), s=state(l,false);
+        if (s.stop) {ctx.shutdown?.(); return;}
+        if (s.window?.n!==window) return;
+        const sent=s.sent.length, opening=!sent && env.LOOP_OPENING, entries=s.undelivered;
+        if (!sending && !s.busy && !s.wait && !s.suspended && (!s.running || s.running.step==="开窗口") && ctx.isIdle?.()!==false && (opening || entries.length)) {
+          sending=true;
+          try {
+            const text=[opening ? readText(opening) : "",...entries.map(r=>r.todo)].filter(Boolean).join("\n\n");
+            pi.sendMessage({customType:"dev-loop-todo",content:text,display:true},{triggerTurn:true});
+            locked(dir,current=>current.add({type:"送达",ref:window,sent:entries.map(r=>r.n)})); wake(dir,env);
+          } finally {sending=false;}
+        }
+        const phase=s.wait ? "等你" : s.running?.step || (s.suspended ? "本人中止" : "开发中"), next=`【${phase}】${s.t.name} · 已用 ${s.returned("评审").length} 评审轮`;
+        if (ctx.hasUI && next!==title) {ctx.ui?.setStatus("dev-loop","dev-loop "+next);ctx.ui?.setTitle(next);title=next;}
+      } catch(e) {console.error("dev-loop 待办：",e);}
+    },opened && new Ledger(dir).task.config.inboxIntervalMs); timer?.unref?.();
   });
-  pi.on("agent_before_settle", async (event, ctx) => {
-    if (!dir) return;
-    const messages = event.context?.contextMessages || ctx.sessionManager.getBranch().map((e) => e.message).filter(Boolean);
-    const last = messages.findLast((m: any) => m.role === "assistant");
-    const result = await settle(dir, contentText(last?.content), {signal: ctx.signal, ending: last});
-    refresh();
-    if (result.continue) return {entries:[{type:"custom_message",customType:"dev-loop-return",content:result.reason,display:true}],continue:true};
-    await startFinish(dir,env);
+  pi.on("agent_start",()=>event({status:"忙"}));
+  pi.on("input",(e,ctx)=>{ if (ctx.mode==="tui" && e.source==="interactive" && e.text) event({type:"窗口原话",text:e.text}); });
+  pi.on("agent_settled",(e,ctx)=>{
+    const last=ctx.sessionManager.getBranch().findLast(x=>x.message?.role==="assistant")?.message;
+    const usage=ctx.getContextUsage?.()?.percent;
+    event({status:"闲",text:content(last),ending:e.aborted ? "aborted" : last?.stopReason || "pending",error:last?.errorMessage,aborted:!!e.aborted,context:usage==null ? undefined : usage/100,file:ctx.sessionManager.getSessionFile()});
   });
-  pi.on("session_shutdown", () => {
-    cleanup();
-    if (context?.hasUI !== false) context?.ui?.setStatus("dev-loop", undefined);
-    if (dir) shutdownSession(dir); dir = undefined; context = undefined;
-  });
+  pi.on("session_shutdown",(_e,ctx)=>{ if (timer) clear(timer); event({status:"断"}); window=0; if (ctx.hasUI) ctx.ui?.setStatus("dev-loop"); });
 }
-export default (pi: PiAPI) => registerPi(pi);
+export default (pi:Pi)=>registerPi(pi);

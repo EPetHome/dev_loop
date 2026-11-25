@@ -2,10 +2,8 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fixture, getJson, ROOT, until, write } from "./helpers.ts";
-import { createTask, checked, checksOf, statusOf, taskOf } from "../src/core/store.ts";
-import { deliver } from "../src/core/deliver.ts";
-import { settle } from "../src/core/settle.ts";
+import { fixture, getJson, ROOT, until, write, checked, statusOf, deliver, settle } from "./helpers.ts";
+import { checksOf, taskOf } from "../src/core/store.ts";
 import { digest, readText } from "../src/infra/files.ts";
 
 const seed = Buffer.from([0,255,142,74,13,10]);
@@ -101,7 +99,7 @@ test("A8：实际原单重投及定向单元测试；两版隔离、开工快照
     assert.ok(readText(f.batch).includes(r.attempt));
   }
   assert.match(readText(results[1].beforeRun.log),/ERR_ASSERTION/);
-  assert.equal(f.git("worktree","list","--porcelain"),worktrees); assert.deepEqual(statusOf(task.dir),status);
+  assert.equal(f.git("worktree","list","--porcelain"),worktrees); assert.deepEqual(statusOf(task.dir).loop.delivery,status.loop.delivery);
   assert.equal(readText(join(f.repo,"src/inbox.cjs")),"用户改动\n"); assert.equal(readText(join(f.repo,"local.txt")),"local secret fixture\n");
   assert.equal(readText(join(f.repo,"outside.txt")),"protected\n"); assert.equal(existsSync(task.worktree),false);
   assert.match(readText(join(task.dir,"summary.md")),/防复发证明.*已证明/); assert.equal(f.git("rev-parse","dev"),f.oldCommit);
@@ -165,7 +163,7 @@ for (const [old,fixed,extra,expected,reason] of [
   assert.deepEqual([first.beforeRun.observation.actual,first.afterRun.observation.actual],expected);
   assert.notEqual(first.attempt,second.attempt); assert.equal(second.reused,false);
   assert.equal(getJson(first.report).attempt,first.attempt); assert.equal(checks(task.dir).length,2); assert.equal(batchCount(f.batch),2);
-  assert.equal(checked(task.dir,commit),true); assert.deepEqual(statusOf(task.dir),original);
+  assert.equal(checked(task.dir,commit),true); assert.deepEqual(statusOf(task.dir).loop.delivery,original.loop.delivery);
 });
 
 test("旧版是其他错误值、或报告失败但退出 0，均不能当作红", async t => {
@@ -308,7 +306,7 @@ test("必修 2：两端报告、检查点证据或日志损坏时，不补摘要
 
 test("必修 3：未发布的归档串入其他步骤或结论时，不能写入正式检查", async t => {
   const f = project(t), task = await f.start([{...scene,issue:"步骤串入"},{...scene,issue:"结论串入"}]);
-  const commit = f.submit(task), ledger = join(task.dir,"checks.jsonl"), before = readText(ledger);
+  const commit = f.submit(task), ledger = join(task.dir,"ledger.jsonl"), before = readText(ledger);
   const old = await f.run(task);
   write(ledger,before); rmSync(f.batch); // 模拟仅落盘总结果，尚未追加账本与批次摘要。
   const tampered = old.map((r: any,i: number) => {
@@ -334,7 +332,7 @@ test("本轮必修：总结果声明串项，不能用 A 的已证明证据给 B
 });`});
   const task = await f.start([{...unit,issue:"A"},{...unit,issue:"B",testName,test:unit.test+` '^${testName}$'`}]);
   f.submit(task);
-  const ledger = join(task.dir,"checks.jsonl"), before = readText(ledger), [a,b] = await f.run(task);
+  const ledger = join(task.dir,"ledger.jsonl"), before = readText(ledger), [a,b] = await f.run(task);
   assert.equal(a.result,"已证明"); assert.equal(b.result,"未证明");
   assert.deepEqual([a.proof.before,a.proof.expected,a.proof.beforeActual],[b.proof.before,b.proof.expected,b.proof.beforeActual]);
   write(ledger,before); rmSync(f.batch); // 模拟总结果已落盘，但尚未登记。
@@ -398,10 +396,10 @@ test("归档报告的摘要吻合，也不能把另一用例或检查点当作�
 test("证明只接受执行号；未交付拒绝，未声明不建证明目录；不存在的旧 SHA 不开工", async t => {
   const f = project(t), task = await f.start([scene]);
   await assert.rejects(f.run(task),/尚未登记交付/); assert.equal(existsSync(join(task.dir,"proofs")),false);
-  await assert.rejects(f.cli(["证明",task.card]),/须指定一个执行编号/);
-  const legacy = fixture(t), old = await legacy.prepare(); deliver(old.dir); await settle(old.dir);
+  await assert.rejects(f.cli(["证明",task.card]),/须指定执行编号/);
+  const legacy = fixture(t), old = await legacy.prepare();
   assert.deepEqual(getOutput(await legacy.cli(["证明",old.executionId,"--json"])).proofs,[]);
   assert.equal(existsSync(join(old.dir,"proofs")),false); assert.equal(existsSync(join(legacy.repo,"结果.md")),false);
   const raw = getJson(f.card); raw.tasks[0].proofs[0].before = "refs/heads/not-present"; write(f.card,JSON.stringify(raw));
-  assert.throws(() => createTask(f.card,f.root),/Needed a single revision/); assert.deepEqual(readdirSync(f.root),[task.executionId]);
+  await assert.rejects(f.cli(["启动",f.card]),/Needed a single revision/); assert.deepEqual(readdirSync(f.root).filter(id=>id!=="start.lock"),[task.executionId]);
 });
