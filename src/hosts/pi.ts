@@ -3,6 +3,7 @@ import { readText } from "../infra/files.ts";
 import { wake } from "../infra/paths.ts";
 import { Ledger, hasLedger, locked, type Entry } from "../core/store.ts";
 import { projectedStop, pendingStarts, state } from "../core/state.ts";
+import { phaseView } from "../core/view.ts";
 interface Context {
   cwd:string; mode?:string; hasUI?:boolean; isIdle?():boolean; shutdown?():void; getContextUsage?():{percent:number|null}|undefined;
   ui?:{setStatus(k:string,s?:string):void; setTitle(s:string):void}; sessionManager:{getSessionId():string;getSessionFile():string|undefined;getBranch():any[]};
@@ -33,7 +34,7 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
     if (!opened) {ctx.shutdown?.(); return;} window=opened.n; wake(dir,env);
     timer=every(()=>{
       try {
-        const l=new Ledger(dir), s=state(l,false);
+        const ui=ctx.hasUI && ctx.ui, l=new Ledger(dir), s=state(l,!!ui);
         if (s.stop) {ctx.shutdown?.(); return;}
         if (s.window?.n!==window) return;
         const sent=s.sent.length, opening=!sent && env.LOOP_OPENING, entries=s.undelivered;
@@ -45,8 +46,11 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
             locked(dir,current=>current.add({type:"送达",ref:window,sent:entries.map(r=>r.n)})); wake(dir,env);
           } finally {sending=false;}
         }
-        const phase=s.wait ? "等你" : s.running?.step || (s.suspended ? "本人中止" : "开发中"), next=`【${phase}】${s.t.name} · 已用 ${s.returned("评审").length} 评审轮`;
-        if (ctx.hasUI && next!==title) {ctx.ui?.setStatus("dev-loop","dev-loop "+next);ctx.ui?.setTitle(next);title=next;}
+        if (ui) {
+          const {phase,detail}=phaseView(l,s);
+          const next=`【${phase}】${s.t.name}${detail ? " · "+detail : ""} · 已用 ${s.returned("评审").length} 评审轮`;
+          if (next!==title) {ui.setStatus("dev-loop","dev-loop "+next);ui.setTitle(next);title=next;}
+        }
       } catch(e) {console.error("dev-loop 待办：",e);}
     },opened && new Ledger(dir).task.config.inboxIntervalMs); timer?.unref?.();
   });

@@ -4,9 +4,10 @@ import { dirname, join, resolve } from "node:path";
 import { execFileSync, execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
+import { after } from "node:test";
 import { fixtureMarker } from "./fixture-process.mjs";
-import { Ledger, allTasks, hasLedger } from "../src/core/store.ts";
-import { signalProcess } from "../src/infra/exec.ts";
+import { assertNoFixtureProcesses, stopFixtureProcesses } from "./fixture-cleanup.ts";
+import { Ledger } from "../src/core/store.ts";
 import { report } from "../src/core/view.ts";
 import { binding, evidence } from "../src/core/inputs.ts";
 process.env.LOOP_CAFFEINATE_CMD="/usr/bin/true";
@@ -24,8 +25,25 @@ export const sq=(s:string)=>"'"+s.replaceAll("'","'\\''")+"'";
 export function writeFixtureScript(file:string,interpreter:"sh"|"node",body:string,{direct=false}={}) {
   const sh=interpreter==="sh"; write(file,"#!"+(sh?"/bin/sh":NODE)+"\n"+(direct?"":(sh?"# ":"// ")+fixtureMarker+"\n")+body);chmodSync(file,0o755); return file;
 }
+const fixtureBases = new Set<string>();
+let compileCache: string | undefined;
+after(() => {
+  try { assertNoFixtureProcesses(...fixtureBases); }
+  finally { if (compileCache) rmSync(compileCache, {recursive: true, force: true}); }
+});
 export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer?:string;config?:any;card?:any;cliTimeoutMs?:number;tasksName?:string}={}) {
-  const base=realpathSync(mkdtempSync(join(tmpdir(),"dev-loop-test-"))), repo=join(base,"repo with 空格"), root=join(base,options.tasksName || "tasks");mkdirSync(repo);
+  // 同一测试文件反复开 CLI；只给这些子进程复用 Node 的临时编译缓存。
+  if (!process.env.NODE_COMPILE_CACHE && process.env.NODE_DISABLE_COMPILE_CACHE !== "1") {
+    compileCache ??= mkdtempSync(join(tmpdir(), "dev-loop-compile-"));
+    process.env.NODE_COMPILE_CACHE = compileCache;
+  }
+  const base=realpathSync(mkdtempSync(join(tmpdir(),"dev-loop-test-"))), repo=join(base,"repo with 空格"), root=join(base,options.tasksName || "tasks");
+  fixtureBases.add(base);
+  t.after(async () => {
+    try { await stopFixtureProcesses(base); }
+    finally { rmSync(base, {recursive: true, force: true, maxRetries: 2}); }
+  });
+  mkdirSync(repo);
   const git=(...args:string[])=>execFileSync("git",args,{cwd:repo,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim(); git("init","--template=","-b","dev");
   appendFileSync(join(repo,".git","config"),"\n[user]\n\tname = Loop Test\n\temail = loop-test@example.invalid\n");
   write(join(repo,"src/app.txt"),"good\n");write(join(repo,"outside.txt"),"protected\n");write(join(repo,"prompt.md"),"实现 good；不要改 scope 外文件。\n");write(join(repo,"criteria.md"),"A1. 操作：读取 app\n预期：good\n");
@@ -41,13 +59,6 @@ export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer
   const cli=(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>promisify(execFile)(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd,env:{...env,...extraEnv},timeout:options.cliTimeoutMs || 15000,maxBuffer:16*1024*1024});
   const call=async(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>{const r=await cli([...args,"--json"],cwd,extraEnv);return JSON.parse(r.stdout || "null");};
   const proc=(args:string[],extraEnv:NodeJS.ProcessEnv={})=>spawn(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd:repo,env:{...env,...extraEnv},stdio:"ignore"});
-  t.after(()=>{
-    for (const dir of allTasks(root).filter(hasLedger)) {
-      const l=new Ledger(dir);
-      for (const row of l.rows.filter(r=>["开始","子进程","窗口","调度"].includes(r.type))) signalProcess(row.owner,row.type==="子进程" && row.status!=="窗口");
-    }
-    rmSync(base,{recursive:true,force:true,maxRetries:2});
-  });
   return {base,repo,root,card,raw,git,env,cli,call,proc,
     async prepare() {const r=await call(["启动",card]);await call(["准备",r.executionId]);return new Ledger(r.taskDir).task;},
     async pump(dir:string,pick:(l:Ledger)=>boolean,max=120) {
