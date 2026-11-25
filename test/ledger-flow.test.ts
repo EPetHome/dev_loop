@@ -13,7 +13,7 @@ import { gitText } from "../src/infra/git.ts";
 import { state } from "../src/core/state.ts";
 import { decide } from "../src/cli/tick.ts";
 import { timerPlist } from "../src/cli/inspect.ts";
-const fgit=(t:Task,...args:string[])=>gitText(t.worktree,args), latest=(l:Ledger,type:string)=>l.last(type), did=(l:Ledger,step:string,result="成功")=>l.rows.some(r=>r.type===step && r.result===result);
+const fgit=(t:Task,...args:string[])=>gitText(t.worktree,args);
 const stat=(l:Ledger)=>state(l), append=(path:string,value:any)=>appendFileSync(path,JSON.stringify(value)+"\n");
 async function control(t:Task,fields:any) {
   const pid=stat(new Ledger(t.dir)).window?.owner?.pid, id=randomUUID();assert(pid);
@@ -109,11 +109,50 @@ test("A4/T11/T13 · agent_end 不补步骤；error 三档；Esc 停住且答复�
   }
   await control(x,{type:"settle",reason:"error",error:"fetch failed"});let l=await wait(f,x);assert.equal(stat(l).wait?.wait,"环境修不好");
   await f.call(["tick","--all"]);assert.equal(new Ledger(x.dir).rows.filter(r=>r.wait).length,1);assert(!l.delivery && !l.last("评审") && !l.last("复测"));
-  await f.call(["续跑",x.executionId,"--话","网络好了"]);await control(x,{type:"turn"});await control(x,{type:"settle",reason:"aborted",aborted:true});
+  await f.call(["续跑",x.executionId,"--话","网络好了"]);
+  await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);assert.match(inbox(x).at(-1)!.content,/网络好了/);
+  await control(x,{type:"settle",reason:"aborted",aborted:true});
   const previous=stat(new Ledger(x.dir)).window!;await control(x,{type:"close"});await f.call(["tick","--all"]);
   assert.equal((await status(f,x)).message,"本人中止，等本人说话");assert.equal(stat(new Ledger(x.dir)).window?.n,previous.n);
   await f.call(["答复",x.executionId,"--话","继续"]);l=await f.pump(x.dir,l=>stat(l).busy && stat(l).window?.n!==previous.n);
   assert.equal(stat(l).window?.file,previous.file);assert.match(inbox(x).at(-1)!.content,/本人答复：继续/);
+});
+
+for (const op of ["续跑","答复"]) test(`R2-1 · 开发错误耗尽后${op}唤起仍存活的窗口`,async t=>{
+  const f=fixture(t,{config:{retry:{times:0}}}),x=await open(f), initial=stat(new Ledger(x.dir)).window!.n;
+  change(x);await control(x,{type:"settle",reason:"error",error:"fetch failed"});
+  assert.equal(stat(await wait(f,x)).wait?.step,"开窗口");
+  await f.call([op,x.executionId,...(op==="答复" ? ["--话","网络已恢复"] : [])]);
+  await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);assert.equal(stat(new Ledger(x.dir)).window!.n,initial);
+  assert.match(inbox(x).at(-1)!.content,op==="答复" ? /网络已恢复/ : /继续/);
+  await deliver(f,x);await control(x,{type:"settle"});await f.pump(x.dir,l=>!!l.last("完成"));
+});
+
+for (const manual of [true,false]) test(`R2-2 · 阻断疑问答复后${manual ? "原样交付" : "分诊收货"}在同 SHA 重评`,async t=>{
+  const blocker=PASS.replace("- 疑问示例","- 阻断：是否保留旧配置？"), words="保留旧配置即可，不改代码", f=fixture(t,{reviewer:`if grep -Fq ${sq(words)} "$2"; then printf %s ${sq(PASS)}; else printf %s ${sq(blocker)}; fi`});
+  const x=await open(f);change(x);const first=await deliver(f,x);await control(x,{type:"settle"});
+  let l=await wait(f,x);assert.match(stat(l).wait?.text || "",/阻断/);assert.equal(stat(l).returned("评审").length,0);
+  const retest=l.last("复测")!.n;
+  await f.call(["答复",x.executionId,"--话",words]);await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);
+  if (manual) assert.equal((await deliver(f,x)).commit,first.commit); else write(join(x.dir,"model"),"收货");
+  await control(x,{type:"settle",text:"已按澄清检查，无需代码改动。"});
+  l=await f.pump(x.dir,l=>!!l.last("完成"),32);
+  assert.equal(l.rows.filter(r=>r.type==="提交").length,1);assert.equal(l.last("复测")!.n,retest);
+  assert.deepEqual(l.rows.filter(r=>r.type==="评审").map(r=>[r.sha,!!r.blocker]),[[first.commit,true],[first.commit,false]]);
+  assert.equal(stat(l).todo.length,0);assert.equal(stat(l).wait,undefined);
+});
+
+test("R2-3 · 接受未验证关闭旧待办并续完授权收尾，不吞之后的指令",async t=>{
+  const flow=["开发评审","测试","合入","部署","推送"], f=fixture(t,{reviewer:`printf %s ${sq(MUST)}`,card:{flow,limits:{开发评审:{maxRepairs:1}}},config:{deploy:{cmd:"deploy.sh",check:"check.sh",rollback:"rollback.sh"}}});
+  for (const script of ["deploy","check","rollback"]) writeFixtureScript(join(f.repo,script+".sh"),"sh","exit 0\n");
+  f.git("add",".");f.git("commit","-m","fixtures");const origin=join(f.base,"origin.git");f.git("init","--bare",origin);f.git("remote","add","origin",origin);f.git("push","origin","dev");
+  const x=await open(f);change(x);const {commit}=await deliver(f,x);await control(x,{type:"settle"});
+  const waiting=await wait(f,x);assert.equal(stat(waiting).wait?.wait,"轮数用完");assert(stat(waiting).todo.length);
+  const before=inbox(x).length;assert((await f.call(["合入",x.executionId,"--接受未验证","--话","确认结束此版返修，接受未验证"])).unverified);
+  const l=await f.pump(x.dir,l=>stat(l).done,32);assert.equal(inbox(x).length,before);
+  assert.equal(stat(l).side("部署")?.sha,commit);assert.equal(stat(l).side("推送")?.sha,commit);assert.equal(stat(l).returned("评审").length,1);
+  const intent=l.last("接受未验证")!;l.rows.push({type:"答复",n:l.rows.at(-1)!.n+1,at:intent.at,todo:"后来的一项请求"});
+  assert.deepEqual(stat(l).todo.map(r=>r.todo),["后来的一项请求"]);
 });
 
 test("A5/T10 · 三次 fetch failed 后同一评审成功；只有一次结论，决定可查询",async t=>{

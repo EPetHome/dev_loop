@@ -1,11 +1,13 @@
 import { join } from "node:path";
 import { alive } from "../infra/exec.ts";
-import { binding, evidence } from "./inputs.ts";
+import { acceptanceOf, binding, evidence } from "./inputs.ts";
 import { maybe } from "../infra/files.ts";
 import { Ledger, hasLedger, type Entry, type Step } from "./store.ts";
 export const resets = ["答复","续跑","加轮","接受未验证"];
 export const success = (r:Entry) => (r.type==="准备好" || r.type==="提交" || r.result==="成功" || ["通过","必修","没验证"].includes(r.check?.result || "")) && !r.kind && !r.blocker;
-export const pendingStarts = (l:Ledger) => l.rows.filter(r=>r.type==="开始" && !l.rows.some(e=>e.ref===r.n && [r.step,"准备好","提交"].includes(e.type)));
+export const pendingStarts=(l:Ledger)=>l.rows.filter(r=>r.type==="开始" && !l.rows.some(e=>e.ref===r.n && [r.step,"准备好","提交","部署已回退"].includes(e.type)));
+export const online=(step?:Step)=>step==="部署" || step==="退回";
+export const pendingDeploy=({rows}:Ledger)=>rows.findLast(r=>r.type==="部署开始" && !rows.some(e=>e.type==="部署已回退" && e.repair===r.ref || e.type==="部署" && e.ref===r.ref && /^(已部署|部署失败，已回退)/.test(e.check?.result || "")));
 export const projectedStop = (l:Ledger):Entry|undefined => {
   const stop=l.last("停"); if (stop && (stop.result==="已放弃" || stop.n>(l.last("续跑")?.n || 0))) return stop;
   return l.open.deps?.flatMap(id=>{ const dir=join(l.dir,"..",id); return hasLedger(dir) ? [projectedStop(new Ledger(dir))] : []; }).find(Boolean);
@@ -26,7 +28,8 @@ export function state(l:Ledger, evaluate=true) {
   const windowLive=windowEvent?.status!=="断" && alive(window?.owner), busy=windowLive && windowEvent?.status==="忙";
   const settled=rows.findLast(r=>r.type==="窗口" && r.status==="闲"), spoke=rows.findLast(r=>r.type==="答复" || r.type==="窗口原话" || r.type==="续跑");
   const suspended=settled?.aborted && (spoke?.n || 0)<settled.n;
-  const todo=rows.filter(r=>r.todo && r.n>last), sent=rows.filter(r=>r.type==="送达" && r.ref===window?.n), sentIds=new Set(sent.flatMap(r=>r.sent || []));
+  const accepted=acceptanceOf(rows,commit), receipt=rows.findLast(r=>r.type==="收货" && r.sha===commit && r.result==="成功" && r.value?.reused);
+  const todo=rows.filter(r=>r.todo && r.n>Math.max(last,accepted?.n || 0) && !(r.type==="答复" && r.n<(receipt?.n || 0))), sent=rows.filter(r=>r.type==="送达" && r.ref===window?.n), sentIds=new Set(sent.flatMap(r=>r.sent || []));
   const undelivered=todo.filter(r=>!sentIds.has(r.n)), starts=pendingStarts(l), running=starts.find(r=>r.step!=="收货" && alive(r.owner));
   const schedule=rows.findLast(r=>r.type==="调度" && r.owner), queued=schedule?.owner && !rows.some(r=>r.type==="开始" && r.source===schedule.n) && alive(schedule.owner) ? schedule : undefined;
   const side=(step:string)=>rows.findLast(r=>r.type===step && r.sha===sha && success(r) && (r.key===key || step==="释放"));

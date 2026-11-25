@@ -48,9 +48,9 @@ export function binding(l:Ledger,sha:string) {
 export function evidence(rows:Entry[],sha:string,key:string,pinnedTree:string) {
   const match=(r:Entry)=>r.sha===sha && r.key===key && r.check?.commit===sha && r.check.tree===pinnedTree;
   const test=rows.findLast(r=>r.type==="复测" && match(r)), review=rows.findLast(r=>r.type==="评审" && match(r) && r.check!.attempt===test?.check?.attempt);
-  const accepted=rows.some(r=>r.type==="接受未验证" && r.sha===sha && r.key===key && r.text?.trim());
-  return {test,review,accepted,verified:test?.check?.result==="通过" && review?.check?.result==="通过" && !review.blocker};
+  return {test,review,accepted:acceptanceOf(rows,sha,key),verified:test?.check?.result==="通过" && review?.check?.result==="通过" && !review.blocker};
 }
+export const acceptanceOf=(rows:Entry[],sha?:string,key?:string)=>rows.findLast(r=>r.type==="接受未验证" && r.sha===sha && (key===undefined || r.key===key) && r.text?.trim());
 export function requireGate(l:Ledger,sha:string) {
   if (!l.delivery || l.delivery.commit!==sha) throw new InputError("版本不是最后一次收货提交");
   const b=binding(l,sha), {verified,accepted}=evidence(l.rows,sha,b.key,b.tree);

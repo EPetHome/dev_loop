@@ -31,6 +31,29 @@ const thaw=(dir:string,name:string)=>write(join(dir,name),"1");
   }
 });
 
+test("R2-7 · 不稳重跑被杀后接管仍按第二次不稳发回",async t=>{
+  const f=fixture(t,{test:`if [ -e "$LOOP_TASK_DIR/pause" ] && (set -C; : > "$LOOP_TASK_DIR/retest-started") 2>/dev/null; then while :; do sleep .03; done; fi`}), x=await f.prepare();
+  const timeout=()=>locked(x.dir,l=>{const {sha,key}=state(l),j=l.add({type:"开始",step:"复测",sha,key});l.add({type:"复测",step:"复测",sha,key,ref:j.n,kind:"超时",result:"失败"});});
+  change(new Ledger(x.dir),"第一次");await receiver(f,x.dir);timeout();const first=await f.pump(x.dir,complete);assert(first.last("复测")?.flaky);
+  change(first,"第二次");const {commit}=await receiver(f,x.dir);timeout();thaw(x.dir,"pause");
+  const pending=await f.pump(x.dir,()=>existsSync(join(x.dir,"retest-started")),32);process.kill(state(pending).running!.owner!.pid,"SIGKILL");
+  const l=await f.pump(x.dir,l=>state(l).returned("复测").length || l.last("完成")?.sha===commit,32);
+  assert(l.rows.some(r=>r.type==="复测" && r.sha===commit && r.kind==="重试" && !r.check));
+  assert.match(l.last("复测")?.text || "",/第二次不稳/);assert(!l.rows.some(r=>r.type==="评审" && r.sha===commit));
+});
+
+test("R2-8 · ENOSPC 留下坏尾，查询保留历史，续跑再追加后短尾不变事实",async t=>{
+  const f=fixture(t), x=await f.prepare(), dir=x.dir, path=join(dir,"ledger.jsonl"), original=text(path);
+  const preload=write(join(f.base,"torn-write.mjs"),`import fs from 'node:fs';import {syncBuiltinESMExports} from 'node:module';
+const append=fs.appendFileSync;fs.appendFileSync=(path,bytes,...opts)=>{if(path.endsWith('/ledger.jsonl')){append(path,Buffer.from(bytes).subarray(0,bytes.indexOf('止')+2),...opts);throw Object.assign(new Error('disk full'),{code:'ENOSPC'});}return append(path,bytes,...opts);};syncBuiltinESMExports();`);
+  await assert.rejects(f.call(["停止",x.executionId],f.repo,{NODE_OPTIONS:`--import=${new URL("file://"+preload).href}`}),/disk full/);
+  const torn=readFileSync(path);assert(torn.length>Buffer.byteLength(original));assert.equal(torn.at(-1)===10,false);
+  assert.equal((await f.call(["查询",x.executionId])).executions[0].loop.ready,true);assert.equal(new Ledger(dir).last("停"),undefined);
+  await f.call(["续跑",x.executionId]);const repaired=readFileSync(path);assert(repaired.subarray(0,torn.length).equals(torn),"恢复不修改已有字节");
+  const l=new Ledger(dir);assert.deepEqual(l.rows.map(r=>r.n),[1,2,3,4]);assert.equal(l.last("续跑")?.n,4);assert(!l.last("停"));
+  await f.call(["停止",x.executionId]);assert.equal(new Ledger(dir).last("停")?.n,5);
+});
+
 test("T3/T4/T6 · 检查期间十次并发叫醒只启动一份；闲窗不分诊；迟到旧评审不扣轮",async t=>{
   const f=fixture(t,{test:'touch "$LOOP_TASK_DIR/test-running"; while [ ! -e "$LOOP_TASK_DIR/test-go" ]; do sleep .03; done',reviewer:`touch "$LOOP_TASK_DIR/review-running"; while [ ! -e "$LOOP_TASK_DIR/review-go" ]; do sleep .03; done\nif [ "$LOOP_JOB" = "$(cat "$LOOP_TASK_DIR/old-review")" ]; then printf %s ${sq(MUST)}; else printf %s ${sq(PASS)}; fi`});
   const {taskDir:dir}=await f.call(["启动",f.card]);let l=await f.pump(dir,l=>state(l).busy), pid=state(l).window!.owner!.pid;

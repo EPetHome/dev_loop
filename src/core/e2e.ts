@@ -9,9 +9,9 @@ import type { Hashes, Task } from "./store.ts";
 export function planIn<T>(dir: string, plan: T) {
   mkdirSync(dir,{mode:0o700}); writeJson(join(dir,"plan.json"),plan); return {dir,plan};
 }
-export function planE2e(t: Task, commit: string, attempt: string, hashes: Hashes, e2e: Scenario[]) {
-  const root = join(t.dir,"e2e"), paths = changedSince(t.repo,t.baseCommit,commit);
-  const scenarios = e2e.filter(s => !s.paths || s.paths.some(p => paths.some(file => matches(file,p))));
+export function planE2e(t:Task,commit:string,attempt:string,hashes:Hashes,e2e:Scenario[],selected?:Scenario[]) {
+  const root=join(t.dir,"e2e"), paths=selected ? [] : changedSince(t.repo,t.baseCommit,commit);
+  const scenarios=selected ?? e2e.filter(s=>!s.paths || s.paths.some(p=>paths.some(file=>matches(file,p))));
   mkdirSync(root,{recursive:true}); return planIn(join(root,attempt),{executionId:t.executionId,attempt,commit,...hashes,scenarios});
 }
 export function requireReport(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason); }
@@ -58,8 +58,7 @@ export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: strin
       const scene = scenarios.get(id); requireReport(scene,"缺少场景："+id);
       const steps = indexed(scene.steps,checks.map(checkId),id+" 检查点"), incomplete = new Set<string>();
       for (const [index,check] of checks.entries()) {
-        const name = checkId(check), step = steps.get(name), label = id+" / "+name;
-        if (!step) { requireReport(incomplete.size && index === steps.size,"缺少检查点："+label); break; }
+        const name=checkId(check), step=steps.get(name), label=id+" / "+name; if (!step) { requireReport(incomplete.size && index === steps.size,"缺少检查点："+label); break; }
         const {actual,dependency,error,cause} = step, expected = typeof check === "string" ? undefined : check.expected;
         requireReport(statuses.includes(step.status) && observed(actual),label+"：缺少有效状态或实得值 actual");
         if (witness) target = {status:step.status,actual};
@@ -87,6 +86,5 @@ export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: strin
       requireReport(!run.killed && (pass || wait),"退出码、普通检查或场景结论不一致"); result = pass ? "通过" : "环境未验证";
     }
     if (unit === "通过" && target) witness?.(target);
-  } catch (e) { notes.unshift(errorText(e)); }
-  return finish();
+  } catch(e) {notes.unshift(errorText(e));} return finish();
 }

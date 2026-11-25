@@ -44,9 +44,8 @@ function originalDir(path: string) {
   return Boolean(stat);
 }
 function mount(cwd: string, commit: string, {t,env,p,files}: Pair) {
-  const dirs = t.config.proofTestDirs || [], roots = dirs.filter(d => !dirs.some(other => d.startsWith(other+"/")));
-  const entries = treeFiles(cwd,commit,env), allowed = [...p.testFiles];
-  for (const {path,mode} of entries) {
+  const dirs=t.config.proofTestDirs || [], roots=dirs.filter(d=>!dirs.some(other=>d.startsWith(other+"/"))), allowed=[...p.testFiles];
+  for (const {path,mode} of treeFiles(cwd,commit,env)) {
     if (roots.some(d => path === d || path.startsWith(d+"/"))) allowed.push(path);
     if (mode === "160000" && p.testFiles.some(name => name === path || name.startsWith(path+"/"))) throw new Error("测试材料不能覆盖子模块："+path);
     if (mode !== "120000") continue;
@@ -74,8 +73,7 @@ function mount(cwd: string, commit: string, {t,env,p,files}: Pair) {
     }
   };
   return () => {
-    checkPin(cwd,commit,allowed,env);
-    roots.forEach(verifyView);
+    checkPin(cwd,commit,allowed,env); roots.forEach(verifyView);
     for (const f of files) {
       const name = evidenceFile(cwd,f.path), mode = lstatSync(name).mode & 0o111;
       requireReport(realpathSync.native(name) === join(cwd,f.path) && Boolean(mode) === (f.mode === "100755") && digest(readFileSync(name)) === f.sha256,"运行时测试材料偏离交付内容："+f.path);
@@ -107,8 +105,7 @@ function readObservation(dir: string, plan: ReturnType<typeof replayPlan>, p: Pr
 }
 async function replay(pair: Pair, commit: string, dir: string) {
   const {t,p,env,signal}=pair,{expected}=p,{plan}=planIn(dir,replayPlan(pair,commit));
-  const scene = "scenarios" in plan, evidence = new Set([join(dir,"plan.json")]), warnings: string[] = [];
-  const deadline = Date.now()+t.limits.测试.timeoutMin*60000;
+  const scene="scenarios" in plan, evidence=new Set([join(dir,"plan.json")]), warnings:string[]=[], deadline=Date.now()+t.limits.测试.timeoutMin*60000;
   let observation: Target | undefined, code: number | undefined, reason: string | undefined;
   try {
     requireReport(!signal.aborted,"证明已中断，未执行本端");
@@ -117,8 +114,7 @@ async function replay(pair: Pair, commit: string, dir: string) {
       const work = {...t,worktree:cwd}, opts = {deadline,signal,isolated:sandbox(cwd,pair),sealed:true};
       verify(); await projectCommand(work,"setup",join(dir,"setup.log"),opts); verify();
       const run = await projectCommand(work,"test",join(dir,"test.log"),{...opts,command:p.test,planEnv:{[scene ? "LOOP_E2E_DIR" : "LOOP_PROOF_DIR"]:dir}});
-      requireReport(run,"证明命令没有执行"); code=run.code; verify();
-      observation = readObservation(dir,plan,p,run,evidence);
+      requireReport(run,"证明命令没有执行"); code=run.code; verify(); observation=readObservation(dir,plan,p,run,evidence);
       const pass = observation.actual === expected, red = scene ? 1 : 76;
       requireReport(!run.killed && observation.expected === expected && observation.status === (pass ? "通过" : "失败") && run.code === (pass ? 0 : red),"目标断言的预期、实得、状态或命令退出码不一致");
     },warning => warnings.push(warning));
@@ -217,8 +213,7 @@ function publish(t: Task, r: Attempt) {
     `证据：[本次记录](${report.split("/").map(encodeURIComponent).join("/")})`],`<!-- dev-loop-proof:${attempt} -->`);
 }
 export async function prove(t: Task) {
-  const {dir,executionId} = t, proofs: (Attempt & {reused:boolean})[] = [];
-  if (!t.proofs?.length) return {executionId,proofs};
+  const {dir,executionId}=t, proofs:(Attempt & {reused:boolean})[]=[]; if (!t.proofs?.length) return {executionId,proofs};
   return underLock(join(dir,"proof.lock"),async () => {
     const binding=locked(dir,l=>{
       const delivery=l.delivery; if (!delivery) throw new InputError("尚未登记交付，不能运行证明");

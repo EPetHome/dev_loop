@@ -15,7 +15,11 @@ export function atomicWrite(path: string, text: string | Buffer): void {
   const temp=path+"."+randomUUID()+".tmp"; try {mkdirSync(dirname(path),{recursive:true});writeFileSync(temp,text);renameSync(temp,path);}finally{rmSync(temp,{force:true});}
 }
 export const writeJson = (path: string, value: unknown) => atomicWrite(path, JSON.stringify(value, null, 2) + "\n");
-export const appendJson = (path: string, value: unknown) => appendFileSync(path, JSON.stringify(value) + "\n");
+// 账本的 LF 才提交一帧；用 JSON 不可能产生的 NUL 废弃未提交尾帧，不改写历史字节。
+export const appendJson=(path:string,value:unknown,torn=false)=>appendFileSync(path,(torn ? "\0\n" : "")+JSON.stringify(value)+"\n");
+export function ledgerLines<T>(path:string) {
+  const lines=readText(path).split("\n"),torn=Boolean(lines.pop()); return {torn,rows:lines.filter(s=>s && !s.endsWith("\0")).map(s=>JSON.parse(s) as T)};
+}
 export const jsonLines = <T>(path: string): T[] => (ifPresent(() => readText(path)) || "").split("\n").filter(Boolean).map(s => JSON.parse(s));
 export class BusyError extends Error {}
 // 锁附着在本进程持有的 fd；进程被杀由内核释放，不能 unlink 锁文件。
@@ -26,6 +30,4 @@ export function lock(path: string, waitMs = 0): () => void {
   closeSync(fd); if (status === 75) throw new BusyError("任务正在处理，请稍后重试"); throw error || new Error("不能取得文件锁："+stderr);
 }
 export function withLock<T>(path: string, action: () => T, waitMs = 2000): T { const release = lock(path,waitMs); try { return action(); } finally { release(); } }
-export async function underLock<T>(path: string, action: () => Promise<T>, waitMs = 0) {
-  const release=lock(path,waitMs);try{return await action();}finally{release();}
-}
+export async function underLock<T>(path:string,action:()=>Promise<T>,waitMs=0) {const release=lock(path,waitMs);try{return await action();}finally{release();}}

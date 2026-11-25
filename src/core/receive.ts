@@ -25,13 +25,14 @@ export function receive(l:Ledger,start:Entry) {
     if (!/^(?:\.png|\.jpe?g|\.webp|\.gif)$/i.test(ext) || !lstatSync(p,{throwIfNoEntry:false})?.isFile() || found.has(page)) throw new InputError("截图不存在、格式不支持或重复："+p);
     found.set(page,p);
   }
+  const previous=l.delivery, confirm=(commit:string,pinned:string)=>({type:"收货",result:"成功",ref:start.n,sha:commit,value:{commit,tree:pinned,reused:true}});
+  if (previous && !c.changed && !images.length) return confirm(previous.commit,previous.tree);
   const missing=layout?.页面.filter(p=>!found.has(p)); if (missing?.length) throw new InputError("缺截图："+missing.join("、")+"。补齐后再交付。");
   const folder=join(t.dir,"截图",String(start.n)); if (found.size) mkdirSync(folder,{recursive:true}); const saved=[...found.values()].map(p=>{ const path=join(folder,basename(p)); copyFileSync(p,path); return path; });
   const unstaged=changes(cwd,true).filter(p=>c.dirty.includes(p)); if (unstaged.length) gitText(cwd,["add","-A","--",...unstaged]);
   if (tree(cwd)!==gitText(cwd,["write-tree"])) gitText(cwd,["commit","-m","dev-loop: "+t.name]);
-  const commit=head(cwd), pinned=tree(cwd), previous=l.delivery;
-  const reused=previous?.commit===commit && digest(JSON.stringify(saved.map(p=>workHash(folder,basename(p)))))===digest(JSON.stringify(previous.images.map(p=>digest(readFileSync(p)))));
-  if (reused) return {type:"收货",result:"成功",ref:start.n,sha:commit,value:{commit,tree:pinned,reused}};
+  const commit=head(cwd), pinned=tree(cwd);
+  if (previous?.commit===commit && JSON.stringify(saved.map(p=>digest(readFileSync(p))))===JSON.stringify(previous.images.map(p=>digest(readFileSync(p))))) return confirm(commit,pinned);
   if ((!c.changed && !previous || previous?.tree===pinned && previous.commit!==commit) && base===baseOf(l,previous?.commit || c.sha)) throw new InputError("没有新的交付改动");
   const value:Receipt={commit,tree:pinned,note,at:new Date().toISOString(),images:saved};
   const {prompt,acceptance,e2e,test,...hashes}=refs, check={...hashes,...span(Date.parse(l.last("提交")?.at || l.open.at)),step:"开发",result:"已交付",commit,tree:pinned,evidence:saved};

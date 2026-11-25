@@ -4,7 +4,7 @@ import { APP_ROOT, entrypoint, wake } from "../infra/paths.ts";
 import { errorText, readText } from "../infra/files.ts";
 import { allTasks, locate, locked, taskOf, hasLedger, LoopError, Ledger, type Step } from "../core/store.ts";
 import { InputError } from "../core/card.ts";
-import { state } from "../core/state.ts";
+import { online, state } from "../core/state.ts";
 import { publicStatus, publish } from "../core/view.ts";
 import { signalProcess } from "../infra/exec.ts";
 import { startCards } from "./start.ts";
@@ -25,8 +25,7 @@ function options(args:string[]) {
     if (specs[a]?.includes(command)) {const v=args.shift();if(v===undefined || v.startsWith("--"))throw new InputError(a+" 缺值");values[a]=v;}
     else if (a.startsWith("-")) throw new InputError("未知选项："+a); else files.push(a);
   }
-  const text=values["--text-file"]===undefined ? undefined : readText(resolve(values["--text-file"]));
-  return {command,files,images,edges,values,flags,words:values["--话"] ?? text,note:values["--说明"] ?? text ?? "",target:files[0],all:flags.has("--all")};
+  const text=values["--text-file"]===undefined ? undefined : readText(resolve(values["--text-file"])); return {command,files,images,edges,values,flags,words:values["--话"] ?? text,note:values["--说明"] ?? text ?? "",target:files[0],all:flags.has("--all")};
 }
 function matching(target?:string) {
   if (!target) {const dir=locate(process.cwd());return dir ? [dir] : [];}
@@ -59,14 +58,14 @@ export async function main(args=process.argv.slice(2)):Promise<unknown> {
   }
   if (!["答复","续跑","加轮","停止","放弃","提问"].includes(command)) throw new InputError("未知命令："+command);
   if (command==="提问" && !(words || target)?.trim() || command==="答复" && !words?.trim() || words!==undefined && !words.trim()) throw new InputError("话不能为空");
-  let abandon=false;
-  const result=locked(dir,l=>{
+  const abandon=command==="放弃", result=locked(dir,l=>{
     const s=state(l), {executionId}=l.task;
     if (command==="停止" || command==="放弃") {
-      abandon=command==="放弃"; l.add({type:"停",result:abandon ? "已放弃" : "已停止",text:words});
-      for (const p of l.rows.filter(r=>r.type==="子进程" && s.starts.some(j=>r.ref===j.n))) signalProcess(p.owner,p.status!=="窗口");
-      s.starts.forEach(j=>signalProcess(j.owner));
-      signalProcess(s.queued?.owner); signalProcess(s.window?.owner); return publish(l);
+      l.add({type:"停",result:abandon ? "已放弃" : "已停止",text:words});
+      const halt=s.starts.filter(j=>!online(j.step));
+      for (const p of l.rows.filter(r=>r.type==="子进程" && halt.some(j=>r.ref===j.n))) signalProcess(p.owner,p.status!=="窗口");
+      halt.forEach(j=>signalProcess(j.owner)); if(!s.queued?.repair) signalProcess(s.queued?.owner);
+      signalProcess(s.window?.owner); return publish(l);
     }
     if (s.stop?.result==="已放弃" || s.side("释放")?.value?.released) throw new InputError("工作区已释放或放弃");
     if (command==="提问") {l.add({type:"疑问",wait:"需求疑问",text:words || target});return {executionId,status:publish(l)};}
@@ -74,8 +73,11 @@ export async function main(args=process.argv.slice(2)):Promise<unknown> {
     const add=command==="加轮" ? Number(files[1]) : s.wait?.wait==="轮数用完" ? 1 : 0;
     if (command==="加轮" && (!Number.isSafeInteger(add) || add<1 || s.wait?.wait!=="轮数用完")) throw new InputError("仅在轮数用完时指定正整数加轮");
     if (add) l.add({type:"加轮",level:s.wait!.level,count:add,text:words || `${command} ${add}`});
-    if (words) l.add({type:"答复",text:words,...(s.wait?.wait!=="环境修不好" && {todo:"本人答复："+words})});
-    if (!add && !words || command==="续跑" && s.stop) l.add({type:"续跑",text:words || "续跑",...(s.wait?.wait==="开发推不动" || s.wait?.wait==="需求疑问" || s.suspended ? {todo:"继续按当前待办；有疑问先提问。"} : {})});
+    const resumeWindow=s.wait?.wait==="环境修不好" && s.wait.step==="开窗口" && s.settled?.ending==="error";
+    const talk=resumeWindow || s.wait?.wait!=="环境修不好" && !!words || s.wait?.wait==="开发推不动" || s.wait?.wait==="需求疑问" || s.suspended;
+    const intent={...(talk && {todo:words ? "本人答复："+words : "继续按当前待办；有疑问先提问。"}),...(resumeWindow && {step:"开窗口" as const})};
+    if (words) l.add({type:"答复",text:words,...intent});
+    if (!add && !words || command==="续跑" && s.stop) l.add({type:"续跑",text:words || "续跑",...(!words && intent)});
     return {executionId,reused:false,running:s.windowLive,status:publish(l)};
   });
   wake(dir); if(abandon) await worker(dir,{step:"放弃"}).catch(()=>{}); return result;

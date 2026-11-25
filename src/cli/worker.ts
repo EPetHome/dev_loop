@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { locked, Ledger, LoopError, type Step, type Job, type Entry, type Outcome } from "../core/store.ts";
-import { state, success, batchReady, batchPresent } from "../core/state.ts";
+import { state, success, batchReady, batchPresent, online, pendingDeploy } from "../core/state.ts";
 import { publish } from "../core/view.ts";
 import { binding, devRef, requireGate } from "../core/inputs.ts";
 import { candidate, onBranch, receive } from "../core/receive.ts";
@@ -14,8 +14,8 @@ import { deploy } from "../steps/deploy.ts";
 import { push } from "../steps/push.ts";
 import { gitText, commitOf, tree, worktreeOf, isAncestor, releaseChanges } from "../infra/git.ts";
 import { identity, signalProcess } from "../infra/exec.ts";
-import { errorText, maybe, span, underLock } from "../infra/files.ts";
-import { APP_ROOT, wake } from "../infra/paths.ts";
+import { errorText, lock, maybe, span } from "../infra/files.ts";
+import { wake } from "../infra/paths.ts";
 import { projectFile } from "../infra/project.ts";
 import { clearCheck } from "../core/run.ts";
 const finishes=["合入","部署","推送","释放","退回"], checkedSteps=["复测","评审",...finishes];
@@ -23,14 +23,16 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
   let start:Entry|undefined, b:ReturnType<typeof binding>|undefined;
   const finish=(l:Ledger,j:Entry,o:Outcome) => {
     const check=o.check && {...b?.hashes,promptHash:b?.hashes.promptHash || "",acceptanceHash:b?.hashes.acceptanceHash || "",...o.check,tree:o.check.tree || tree(l.task.repo,o.check.commit)};
-    const row=l.add({type:j.step==="准备" && !o.kind ? "准备好" : j.step!, step:j.step,ref:j.n,sha:j.sha,key:j.key,target:j.target,...o,check}); publish(new Ledger(dir)); return row;
+    const type=j.repair && !o.kind ? "部署已回退" : j.step==="准备" && !o.kind ? "准备好" : j.step!;
+    const row=l.add({type,step:j.step,ref:j.n,sha:j.sha,key:j.key,target:j.target,repair:j.repair,...o,check});publish(new Ledger(dir));return row;
   };
   try {
     const claim=locked(dir,l=>{
       const s=state(l), {t}=s, scheduled=request && s.queued?.n===request && s.queued.owner?.pid===process.pid ? s.queued : undefined;
       if (request && !scheduled) return {skipped:true};
-      const j=scheduled || job, step=job.step;
-      if (step!=="放弃" && (s.stop || s.suspended || s.wait && !accept && step!=="退回")) throw new InputError("任务当前暂停，请查询等待原因");
+      const j=scheduled || job, step=job.step, repair=j.repair;
+      if (repair && (!scheduled || step!=="部署" || pendingDeploy(l)?.ref!==repair)) return {skipped:true};
+      if (!repair && step!=="放弃" && (s.stop || s.suspended || s.wait && !accept && step!=="退回")) throw new InputError("任务当前暂停，请查询等待原因");
       if (accept && !accept.trim()) throw new InputError("接受未验证须有本人原话");
       if (s.running && (step!=="收货" || !["复测","评审"].includes(s.running.step!)) || s.queued && !scheduled && step!=="收货") throw new InputError("已有工具在运行");
       if (["开窗口","准备"].includes(step) && (!batchPresent(l) || !batchReady(l))) throw new InputError("等待同批前置卡或窗口名额");
@@ -38,11 +40,10 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
       if (s.side("释放")?.value?.released && ["收货","开窗口"].includes(step)) throw new InputError("工作区已释放");
       const old=step==="退回" ? l.rows.findLast(r=>r.type==="部署" && r.result==="成功")?.sha : undefined;
       const sha=step==="准备" ? l.last("准备好")?.sha || t.baseCommit || commitOf(t.repo,"refs/heads/"+t.base) : step==="收货" ? candidate(l).sha : j.sha || old || s.sha;
-      if (j.sha && !["准备","收货"].includes(step) && sha!==s.sha && step!=="退回") throw new InputError("目标已变化：当前收货为 "+s.sha);
-      if (job.target && checkedSteps.includes(step) && commitOf(t.repo,job.target)!==sha) throw new InputError("目标已变化：当前收货为 "+sha);
-      if (checkedSteps.includes(step) && (s.busy || s.settled?.ending && s.settled.ending!=="stop" && s.settled.n>s.last && !accept)) throw new InputError("等待开发窗口正常停下");
       if (step==="收货" && (request && s.busy || !s.busy && s.settled && s.settled.ending!=="stop")) throw new InputError("本轮未正常结束，不收货");
-      if (checkedSteps.includes(step)) {
+      if (!repair && checkedSteps.includes(step)) {
+        if (step!=="退回" && sha!==s.sha || job.target && commitOf(t.repo,job.target)!==sha) throw new InputError("目标已变化：当前收货为 "+s.sha);
+        if (s.busy || s.settled?.ending && s.settled.ending!=="stop" && s.settled.n>s.last && !accept && !s.proofs?.accepted) throw new InputError("等待开发窗口正常停下");
         if (!s.delivery) throw new InputError("没有交付记录"); b=binding(l,sha);
         if (j.key && j.key!==b.key) throw new InputError("检查输入已变化，重新调度");
         if (accept && !s.proofs?.verified && !s.proofs?.accepted) l.add({type:"接受未验证",sha,key:b.key,text:accept});
@@ -50,11 +51,11 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
       }
       const key=b?.key || j.key || "";
       const cached=l.rows.findLast(r=>r.type===step && r.sha===sha && r.key===key && success(r));
-      if (step==="准备" && s.ready || step==="开窗口" && s.windowLive && !j.file || cached && !["开窗口","退回","分诊","收货"].includes(step)) return {cached:cached?.value || cached?.check || {executionId:t.executionId,result:"已就绪"}};
+      if (!repair && (step==="准备" && s.ready || step==="开窗口" && s.windowLive && !j.file || cached && !["开窗口","退回","分诊","收货"].includes(step))) return {cached:cached?.value || cached?.check || {executionId:t.executionId,result:"已就绪"}};
       if (step==="评审" && s.returned("评审").length>=s.allowance("评审") || step==="复测" && s.returned("复测").length>=s.allowance("复测")) throw new InputError("轮数用完，须本人加轮");
       if (step==="释放" && t.after.some(k=>!s.side(k))) throw new InputError("尚未完成卡上约定的收尾");
       const {note,images,retry,file,auto,target}=j, devBefore=step==="合入" && !isAncestor(t.repo,sha,devRef) ? commitOf(t.repo,devRef) : undefined;
-      start=l.add({type:"开始",step,sha,key,source:request,retry,note,images,file,auto,target,owner:identity(),devBefore});
+      start=l.add({type:"开始",step,sha,key,source:request,retry,note,images,file,auto,target,owner:identity(),devBefore,repair});
       if (step==="收货") {
         let row:Entry;
         try {row=l.add(receive(l,start));}
@@ -85,15 +86,15 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
         default:throw new Error("未知工具");
       }
     };
-    let out:Outcome;
-    try {out=finishes.includes(j.step!) ? await underLock(projectFile(dirname(dir),t.repo,"operations"),run,2000) : await run();}
-    catch(e) {const text=errorText(e); out={result:"失败",kind:["准备","开窗口"].includes(j.step!) || /fetch failed|超时|setup 失败|timed out|正在处理|connection/i.test(text) ? "重试" : "未知",text};}
-    const row=locked(dir,current=>{
-      if (state(current,false).stop && j.step!=="放弃") out={result:"已停止"};
-      // P2 照记旧提交；正式输入漂移不能成为当前输入的通过结论。
+    const record=(out:Outcome)=>locked(dir,current=>{
+      if (!online(j.step) && j.step!=="放弃" && state(current,false).stop) out={result:"已停止"};
       if (b && ["复测","评审"].includes(j.step!) && maybe(()=>binding(current,j.sha!).key)!==b.key) out={...out,result:"失败",kind:"重试",text:"检查期间输入变化",check:out.check && {...out.check,result:"失败"}};
       return finish(current,j,out);
     });
+    let release:(()=>void)|undefined, out:Outcome;
+    try {if(finishes.includes(j.step!))release=lock(projectFile(dirname(dir),t.repo,"operations"),2000);out=await run();}
+    catch(e) {const text=errorText(e);out={result:"失败",kind:j.repair ? "环境" : ["准备","开窗口"].includes(j.step!) || /fetch failed|超时|setup 失败|timed out|正在处理|connection/i.test(text) ? "重试" : "未知",text};}
+    let row:Entry;try{row=record(out);}finally{release?.();}
     if (row.kind) throw new LoopError(row.kind==="重试" ? "临时故障" : "输入问题",row.text || row.kind,row.value);
     return row.value || row.check || {executionId:t.executionId,result:row.result};
   } finally {if (start) {delete process.env.LOOP_JOB; wake(dir);}}

@@ -2,7 +2,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, readdirSync, rea
 import { dirname, join, resolve } from "node:path";
 import { InputError, type Card, type Proof } from "./card.ts";
 import { inside, type Config } from "../infra/config.ts";
-import { appendJson, jsonLines, readJson, ifPresent, iso, type span, withLock } from "../infra/files.ts";
+import { appendJson, ledgerLines, readJson, ifPresent, iso, type span, withLock } from "../infra/files.ts";
 import { tree } from "../infra/git.ts";
 import { tasksRoot } from "../infra/paths.ts";
 import type { Identity } from "../infra/exec.ts";
@@ -21,7 +21,7 @@ export type Step = "准备"|"开窗口"|"收货"|"复测"|"评审"|"分诊"|"合
 export type Kind = "重试"|"超时"|"产品"|"冲突"|"未知"|"环境"|"疑问";
 export type Wait = "需求疑问"|"轮数用完"|"开发推不动"|"环境修不好";
 export interface Receipt {commit:string; tree:string; note:string; at:string; images:string[]}
-export interface Job {step:Step; sha:string; key:string; retry?:boolean; source?:number; devBefore?:string; note?:string; images?:string[]; file?:string; auto?:boolean; target?:string}
+export interface Job {step:Step; sha:string; key:string; retry?:boolean; source?:number; devBefore?:string; note?:string; images?:string[]; file?:string; auto?:boolean; target?:string; repair?:number}
 export interface Outcome { result:string; kind?:Kind; text?:string; check?:Check; value?:any; flaky?:string; blocker?:string; baseFiles?:Record<string,string> }
 export interface Entry extends Partial<Job>, Partial<Outcome> {
   type:string; n:number; at:string; ref?:number; owner?:Identity; todo?:string; wait?:Wait; rule?:number; status?:string;
@@ -32,16 +32,18 @@ export const ledgerFile = (dir:string) => join(dir,"ledger.jsonl");
 export const hasLedger = (dir:string) => existsSync(ledgerFile(dir));
 export const cardLock = (dir:string) => join(dir,"card.lock");
 export class Ledger {
-  readonly dir:string; readonly rows:Entry[]; readonly open:Entry; readonly task:Task;
+  readonly dir:string; readonly rows:Entry[]; readonly open:Entry; readonly task:Task; private torn:boolean;
   constructor(dir:string) {
-    this.dir=dir; this.rows=jsonLines<Entry>(ledgerFile(dir));
+    const {rows,torn}=ledgerLines<Entry>(ledgerFile(dir)); this.dir=dir; this.rows=rows; this.torn=torn;
     if (this.rows[0]?.type!=="开工" || !this.rows[0].task) throw new InputError("没有新版开工账本："+dir);
     this.open=this.rows[0]; const t=this.open.task!, baseCommit=this.last("准备好")?.sha || this.rows.find(r=>r.type==="开始" && r.step==="准备")?.sha || "";
     this.task={...t,baseCommit,proofs:t.proofs?.map(p=>({...p,before:p.before || baseCommit}))};
   }
   last(type:string) { return this.rows.findLast(r=>r.type===type); }
   add(entry:Omit<Entry,"n"|"at">, now=Date.now()) {
-    const row={...entry,n:(this.rows.at(-1)?.n || 0)+1,at:iso(now)}; appendJson(ledgerFile(this.dir),row); this.rows.push(row); return row;
+    const row={...entry,n:(this.rows.at(-1)?.n || 0)+1,at:iso(now)};
+    const torn=this.torn; this.torn=true; appendJson(ledgerFile(this.dir),row,torn);
+    this.torn=false; this.rows.push(row); return row;
   }
   get delivery():Receipt|undefined { return this.last("提交")?.value; }
   get checks() { return this.rows.flatMap(r=>r.check ? [r.check] : []); }
@@ -53,12 +55,10 @@ export const allTasks = (root=tasksRoot()) => (ifPresent(()=>readdirSync(root,{w
   const dir=join(root,e.name); return e.isDirectory() && !e.name.startsWith(".") && (hasLedger(dir) || existsSync(join(dir,"task.json"))) ? [dir] : [];
 });
 export const locate=(cwd:string,env=process.env)=>env.LOOP_TASK_DIR ? resolve(env.LOOP_TASK_DIR) : allTasks(tasksRoot(env)).find(d=>{const w=taskOf(d).worktree;return w && inside(w,realpathSync(cwd));});
-export function recordStep(dir:string,entry:Omit<Check,keyof Hashes|"tree"> & Partial<Hashes & {tree:string}>) {
+export const recordStep=(dir:string,entry:Omit<Check,keyof Hashes|"tree"> & Partial<Hashes & {tree:string}>)=>
   locked(dir,l=>l.add({type:entry.step,check:{promptHash:"",acceptanceHash:"",...entry,tree:entry.tree ?? tree(l.task.repo,entry.commit)}}));
-}
 export function batchResult(t:Task,lines:string[],marker:string) {
-  const batch=dirname(t.card), file=join(batch,"结果.md");
-  if (realpathSync.native(batch)!==batch || !inside(t.repo,batch)) throw new InputError("批次目录已移动或越界："+batch);
+  const batch=dirname(t.card), file=join(batch,"结果.md"); if (realpathSync.native(batch)!==batch || !inside(t.repo,batch)) throw new InputError("批次目录已移动或越界："+batch);
   const fd=openSync(file,constants.O_CREAT|constants.O_APPEND|constants.O_RDWR|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o644);
   try {
     const info=fstatSync(fd); if (!info.isFile() || info.nlink!==1) throw new InputError("结果.md 不是批次独有的普通文件："+file);
