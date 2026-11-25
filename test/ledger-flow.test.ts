@@ -48,10 +48,10 @@ cp.spawnSync=function(cmd,args,...rest){
   f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,"--import="+new URL("file://"+hook).href].filter(Boolean).join(" ");
   const {taskDir:dir}=await f.call(["启动",f.card]);
   // 这里确实要杀调度 CLI，pulse 保留子进程；等待活 worker 时不重开调度 CLI。
-  const bump=(pick:(l:Ledger)=>boolean)=>f.pump(dir,pick,30000,async()=>{
+  const bump=(pick:(l:Ledger)=>boolean)=>f.pump(dir,pick,{pulse:async()=>{
     try {const r=await f.call(["tick","--all"]);assert(!r.errors.length,JSON.stringify(r.errors));}
     catch(e:any){if(e.signal!=="SIGKILL")throw e;}
-  });
+  }});
   let l=await bump(l=>stat(l).busy), x=l.task, original=stat(l).window!;
   change(x,"recovered after kill\n");await assert.rejects(deliver(f,x),{signal:"SIGKILL"});
   process.kill(original.owner!.pid,"SIGKILL");
@@ -140,7 +140,7 @@ for (const manual of [true,false]) test(`R2-2 · 阻断疑问答复后${manual ?
   await f.call(["答复",x.executionId,"--话",words]);await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);
   if (manual) assert.equal((await deliver(f,x)).commit,first.commit); else write(join(x.dir,"model"),"收货");
   await control(x,{type:"settle",text:"已按澄清检查，无需代码改动。"});
-  l=await f.pump(x.dir,l=>!!l.last("完成"),5000);
+  l=await f.pump(x.dir,l=>!!l.last("完成"));
   assert.equal(l.rows.filter(r=>r.type==="提交").length,1);assert.equal(l.last("复测")!.n,retest);
   assert.deepEqual(l.rows.filter(r=>r.type==="评审").map(r=>[r.sha,!!r.blocker]),[[first.commit,true],[first.commit,false]]);
   assert.equal(stat(l).todo.length,0);assert.equal(stat(l).wait,undefined);
@@ -153,7 +153,7 @@ test("R2-3 · 接受未验证关闭旧待办并续完授权收尾，不吞之后
   const x=await open(f);change(x);const {commit}=await deliver(f,x);await control(x,{type:"settle"});
   const waiting=await wait(f,x);assert.equal(stat(waiting).wait?.wait,"轮数用完");assert(stat(waiting).todo.length);
   const before=inbox(x).length;assert((await f.call(["合入",x.executionId,"--接受未验证","--话","确认结束此版返修，接受未验证"])).unverified);
-  const l=await f.pump(x.dir,l=>stat(l).done,5000);assert.equal(inbox(x).length,before);
+  const l=await f.pump(x.dir,l=>stat(l).done);assert.equal(inbox(x).length,before);
   assert.equal(stat(l).side("部署")?.sha,commit);assert.equal(stat(l).side("推送")?.sha,commit);assert.equal(stat(l).returned("评审").length,1);
   const intent=l.last("接受未验证")!;l.rows.push({type:"答复",n:l.rows.at(-1)!.n+1,at:intent.at,todo:"后来的一项请求"});
   assert.deepEqual(stat(l).todo.map(r=>r.todo),["后来的一项请求"]);
@@ -193,7 +193,10 @@ test("A8 · 冲突清单发回，合入 dev 后起点前移、他人文件不进
   write(join(f.repo,"src/app.txt"),"dev 版本\n");write(join(f.repo,"outside.txt"),"他人独立改动\n");f.git("add",".");f.git("commit","-m","dev advancing");
   let l=await f.pump(x.dir,l=>l.rows.some(r=>r.type==="发回" && r.step==="合入") && stat(l).busy);
   assert.match(inbox(x).at(-1)!.content,/src\/app\.txt/);assert.equal(stat(l).returned("评审").length,0);
-  assert.throws(()=>fgit(x,"merge","dev"));change(x,"解决冲突\n");fgit(x,"add","src/app.txt");fgit(x,"commit","--no-edit");
+  assert.throws(()=>fgit(x,"merge","--no-edit","dev"));
+  assert.match(fgit(x,"ls-files","-u"),/src\/app\.txt/);
+  assert.equal(fgit(x,"rev-parse","MERGE_HEAD"),f.git("rev-parse","dev"));
+  change(x,"解决冲突\n");fgit(x,"add","src/app.txt");fgit(x,"commit","-m","resolve fixture merge");
   const {commit}=await deliver(f,x);await control(x,{type:"settle"});l=await f.pump(x.dir,l=>!!stat(l).side("合入") && stat(l).done);
   assert.equal(l.last("评审")?.sha,commit);assert.doesNotMatch(readFileSync(l.last("评审")!.check!.evidence.find(p=>p.includes("review-input"))!,"utf8"),/他人独立改动|outside\.txt/);
   assert.equal(f.git("rev-parse","dev^2"),commit);

@@ -18,8 +18,8 @@ const doc = (path:string,o:unknown) => write(path,json(o));
 const jsonl = (path:string,o:unknown[]) => write(path,o.map(v=>JSON.stringify(v)).join("\n")+"\n");
 function fixture(t:TestContext) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(),"coordinate-test-"))), repo = join(dir,"PA 项目"), other = join(dir,"别的项目"), tasks = join(dir,"tasks");
-  for (const p of [repo,other,tasks]) mkdirSync(p);
   t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  for (const p of [repo,other,tasks]) mkdirSync(p);
   const args = (cmd:string,more:string[]=[])=>[cmd,"--project",repo,"--tasks-root",tasks,...more];
   const run = (cmd:string,more:string[]=[],clock=now) => {
     const report = coordinate(args(cmd,more),clock);

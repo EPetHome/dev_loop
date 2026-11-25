@@ -127,7 +127,7 @@ test("N4 A1/A3 · 完成后 Pi 原话只触发一次本地合入，窗口显示�
   assert.equal(quote.text, text);
   assert(quote.n > done.last("完成")!.n);
   view.busy(); // 合入不靠开发方回复或正常停下。
-  const merged = await f.pump(x.dir, l => !!l.last("合入"), 2500);
+  const merged = await f.pump(x.dir, l => !!l.last("合入"));
   const intent = quoteIntents(merged)[0], merge = merged.last("合入")!, tip = f.git("rev-parse", "dev");
   assert.equal(intent?.ref, quote.n);
   assert.equal(intent?.text, text);
@@ -219,7 +219,7 @@ test("N4 A5 · 伪造完成遭合入工具拒绝，窗口说明原因且查询�
   const f = fixture(t), {x, view, commit} = await receipt(f), before = f.git("rev-parse", "dev");
   const fake = locked(x.dir, l => l.add({type: "完成", sha: commit}));
   view.input("合入");
-  const l = await f.pump(x.dir, l => !!l.last("合入") || !!l.last("评审"), 2500);
+  const l = await f.pump(x.dir, l => !!l.last("合入") || !!l.last("评审"));
   assert.equal(l.last("评审"), undefined, "合入工具应先独立核对现有证据");
   const rejected = l.last("合入")!;
   assert.equal(rejected.result, "失败");
