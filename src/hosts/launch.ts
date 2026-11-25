@@ -20,7 +20,7 @@ export async function openWindow(l:Ledger,start:Entry) {
     realpathSync(file).startsWith(join(t.dir,"sessions")+"/") && jsonLines<{type:string}>(file)[0]?.type==="session");
   const id=resume ? window?.value.id : randomUUID(), folder=join(t.dir,"sessions"), opening=join(t.dir,`opening-${start.n}.md`), loop=join(APP_ROOT,"bin/loop");
   const {prompt,acceptance}=inputs(t), last=l.rows.findLast(r=>r.type==="评审" && r.check?.result==="必修"); mkdirSync(folder,{recursive:true});
-  atomicWrite(opening,[`受管开发卡 ${t.executionId}。做完运行 ${loop} 交付；疑问用 ${loop} 提问。不要自行验证放行或合入部署。`,prompt,acceptance,
+  atomicWrite(opening,[`受管开发卡 ${t.executionId}。做完运行 ${loop} 交付；疑问用 ${loop} 提问。不要自行验证放行或合入部署。卡完成后，本人在这个窗口单独说「合入」由 dev-loop 处理；开发方不要运行合入命令，也不要让本人去终端执行。`,prompt,acceptance,
     `最新收货：${s.delivery?.commit || "无"}`,last ? `上轮必修原文（${last.check?.evidence[1]}）：\n${last.value?.items?.join("\n")}` : "",
     ...(t.版式 ? [`截图按页面名交付：${t.版式.页面.join("、")}`] : [])].join("\n\n"));
   const args=["--cwd",t.worktree,"--name",t.executionId,"--model",t.config.developerModel,"--thinking",t.config.developerThinking,

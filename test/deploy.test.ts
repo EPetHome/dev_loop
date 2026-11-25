@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -15,6 +15,9 @@ function project(t:any,check="exit 0",rollback="exit 0",flow=["开发评审","�
   writeFixtureScript(join(f.repo,"snapshot.sh"),"sh",'echo \'{"good":true}\' > "$LOOP_SNAPSHOT_OUT"\n');
   f.git("add",".");f.git("commit","-m","deployment doubles"); return f;
 }
+// 不同临时项目可以重叠等待；单个部署及补偿仍按真实顺序执行。
+describe("隔离部署与恢复",{concurrency:2},registerCases);
+function registerCases() {
 test("部署 · 绑最后收货 SHA、隔离检出、前后快照、重复不部署、可退回",async t=>{
   const f=project(t), x=await f.prepare();write(join(x.worktree,"src/app.txt"),"deployed version\n");const {commit}=deliver(x.dir);await settle(x.dir);
   const r=await f.call(["部署",x.executionId]);assert.equal(r.commit,commit);assert.deepEqual(r.steps.map(x=>x.name),["cmd","check"]);
@@ -37,7 +40,7 @@ for (const stopped of [false,true]) test(`R2-4 · 部分发布后杀 worker${sto
   const l=await f.pump(x.dir,l=>existsSync(join(f.base,"deploy-started"))), owner=state(l).running!.owner!;
   assert.equal(state(l).running!.step,"部署");process.kill(owner.pid,"SIGKILL");await until(x.dir,()=>alive(owner),v=>!v);
   if (stopped) await f.call(["停止",x.executionId]);
-  const finished=await f.pump(x.dir,l=>stopped ? !!l.last("部署已回退") : state(l).done,42);
+  const finished=await f.pump(x.dir,l=>stopped ? !!l.last("部署已回退") : state(l).done,6000);
   assert.equal(readFileSync(join(f.base,"sequence"),"utf8"),stopped ? "cmd\ninterrupted\n" : "cmd\ninterrupted\ncmd\n");
   assert(finished.rows.some(r=>r.type==="部署" && r.kind==="重试" && !r.check));
   assert.equal(finished.rows.filter(r=>r.type==="部署已回退").length,1);
@@ -62,7 +65,7 @@ cp.spawn=(cmd,args,opts)=>{
   f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,`--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
   const injected=()=>JSON.parse(readFileSync(fault,"utf8")) as {child:Identity;ref:number};
   try {
-    const done=await f.pump(x.dir,l=>state(l).done,54),{child,ref}=injected();
+    const done=await f.pump(x.dir,l=>state(l).done,8000),{child,ref}=injected();
     assert(done.rows.some(r=>r.type==="部署开始" && r.ref===ref));assert(!done.rows.some(r=>r.type==="子进程" && r.owner?.pid===child.pid));
     assert(done.rows.some(r=>r.type==="部署" && r.kind==="重试" && r.ref===ref));
     write(go,"");await until(f.base,()=>alive(child),v=>!v);
@@ -77,7 +80,7 @@ for (const mode of ["cmd成功","cmd后回退","回退中"]) test(`R2-5 · ${mod
   f.git("add",".");f.git("commit","-m","stoppable deploy");const x=await f.prepare();write(join(x.worktree,"src/app.txt"),"version\n");deliver(x.dir);await settle(x.dir);
   const l=await f.pump(x.dir,l=>existsSync(ready)), owner=state(l).running!.owner!;
   assert.equal((await f.call(["停止",x.executionId])).state,"cancelled");assert(alive(owner));
-  write(gate,"");const finished=await f.pump(x.dir,l=>!!l.last("部署")?.check,32), actual=finished.last("部署")!.check!;
+  write(gate,"");const finished=await f.pump(x.dir,l=>!!l.last("部署")?.check,4000), actual=finished.last("部署")!.check!;
   assert.equal(actual.result,failed ? "部署失败，已回退" : "已部署");
   if(failed) assert.equal(readFileSync(join(actual.evidence[1],"rollback-cause"),"utf8"),"check\n");
   await f.call(["tick","--all"]);assert(existsSync(x.worktree));assert.equal(state(finished).stop?.result,"已停止");assert(!new Ledger(x.dir).last("释放"));
@@ -88,3 +91,4 @@ test("部署 · 脚本不是检出中的可执行普通文件则不运行",async
   const x=await f.prepare();write(join(x.worktree,"src/app.txt"),"deployed version\n");deliver(x.dir);await settle(x.dir);
   await assert.rejects(f.call(["部署",x.executionId]),/不是|不可执行/);assert(!new Ledger(x.dir).last("部署")?.check);
 });
+}

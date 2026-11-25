@@ -38,7 +38,7 @@ test("E2E · 退出 75 与绑定的外部探测一致才是环境缺项；不造
 test("R2-6 · 起点对照沿用交付版场景计划，路径限定的共同失败不扣轮",async t=>{
   const f=project(t,[{id:"S4",paths:["src/app.txt"],checks:[{id:"同一任务完成通知",expected:1}]}]),x=await f.prepare();
   write(join(x.worktree,"src/app.txt"),"new\n");const {commit}=deliver(x.dir);write(join(x.dir,"mode"),"only-stop");
-  const l=await f.pump(x.dir,l=>!!state(l).wait || !!l.last("发回"),25), c=l.last("复测")!.check!;
+  const l=await f.pump(x.dir,l=>!!state(l).wait || !!l.last("发回"),4000), c=l.last("复测")!.check!;
   const plans=c.evidence.filter(p=>p.endsWith("/plan.json")).map(p=>getJson(p));assert.equal(plans.length,2);
   assert.deepEqual(plans.map(p=>p.commit),[commit,x.baseCommit]);assert.deepEqual(plans[0].scenarios,plans[1].scenarios);assert.equal(plans[1].scenarios[0].id,"S4");
   assert.equal(c.result,"环境未验证");assert.equal(state(l).wait?.wait,"环境修不好");assert.equal(state(l).returned("复测").length,0);

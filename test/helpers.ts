@@ -10,6 +10,8 @@ import { assertNoFixtureProcesses, stopFixtureProcesses } from "./fixture-cleanu
 import { Ledger } from "../src/core/store.ts";
 import { report } from "../src/core/view.ts";
 import { binding, evidence } from "../src/core/inputs.ts";
+import { state } from "../src/core/state.ts";
+import { tick } from "../src/cli/tick.ts";
 process.env.LOOP_CAFFEINATE_CMD="/usr/bin/true";
 if (process.platform==="darwin" && execFileSync("/bin/sh",["-c","command -v git"],{encoding:"utf8"}).trim()==="/usr/bin/git") process.env.PATH=dirname(execFileSync("/usr/bin/xcrun",["--find","git"],{encoding:"utf8"}).trim())+":"+process.env.PATH;
 export const ROOT=resolve(import.meta.dirname,".."), NODE=process.execPath;
@@ -31,7 +33,7 @@ after(() => {
   try { assertNoFixtureProcesses(...fixtureBases); }
   finally { if (compileCache) rmSync(compileCache, {recursive: true, force: true}); }
 });
-export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer?:string;config?:any;card?:any;cliTimeoutMs?:number;tasksName?:string}={}) {
+export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer?:string;config?:any;card?:any;cliTimeoutMs?:number;tasksName?:string;pollMs?:number}={}) {
   // 同一测试文件反复开 CLI；只给这些子进程复用 Node 的临时编译缓存。
   if (!process.env.NODE_COMPILE_CACHE && process.env.NODE_DISABLE_COMPILE_CACHE !== "1") {
     compileCache ??= mkdtempSync(join(tmpdir(), "dev-loop-compile-"));
@@ -56,13 +58,28 @@ export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer
   const launch=writeFixtureScript(join(base,"fake-launch.cjs"),"node",`import(${JSON.stringify(new URL("./fake-window.ts",import.meta.url).href)}).then(m=>m.fakeWindow()).catch(e=>{console.error(e);process.exitCode=1;});\n`);
   const model=writeFixtureScript(join(base,"fake-pi.cjs"),"node",`const fs=require('node:fs'),f=process.env.LOOP_TASK_DIR+'/model'; process.stdout.write(fs.existsSync(f)?fs.readFileSync(f,'utf8'):'等本人');\n`);
   const env:NodeJS.ProcessEnv={...process.env,LOOP_TASK_DIR:undefined,LOOP_ROLE:undefined,LOOP_JOB:undefined,LOOP_WAKE:"manual",LOOP_TASKS_ROOT:root,LOOP_LAUNCH_CMD:launch,PI_BIN:model,PATH:dirname(NODE)+":"+process.env.PATH};
-  const cli=(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>promisify(execFile)(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd,env:{...env,...extraEnv},timeout:options.cliTimeoutMs || 15000,maxBuffer:16*1024*1024});
+  const invoke=(entry:string,args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>promisify(execFile)(NODE,[join(ROOT,entry),...args],{cwd,env:{...env,...extraEnv},timeout:options.cliTimeoutMs || 15000,maxBuffer:16*1024*1024});
+  const cli=(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>invoke("src/cli/main.ts",args,cwd,extraEnv);
   const call=async(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>{const r=await cli([...args,"--json"],cwd,extraEnv);return JSON.parse(r.stdout || "null");};
   const proc=(args:string[],extraEnv:NodeJS.ProcessEnv={})=>spawn(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd:repo,env:{...env,...extraEnv},stdio:"ignore"});
+  const advance=()=>{
+    const r=tick(undefined,root,Date.now(),env);
+    if(r.errors.length)throw new Error(JSON.stringify(r.errors));
+  };
   return {base,repo,root,card,raw,git,env,cli,call,proc,
-    async prepare() {const r=await call(["启动",card]);await call(["准备",r.executionId]);return new Ledger(r.taskDir).task;},
-    async pump(dir:string,pick:(l:Ledger)=>boolean,max=120) {
-      for(let i=0;i<max;i++) {const l=new Ledger(dir);if(pick(l))return l; const r=await call(["tick","--all"]);if(r.errors.length)throw new Error(JSON.stringify(r.errors));await delay(18);}
+    async prepare() {
+      const {stdout}=await invoke("test/fixture-cli.ts",["prepare",card]);
+      return new Ledger(JSON.parse(stdout).taskDir).task;
+    },
+    async pump(dir:string,pick:(l:Ledger)=>boolean,timeoutMs=12000,pulse:()=>void|Promise<void>=advance) {
+      // 真 worker、卡锁和进程身份照旧；等子进程时只查账本，不为轮询反复冷启 CLI。
+      const deadline=Date.now()+timeoutMs;
+      do {
+        const l=new Ledger(dir); if(pick(l))return l;
+        const {running,queued}=state(l,false);
+        if (!running && !queued) await pulse();
+        await delay(options.pollMs ?? 15);
+      } while (Date.now()<deadline);
       throw new Error("tick 未到预期："+readFileSync(join(dir,"ledger.jsonl"),"utf8").slice(-4300)+(existsSync(join(dir,"worker.log")) ? readFileSync(join(dir,"worker.log"),"utf8").slice(-2000) : ""));
     }
   };
@@ -73,7 +90,9 @@ export async function until<T>(dir:string,get:()=>T,ready:(v:T)=>boolean,file?:s
   }
   throw new Error("等不到："+(file || dir));
 }
-const direct=(dir:string,cmd:string)=>JSON.parse(execFileSync(NODE,[join(ROOT,"src/cli/main.ts"),cmd,...(cmd==="交付" ? [] : [dir]),"--json"],{env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:dir,LOOP_TASKS_ROOT:dirname(dir),LOOP_WAKE:"manual"},encoding:"utf8",stdio:["ignore","pipe","pipe"]}));
-export const deliver=(dir:string)=>direct(dir,"交付"), statusOf=(dir:string)=>report(new Ledger(dir));
-export async function settle(dir:string) {direct(dir,"复测");direct(dir,"评审");}
+const direct=(dir:string,entry:string,args:string[])=>execFileSync(NODE,[join(ROOT,entry),...args],{
+  env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:dir,LOOP_TASKS_ROOT:dirname(dir),LOOP_WAKE:"manual"},encoding:"utf8",stdio:["ignore","pipe","pipe"]
+});
+export const deliver=(dir:string)=>JSON.parse(direct(dir,"src/cli/main.ts",["交付","--json"])), statusOf=(dir:string)=>report(new Ledger(dir));
+export async function settle(dir:string) {direct(dir,"test/fixture-cli.ts",["settle",dir]);}
 export function checked(dir:string,sha:string) {const l=new Ledger(dir),b=binding(l,sha);return evidence(l.rows,sha,b.key,b.tree).verified;}

@@ -1,17 +1,17 @@
 import { spawn } from "node:child_process";
 import { openSync, closeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { alive, identity, signalProcess } from "../infra/exec.ts";
 import { BusyError, errorText, maybe } from "../infra/files.ts";
 import { entrypoint, tasksRoot, wake } from "../infra/paths.ts";
 import { Ledger, allTasks, hasLedger, locked, type Entry, type Job, type Step } from "../core/store.ts";
-import { state, success, returnedMessage, resets, batchReady, batchPresent, pendingDeploy } from "../core/state.ts";
+import { state, success, returnedMessage, resets, batchReady, batchPresent, pendingDeploy, waiting, windowSuspended } from "../core/state.ts";
 import { candidate } from "../core/receive.ts";
 import { publish } from "../core/view.ts";
 import { newContext } from "../hosts/launch.ts";
 const circle="⓪①②③④⑤⑥⑦⑧";
 export function decide(l:Ledger,now=Date.now()) {
-  const s=state(l), {rows,t,ready,wait,stop,settled,sha,key,proofs}=s;
+  const s=state(l), {rows,t,ready,wait,stop,settled,sha,key,proofs,complete}=s;
   type Decision=Omit<Entry,"n"|"at"> & {job?:Partial<Job> & {step:Step}};
   const say=(rule:number,text:string,data:Partial<Decision>={}):Decision=>({type:"调度",rule,text,...data});
   const tool=(rule:number,step:Step,options:Partial<Job>={})=>say(rule,"启动"+step,{step,job:{step,sha,key,auto:true,...options}});
@@ -26,6 +26,20 @@ export function decide(l:Ledger,now=Date.now()) {
   if (stop) return stop===l.last("停") && stop.result==="已放弃" && !rows.some(r=>r.type==="放弃" && success(r)) && !s.running && !s.queued
     ? tool(2,"放弃") : undefined;
   if (wait) return say(1,"等待："+wait.wait);
+  if (complete && ready && s.delivery && !t.after.length && !s.todo.length && !s.running && !s.queued && !s.suspended) {
+    // 已授权的自动收尾另走原规则。本分支只认完成之后的原话，不核放行证据。
+    const intents=rows.filter(r=>r.type==="合入意图" && r.sha===sha && r.n>complete.n);
+    const pending=intents.find(r=>!rows.some(e=>e.type==="合入" && e.intent===r.n));
+    if (pending) return tool(8,"合入",{intent:pending.n,key:pending.key || ""});
+    if (!s.side("合入")) {
+      const quote=rows.find((r,i)=>{
+        if (r.n<=complete.n || r.type!=="窗口原话" || r.text?.trim()!=="合入" || intents.some(e=>e.ref===r.n)) return false;
+        const before=rows.slice(0,i); // 这一句本身可以解除疑问或 Esc 中止，但不能追认成放行意图。
+        return !waiting(before) && !windowSuspended(before);
+      });
+      if (quote) return say(8,quote.text!,{type:"合入意图",step:"合入",ref:quote.n,sha,key:complete.key || ""});
+    }
+  }
   if (s.running || s.queued || s.busy || s.suspended) return say(2,s.suspended ? "本人中止，等本人说话" : s.busy ? "窗口忙" : "已有工具在跑");
   if ((!ready || !s.windowLive && s.todo.length) && !batchReady(l)) return say(0,"等待同批前置卡或窗口名额");
   const cutoff=rows.findLast(r=>resets.includes(r.type))?.n || 0;
@@ -112,14 +126,15 @@ export function decide(l:Ledger,now=Date.now()) {
   }
 }
 function receiptArgs(rows:Entry[],result:Entry) {const s=rows.find(r=>r.n===result.ref);return {note:s?.note,images:s?.images};}
-export function tick(target?:string,root=tasksRoot(),now=Date.now()) {
+export function tick(target?:string,root=tasksRoot(),now=Date.now(),env=process.env) {
   const decisions:unknown[]=[], errors:unknown[]=[];
   for (const dir of (target ? [target] : allTasks(root)).filter(hasLedger)) try {
-    locked(dir,l=>{
+    const followUp=locked(dir,l=>{
+      let advance=false;
       for (const dead of state(l,false).starts.filter(r=>!alive(r.owner))) {
         const opened=dead.step==="开窗口" && l.rows.some(r=>r.type==="窗口" && r.status==="开" && r.ref===dead.n);
         if (!opened) for (const e of l.rows.filter(r=>r.type==="子进程" && r.ref===dead.n)) signalProcess(e.owner,e.status!=="窗口");
-        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,
+        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,intent:dead.intent,
           result:opened ? "成功" : "失败",...(!opened && {kind:"重试",text:"工具进程已退出，未留下结论"})},now);
       }
       const decision=decide(l,now); if (decision) {
@@ -129,17 +144,21 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now()) {
           const log=openSync(join(dir,"worker.log"),"a");
           try {
             const id=(l.rows.at(-1)?.n || 0)+1, p=spawn(process.execPath,[entrypoint,"_worker",dir,String(id),job.step],{
-              env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:undefined},detached:true,stdio:["ignore",log,log]
+              env:{...env,LOOP_ROLE:undefined,LOOP_TASK_DIR:undefined},detached:true,stdio:["ignore",log,log]
             });
             p.on("error",console.error); p.unref(); l.add({...row,...job,owner:p.pid ? identity(p.pid) : undefined},now);
           } finally {closeSync(log);}
         } else if (row.type!=="调度" || l.last("调度")?.text!==row.text || l.last("调度")?.owner) {
-          l.add(row,now); if (row.type==="完成") wake(dir);
+          l.add(row,now); advance=row.type==="完成" || row.type==="合入意图";
         }
       }
-      if (state(l).done && (l.open.batch?.length || 0)>1) signalProcess(state(l,false).window?.owner);
+      if ((l.open.batch?.length || 0)>1) {
+        const s=state(l); if (s.done) signalProcess(s.window?.owner);
+      }
       publish(l);
+      return advance;
     },0);
+    if (followUp) wake(dir,env);
   } catch(e) {if(!(e instanceof BusyError)) errors.push({dir,error:errorText(e)});}
   return {decisions,errors};
 }

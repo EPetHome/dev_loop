@@ -25,42 +25,49 @@ export async function worker(dir:string,job:Partial<Job> & {step:Step},request?:
     const check=o.check && {...b?.hashes,promptHash:b?.hashes.promptHash || "",acceptanceHash:b?.hashes.acceptanceHash || "",
       ...o.check,tree:o.check.tree || tree(l.task.repo,o.check.commit)};
     const type=j.repair && !o.kind ? "部署已回退" : j.step==="准备" && !o.kind ? "准备好" : j.step!;
-    const row=l.add({type,step:j.step,ref:j.n,sha:j.sha,key:j.key,target:j.target,repair:j.repair,...o,check});publish(new Ledger(dir));return row;
+    const row=l.add({type,step:j.step,ref:j.n,sha:j.sha,key:j.key,target:j.target,repair:j.repair,intent:j.intent,...o,check});publish(new Ledger(dir));return row;
   };
   try {
     const claim=locked(dir,l=>{
       const s=state(l), {t}=s, scheduled=request && s.queued?.n===request && s.queued.owner?.pid===process.pid ? s.queued : undefined;
       if (request && !scheduled) return {skipped:true};
-      const j=scheduled || job, step=job.step, repair=j.repair;
+      const j=scheduled || job, step=job.step, repair=j.repair, intent=step==="合入" ? scheduled?.intent : undefined;
       if (repair && (!scheduled || step!=="部署" || pendingDeploy(l)?.ref!==repair)) return {skipped:true};
-      if (!repair && step!=="放弃" && (s.stop || s.suspended || s.wait && !accept && step!=="退回")) throw new InputError("任务当前暂停，请查询等待原因");
-      if (accept && !accept.trim()) throw new InputError("接受未验证须有本人原话");
-      if (s.running && (step!=="收货" || !["复测","评审"].includes(s.running.step!)) || s.queued && !scheduled && step!=="收货") throw new InputError("已有工具在运行");
-      if (["开窗口","准备"].includes(step) && (!batchPresent(l) || !batchReady(l))) throw new InputError("等待同批前置卡或窗口名额");
-      if (step!=="准备" && step!=="放弃" && !s.ready) throw new InputError("工作区尚未准备好");
-      if (s.side("释放")?.value?.released && ["收货","开窗口"].includes(step)) throw new InputError("工作区已释放");
-      const old=step==="退回" ? l.rows.findLast(r=>r.type==="部署" && r.result==="成功")?.sha : undefined;
-      const sha=step==="准备" ? l.last("准备好")?.sha || t.baseCommit || commitOf(t.repo,"refs/heads/"+t.base)
-        : step==="收货" ? candidate(l).sha : j.sha || old || s.sha;
-      if (step==="收货" && (request && s.busy || !s.busy && s.settled && s.settled.ending!=="stop")) throw new InputError("本轮未正常结束，不收货");
-      if (!repair && checkedSteps.includes(step)) {
-        if (step!=="退回" && sha!==s.sha || job.target && commitOf(t.repo,job.target)!==sha) throw new InputError("目标已变化：当前收货为 "+s.sha);
-        if (s.busy || s.settled?.ending && s.settled.ending!=="stop" && s.settled.n>s.last && !accept && !s.proofs?.accepted)
-          throw new InputError("等待开发窗口正常停下");
-        if (!s.delivery) throw new InputError("没有交付记录"); b=binding(l,sha);
-        if (j.key && j.key!==b.key) throw new InputError("检查输入已变化，重新调度");
-        if (accept && !s.proofs?.verified && !s.proofs?.accepted) l.add({type:"接受未验证",sha,key:b.key,text:accept});
-        if (finishes.includes(step) && step!=="退回") requireGate(l,sha);
+      let sha:string;
+      try {
+        if (!repair && step!=="放弃" && (s.stop || s.suspended || s.wait && !accept && step!=="退回")) throw new InputError("任务当前暂停，请查询等待原因");
+        if (accept && !accept.trim()) throw new InputError("接受未验证须有本人原话");
+        if (s.running && (step!=="收货" || !["复测","评审"].includes(s.running.step!)) || s.queued && !scheduled && step!=="收货") throw new InputError("已有工具在运行");
+        if (["开窗口","准备"].includes(step) && (!batchPresent(l) || !batchReady(l))) throw new InputError("等待同批前置卡或窗口名额");
+        if (step!=="准备" && step!=="放弃" && !s.ready) throw new InputError("工作区尚未准备好");
+        if (s.side("释放")?.value?.released && ["收货","开窗口"].includes(step)) throw new InputError("工作区已释放");
+        const old=step==="退回" ? l.rows.findLast(r=>r.type==="部署" && r.result==="成功")?.sha : undefined;
+        sha=step==="准备" ? l.last("准备好")?.sha || t.baseCommit || commitOf(t.repo,"refs/heads/"+t.base)
+          : step==="收货" ? candidate(l).sha : j.sha || old || s.sha;
+        if (step==="收货" && (request && s.busy || !s.busy && s.settled && s.settled.ending!=="stop")) throw new InputError("本轮未正常结束，不收货");
+        if (!repair && checkedSteps.includes(step)) {
+          if (step!=="退回" && sha!==s.sha || job.target && commitOf(t.repo,job.target)!==sha) throw new InputError("目标已变化：当前收货为 "+s.sha);
+          // 窗口原话可能启动 Pi 对话，但本地合入仍只针对已收货的 SHA。
+          if (!intent && (s.busy || s.settled?.ending && s.settled.ending!=="stop" && s.settled.n>s.last && !accept && !s.proofs?.accepted))
+            throw new InputError("等待开发窗口正常停下");
+          if (!s.delivery) throw new InputError("没有交付记录"); b=binding(l,sha);
+          if (j.key && j.key!==b.key) throw new InputError("检查输入已变化，重新调度");
+          if (accept && !s.proofs?.verified && !s.proofs?.accepted) l.add({type:"接受未验证",sha,key:b.key,text:accept});
+          if (finishes.includes(step) && step!=="退回") requireGate(l,sha);
+        }
+      } catch(e) {
+        if (intent) finish(l,scheduled!,{result:"失败",kind:"未知",text:errorText(e)});
+        throw e;
       }
       const key=b?.key || j.key || "";
-      const cached=l.rows.findLast(r=>r.type===step && r.sha===sha && r.key===key && success(r));
+      const cached=intent ? undefined : l.rows.findLast(r=>r.type===step && r.sha===sha && r.key===key && success(r));
       if (!repair && (step==="准备" && s.ready || step==="开窗口" && s.windowLive && !j.file || cached && !["开窗口","退回","分诊","收货"].includes(step)))
         return {cached:cached?.value || cached?.check || {executionId:t.executionId,result:"已就绪"}};
       if (step==="评审" && s.returned("评审").length>=s.allowance("评审") || step==="复测" && s.returned("复测").length>=s.allowance("复测"))
         throw new InputError("轮数用完，须本人加轮");
       if (step==="释放" && t.after.some(k=>!s.side(k))) throw new InputError("尚未完成卡上约定的收尾");
       const {note,images,retry,file,auto,target}=j, devBefore=step==="合入" && !isAncestor(t.repo,sha,devRef) ? commitOf(t.repo,devRef) : undefined;
-      start=l.add({type:"开始",step,sha,key,source:request,retry,note,images,file,auto,target,owner:identity(),devBefore,repair});
+      start=l.add({type:"开始",step,sha,key,source:request,retry,note,images,file,auto,target,owner:identity(),devBefore,repair,intent});
       if (step==="收货") {
         let row:Entry;
         try {row=l.add(receive(l,start));}

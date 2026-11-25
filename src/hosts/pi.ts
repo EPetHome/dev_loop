@@ -14,7 +14,7 @@ interface Pi {
 }
 export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clearInterval}={}) {
   const dir=env.LOOP_TASK_DIR, ref=Number(env.LOOP_WINDOW_JOB); if (!dir || !hasLedger(dir) || !ref || env.LOOP_PI_WINDOW_OWNER!==String(process.ppid)) return;
-  let window=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
+  let window=0, mergeNotice=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
   const content=(msg:any)=>Array.isArray(msg?.content)
     ? msg.content.filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n") : String(msg?.content || "");
   const event=(data:Partial<Entry>)=>{
@@ -31,7 +31,7 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
         || !pendingStarts(l).some(r=>r.step==="开窗口" && r.n===ref) || state(l,false).windowLive) return;
       return l.add({type:"窗口",status:"开",ref,owner:identity(),file:ctx.sessionManager.getSessionFile(),value:{id}});
     });
-    if (!opened) {ctx.shutdown?.(); return;} window=opened.n; wake(dir,env);
+    if (!opened) {ctx.shutdown?.(); return;} window=mergeNotice=opened.n; wake(dir,env);
     timer=every(()=>{
       try {
         const ui=ctx.hasUI && ctx.ui, l=new Ledger(dir), s=state(l,!!ui);
@@ -48,8 +48,15 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
         }
         if (ui) {
           const {phase,detail}=phaseView(l,s);
-          const next=`【${phase}】${s.t.name}${detail ? " · "+detail : ""} · 已用 ${s.returned("评审").length} 评审轮`;
+          const visible=phase==="完成" && s.proofs?.verified && !s.complete ? "收尾中" : phase;
+          const next=`【${visible}】${s.t.name}${detail ? " · "+detail : ""} · 已用 ${s.returned("评审").length} 评审轮`;
           if (next!==title) {ui.setStatus("dev-loop","dev-loop "+next);ui.setTitle(next);title=next;}
+          for (const r of l.rows.filter(r=>r.n>mergeNotice && r.type==="合入" && r.intent)) {
+            const text=r.result==="成功" ? `本地 dev ${r.value.result}：${r.value.devAfter}（未推送、未部署）`
+              : `合入失败：${r.text || r.result}`;
+            pi.sendMessage({customType:"dev-loop-merge",content:text,display:true},{triggerTurn:false});
+            mergeNotice=r.n;
+          }
         }
       } catch(e) {console.error("dev-loop 待办：",e);}
     },opened && new Ledger(dir).task.config.inboxIntervalMs); timer?.unref?.();
