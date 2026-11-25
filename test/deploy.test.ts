@@ -4,8 +4,9 @@ import { existsSync, readFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { fixture, write, writeFixtureScript, deliver, settle, until, sq } from "./helpers.ts";
 import { Ledger } from "../src/core/store.ts";
+import { pathToFileURL } from "node:url";
 import { state } from "../src/core/state.ts";
-import { alive } from "../src/infra/exec.ts";
+import { alive, signalProcess, type Identity } from "../src/infra/exec.ts";
 function project(t:any,check="exit 0",rollback="exit 0",flow=["开发评审","测试"]) {
   const f=fixture(t,{card:{flow},config:{snapshot:"snapshot.sh",deploy:{cmd:"deploy.sh",check:"check.sh",rollback:"rollback.sh",env:{APP_DIR:"isolated"}}}});
   writeFixtureScript(join(f.repo,"deploy.sh"),"sh",'echo "$LOOP_DEPLOY_COMMIT;$APP_DIR" > "$LOOP_EVIDENCE_DIR/observed"\n');
@@ -41,6 +42,33 @@ for (const stopped of [false,true]) test(`R2-4 · 部分发布后杀 worker${sto
   assert(finished.rows.some(r=>r.type==="部署" && r.kind==="重试" && !r.check));
   assert.equal(finished.rows.filter(r=>r.type==="部署已回退").length,1);
   if (stopped) assert.equal(state(finished).stop?.result,"已停止");
+});
+
+test("R3-1 · spawn 已返回但未登记时杀 worker，旧部署脚本不能越过许可",async t=>{
+  const f=project(t,"exit 0","exit 0",["开发评审","测试","合入","部署"]), fault=join(f.base,"injected.json"), go=join(f.base,"let-old-write"), sequence=join(f.base,"sequence");
+  writeFixtureScript(join(f.repo,"deploy.sh"),"sh",`if [ "$TEST_UNRECORDED" = yes ]; then\nwhile [ ! -e ${sq(go)} ]; do sleep .03; done\necho escaped >> ${sq(sequence)}\nelse echo cmd >> ${sq(sequence)}; fi\n`);
+  writeFixtureScript(join(f.repo,"rollback.sh"),"sh",`echo "$LOOP_DEPLOY_FAILED" >> ${sq(sequence)}\n`);
+  f.git("add",".");f.git("commit","-m","deploy handshake doubles");const x=await f.prepare();write(join(x.worktree,"src/app.txt"),"version\n");deliver(x.dir);await settle(x.dir);
+  const shim=write(join(f.base,"kill-before-register.mjs"),`
+import cp from 'node:child_process'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const fault=${JSON.stringify(fault)}, spawn=cp.spawn;
+cp.spawn=(cmd,args,opts)=>{
+  const script=args?.[2]==='dev-loop-start' ? args[3] : cmd;
+  if(!script.endsWith('/deploy.sh') || fs.existsSync(fault))return spawn(cmd,args,opts);
+  const child=spawn(cmd,args,{...opts,env:{...opts.env,TEST_UNRECORDED:'yes'}});
+  const startedAt=cp.execFileSync('ps',['-p',String(child.pid),'-o','lstart='],{encoding:'utf8'}).trim();
+  fs.writeFileSync(fault,JSON.stringify({child:{pid:child.pid,startedAt},ref:Number(process.env.LOOP_JOB)})); process.kill(process.pid,'SIGKILL'); return child;
+}; syncBuiltinESMExports();`);
+  f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,`--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
+  const injected=()=>JSON.parse(readFileSync(fault,"utf8")) as {child:Identity;ref:number};
+  try {
+    const done=await f.pump(x.dir,l=>state(l).done,54),{child,ref}=injected();
+    assert(done.rows.some(r=>r.type==="部署开始" && r.ref===ref));assert(!done.rows.some(r=>r.type==="子进程" && r.owner?.pid===child.pid));
+    assert(done.rows.some(r=>r.type==="部署" && r.kind==="重试" && r.ref===ref));
+    write(go,"");await until(f.base,()=>alive(child),v=>!v);
+    assert.equal(readFileSync(sequence,"utf8"),"interrupted\ncmd\n");
+    assert.equal(done.rows.filter(r=>r.type==="部署已回退").length,1);
+  } finally {if(existsSync(fault))signalProcess(injected().child,true);}
 });
 
 for (const mode of ["cmd成功","cmd后回退","回退中"]) test(`R2-5 · ${mode}时请求停止，登记真实线上结果，不走后续步骤`,async t=>{

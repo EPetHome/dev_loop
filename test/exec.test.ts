@@ -65,6 +65,14 @@ test("signalProcess：ESRCH 仍忽略，不查询 stat", t => {
   t.mock.method(process, "kill", () => { throw Object.assign(new Error("gone"), {code: "ESRCH"}); });
   assert.doesNotThrow(() => signalProcess(p, true)); assert.equal(queried.length, 1);
 });
+test("R3-1 · 放行后保持登记 PID，脚本 stdin 仍是 EOF；登记失败不执行",async()=>{
+  let pid=0;
+  const options={cwd:process.cwd(),timeoutMs:3000,gate:true};
+  const result=await childExec("/bin/sh",["-c",'read -r input && exit 1; printf "%s" "$$"'],{...options,register:owner=>{pid=owner.pid;assert(owner.startedAt);}});
+  assert(pid>0);assert.equal(result.code,0);assert.equal(result.stdout,String(pid));
+  const denied=await childExec("/bin/sh",["-c","printf mutates"],{...options,register:()=>{throw new Error("登记失败");}});
+  assert.equal(denied.stdout,"");assert(denied.killed);assert.match(denied.stderr,/登记失败/);
+});
 test("真实进程超时保留原文、整组退出；UTF-8 跨块不裂开",async()=>{
   const cwd=process.cwd(), code=`process.stdout.write('你好'.repeat(60000))`;
   assert.equal((await childExec(process.execPath,["-e",code],{cwd,timeoutMs:3000})).stdout,"你好".repeat(60000));

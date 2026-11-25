@@ -7,10 +7,10 @@ import { childExec, signalProcess, type ExecResult } from "../infra/exec.ts";
 import { locked, Ledger, type Task } from "./store.ts";
 import { projectedStop } from "./state.ts";
 export async function run(t:Task,command:string,args:string[],timeoutMs:number,signal?:AbortSignal,env?:NodeJS.ProcessEnv,drain=false):Promise<ExecResult> {
-  const ref=Number(process.env.LOOP_JOB);
+  const ref=Number(process.env.LOOP_JOB); if (drain && !ref) throw new Error("线上脚本缺少工具登记");
   if (!drain && projectedStop(new Ledger(t.dir))) throw new Error("任务已停止");
   if (timeoutMs<=0) return {code:137,killed:true,stdout:"",stderr:"检查时限已用完",output:"检查时限已用完"};
-  return childExec(command,args,{cwd:t.worktree,timeoutMs,signal,env:{...env,LOOP_TASK_DIR:t.dir,LOOP_ROLE:"worker"},onSpawn:ref ? owner=>locked(t.dir,l=>{
+  return childExec(command,args,{cwd:t.worktree,timeoutMs,signal,gate:drain,env:{...env,LOOP_TASK_DIR:t.dir,LOOP_ROLE:"worker"},register:ref ? owner=>locked(t.dir,l=>{
     l.add({type:"子进程",ref,owner}); if (!drain && projectedStop(l)) signalProcess(owner,true);
   }) : undefined});
 }
