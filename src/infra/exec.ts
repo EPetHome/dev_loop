@@ -23,16 +23,17 @@ export async function retireGroup(p: Identity) {
 export interface ExecResult { code: number; stdout: string; stderr: string; output: string; killed: boolean }
 export interface ExecOptions {
   cwd:string; timeoutMs:number; env?:NodeJS.ProcessEnv; replaceEnv?:boolean;
-  signal?:AbortSignal; register?: (p:Identity)=>void; gate?:boolean
+  signal?:AbortSignal; register?: (p:Identity)=>void; gate?:boolean; lockFd?:number
 }
 export function childExec(command: string, args: string[], options: ExecOptions): Promise<ExecResult> {
   return new Promise((accept) => {
     const result: ExecResult = {code:0,stdout:"",stderr:"",output:"",killed:false}; let done = false, reap: ReturnType<typeof setTimeout> | undefined;
     // 明确许可前只读私有管道；父进程死亡即 EOF，exec 保留已登记的 PID/PGID。
-    const {cwd,timeoutMs,signal,register,env,replaceEnv,gate}=options,
+    const {cwd,timeoutMs,signal,register,env,replaceEnv,gate,lockFd}=options,
       launch=gate ? ["-c",'IFS= read -r permit && [ "$permit" = go ] || exit 125; exec "$@" </dev/null',"dev-loop-start",command,...args] : args;
     const child=spawn(gate ? "/bin/sh" : command,launch,{
-      cwd,env:replaceEnv ? env || {} : {...process.env,...env},detached:true,stdio:[gate ? "pipe" : "ignore","pipe","pipe"]
+      cwd,env:replaceEnv ? env || {} : {...process.env,...env},detached:true,
+      stdio:[gate ? "pipe" : "ignore","pipe","pipe",...(lockFd===undefined ? [] : [lockFd])]
     });
     const collect = (stream: "stdout"|"stderr", text: string) => { result[stream] += text; result.output += text; };
     const finish = (code: number) => {

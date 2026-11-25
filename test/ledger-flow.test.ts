@@ -1,11 +1,11 @@
-import { test, type TestContext } from "node:test";
+import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
-import { setTimeout as delay } from "node:timers/promises";
 import { fixture, until, write, sq, MUST, PASS, getJson, ROOT, NODE, writeFixtureScript } from "./helpers.ts";
 import { Ledger, locked, PHASES, type Task } from "../src/core/store.ts";
 import { jsonLines } from "../src/infra/files.ts";
@@ -21,12 +21,17 @@ async function control(t:Task,fields:any) {
   if (fields.type==="close") await until(t.dir,()=>stat(new Ledger(t.dir)).windowLive,v=>!v);
   else await until(t.dir,()=>jsonLines<any>(join(t.dir,"window-control-ack.jsonl")),rows=>rows.some(r=>r.id===id));
 }
-const inbox=(t:Task)=>jsonLines<{pid:number;content:string}>(join(t.dir,"inbox.jsonl"));
+const inbox=(t:Task)=>jsonLines<{pid:number;content:string;customType?:string;triggerTurn?:boolean}>(join(t.dir,"inbox.jsonl"));
+const mergeNotices=(t:Task)=>inbox(t).filter(r=>r.customType==="dev-loop-merge");
+const titleOf=(t:Task,pid:number)=>readFileSync(join(t.dir,`title-${pid}`),"utf8");
 const wakeToWindow=async(f:ReturnType<typeof fixture>,dir:string)=>(await f.pump(dir,l=>stat(l).busy)).task;
 const change=(t:Task,text="repaired\n")=>write(join(t.worktree,"src/app.txt"),text);
 const deliver=(f:ReturnType<typeof fixture>,t:Task,...opts:string[])=>f.call(["交付",...opts],t.worktree,{LOOP_TASK_DIR:t.dir,LOOP_ROLE:"development"});
 const wait=(f:ReturnType<typeof fixture>,t:Task)=>f.pump(t.dir,l=>!!stat(l).wait);
 
+// 各用例持有独立仓库、任务目录和窗口；串行的只保留每个场景内部的状态转换。
+describe("隔离账本流程",{concurrency:2},registerCases);
+function registerCases() {
 test("A1 · 六步真实 SIGKILL 后靠 tick 接上；重开原窗口，合入副作用不重复",async t=>{
   const f=fixture(t,{card:{flow:["开发评审","测试","合入"]}});
   const hook=write(join(f.base,"kill-once.mjs"),`
@@ -45,14 +50,16 @@ cp.spawnSync=function(cmd,args,...rest){
 }; syncBuiltinESMExports();`);
   f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,"--import="+new URL("file://"+hook).href].filter(Boolean).join(" ");
   const {taskDir:dir}=await f.call(["启动",f.card]);
-  const bump=async(pick:(l:Ledger)=>boolean)=>{
-    for(let i=0;i<120;i++) {const l=new Ledger(dir);if(pick(l))return l;try {const r=await f.call(["tick","--all"]);assert(!r.errors.length,JSON.stringify(r.errors));}catch(e:any){if(e.signal!=="SIGKILL")throw e;}await delay(15);}
-    assert.fail(readFileSync(join(dir,"ledger.jsonl"),"utf8").slice(-4050));
-  };
+  // 这里确实要杀调度 CLI，pulse 保留子进程；等待活 worker 时不重开调度 CLI。
+  const bump=(pick:(l:Ledger)=>boolean)=>f.pump(dir,pick,{pulse:async()=>{
+    try {const r=await f.call(["tick","--all"]);assert(!r.errors.length,JSON.stringify(r.errors));}
+    catch(e:any){if(e.signal!=="SIGKILL")throw e;}
+  }});
   let l=await bump(l=>stat(l).busy), x=l.task, original=stat(l).window!;
   change(x,"recovered after kill\n");await assert.rejects(deliver(f,x),{signal:"SIGKILL"});
   process.kill(original.owner!.pid,"SIGKILL");
   l=await bump(l=>stat(l).busy && stat(l).window?.n!==original.n);assert.equal(stat(l).window?.file,original.file);assert.match(inbox(x).at(-1)!.content,/按开发卡开发/);
+  assert.match(inbox(x).at(-1)!.content,/单独说「合入」由 dev-loop 处理；开发方不要运行合入命令，也不要让本人去终端执行/);
   await control(x,{type:"settle"});l=await bump(l=>stat(l).done);
   for(const step of ["准备","开窗口","收货","复测","评审","合入"]) assert(l.rows.some(r=>r.type===step && r.kind==="重试"),step);
   for(const type of ["准备好","提交","复测","评审","完成","合入"]) assert.equal(l.rows.filter(r=>r.type===type && !r.kind).length,1,type);
@@ -136,7 +143,7 @@ for (const manual of [true,false]) test(`R2-2 · 阻断疑问答复后${manual ?
   await f.call(["答复",x.executionId,"--话",words]);await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);
   if (manual) assert.equal((await deliver(f,x)).commit,first.commit); else write(join(x.dir,"model"),"收货");
   await control(x,{type:"settle",text:"已按澄清检查，无需代码改动。"});
-  l=await f.pump(x.dir,l=>!!l.last("完成"),32);
+  l=await f.pump(x.dir,l=>!!l.last("完成"));
   assert.equal(l.rows.filter(r=>r.type==="提交").length,1);assert.equal(l.last("复测")!.n,retest);
   assert.deepEqual(l.rows.filter(r=>r.type==="评审").map(r=>[r.sha,!!r.blocker]),[[first.commit,true],[first.commit,false]]);
   assert.equal(stat(l).todo.length,0);assert.equal(stat(l).wait,undefined);
@@ -149,7 +156,7 @@ test("R2-3 · 接受未验证关闭旧待办并续完授权收尾，不吞之后
   const x=await open(f);change(x);const {commit}=await deliver(f,x);await control(x,{type:"settle"});
   const waiting=await wait(f,x);assert.equal(stat(waiting).wait?.wait,"轮数用完");assert(stat(waiting).todo.length);
   const before=inbox(x).length;assert((await f.call(["合入",x.executionId,"--接受未验证","--话","确认结束此版返修，接受未验证"])).unverified);
-  const l=await f.pump(x.dir,l=>stat(l).done,32);assert.equal(inbox(x).length,before);
+  const l=await f.pump(x.dir,l=>stat(l).done);assert.equal(inbox(x).length,before);
   assert.equal(stat(l).side("部署")?.sha,commit);assert.equal(stat(l).side("推送")?.sha,commit);assert.equal(stat(l).returned("评审").length,1);
   const intent=l.last("接受未验证")!;l.rows.push({type:"答复",n:l.rows.at(-1)!.n+1,at:intent.at,todo:"后来的一项请求"});
   assert.deepEqual(stat(l).todo.map(r=>r.todo),["后来的一项请求"]);
@@ -183,13 +190,78 @@ test("A7/T15/T16 · 未授权无写入；重复开工返回同号；依赖推迟
   assert.equal(new Ledger(a2.dir).rows.filter(r=>r.type==="窗口" && r.status==="开").length,1);
 });
 
+test("N4 返修 1 · 同批下一卡开窗后，已完成卡仍可在原 Pi 窗口合入",async t=>{
+  const f=fixture(t), bpath=write(join(f.repo,"B.json"),JSON.stringify({...f.raw,name:"B",tasks:[{...f.raw.tasks[0],name:"B"}]}));
+  f.env.TEST_WINDOW_UI="yes";
+  const batch=await f.call(["开工",f.card,bpath]), x=await wakeToWindow(f,batch.taskDir), bdir=join(f.root,batch.executions[1]);
+  assert(!new Ledger(bdir).last("准备好"));
+  const owner=stat(new Ledger(x.dir)).window!.owner!;
+  change(x);const {commit}=await deliver(f,x);await control(x,{type:"settle"});
+  await f.pump(x.dir,l=>!!l.last("完成"));
+  const next=await f.pump(bdir,l=>stat(l).busy);
+  assert.equal(stat(new Ledger(x.dir)).windowLive,true,"下一卡开窗不能关闭前一张完成卡");
+  await until(x.dir,()=>titleOf(x,owner.pid),s=>s.startsWith("【完成】"));
+  await control(x,{type:"input",text:"合入"});
+  const l=await f.pump(x.dir,l=>!!l.last("合入"));
+  const tip=l.last("合入")!.value.devAfter;
+  assert.equal(f.git("rev-parse","dev"),tip);
+  assert.equal(f.git("rev-parse","dev^2"),commit);
+  await control(x,{type:"settle"}); // Pi 空闲时将不触发模型的说明写进会话。
+  const notices=await until(x.dir,()=>mergeNotices(x),rows=>rows.length>0);
+  assert.deepEqual(notices.map(n=>[n.pid,n.triggerTurn]),[[owner.pid,false]]);
+  assert.match(notices[0].content,new RegExp(tip));
+  await until(x.dir,()=>titleOf(x,owner.pid),s=>s.startsWith("【已合入】"));
+  assert.equal(stat(new Ledger(bdir)).window?.n,stat(next).window?.n);
+});
+
+test("N4 返修 3 · Pi 在结论前崩窗，重开原会话补发一条合入说明",async t=>{
+  const f=fixture(t);f.env.TEST_WINDOW_UI="yes";
+  // 新窗保存说明后、登记已送达前再杀一次 Pi，检查会话去重而不靠进程内游标。
+  const interrupted=join(f.base,"notice-before-ack"), shim=write(join(f.base,"kill-before-notice-ack.mjs"),`
+import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const append=fs.appendFileSync, marker=${JSON.stringify(interrupted)};
+fs.appendFileSync=(path,data,...opts)=>{
+  if (typeof path==='string' && path.endsWith('/ledger.jsonl') && String(data).includes('"type":"合入送达"') && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker,String(process.pid)); process.kill(process.pid,'SIGKILL');
+  }
+  return append(path,data,...opts);
+}; syncBuiltinESMExports();`);
+  f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,`--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
+  const x=await open(f), old=stat(new Ledger(x.dir)).window!;
+  change(x);await deliver(f,x);await control(x,{type:"settle"});
+  await f.pump(x.dir,l=>!!l.last("完成"));
+  await control(x,{type:"input",text:"合入"});
+  process.kill(old.owner!.pid,"SIGKILL");
+  const merged=await f.pump(x.dir,l=>!!l.last("合入"));
+  assert.equal(stat(merged).windowLive,false);
+  assert.deepEqual(mergeNotices(x),[]);
+  const result=merged.last("合入")!, tip=result.value.devAfter;
+  const reopenedAfterResult=(l:Ledger)=>l.rows.find(r=>r.type==="窗口" && r.status==="开" && r.n>result.n);
+  const reopened=reopenedAfterResult(await f.pump(x.dir,l=>!!reopenedAfterResult(l)))!;
+  assert.equal(reopened.file,old.file);
+  const notices=await until(x.dir,()=>mergeNotices(x),rows=>rows.length>0);
+  assert.deepEqual(notices.map(n=>[n.pid,n.triggerTurn]),[[reopened.owner!.pid,false]]);
+  assert.match(notices[0].content,new RegExp(tip));
+  await until(x.dir,()=>readFileSync(interrupted,"utf8"),pid=>Number(pid)===reopened.owner!.pid);
+  const acknowledged=await f.pump(x.dir,l=>l.last("合入送达")?.ref===result.n);
+  const last=stat(acknowledged).window!;
+  assert(last.n>reopened.n);
+  assert.equal(last.file,old.file);
+  assert.equal(acknowledged.last("合入送达")?.source,last.n);
+  await until(x.dir,()=>titleOf(x,last.owner!.pid),s=>s.startsWith("【已合入】"));
+  assert.equal(mergeNotices(x).length,1);
+});
+
 test("A8 · 冲突清单发回，合入 dev 后起点前移、他人文件不进 diff，重新检查再合入",async t=>{
   const f=fixture(t,{card:{flow:["开发评审","测试","合入"]}}), x=await open(f);
   change(x,"开发方版本\n");await deliver(f,x);await control(x,{type:"settle"});
   write(join(f.repo,"src/app.txt"),"dev 版本\n");write(join(f.repo,"outside.txt"),"他人独立改动\n");f.git("add",".");f.git("commit","-m","dev advancing");
   let l=await f.pump(x.dir,l=>l.rows.some(r=>r.type==="发回" && r.step==="合入") && stat(l).busy);
   assert.match(inbox(x).at(-1)!.content,/src\/app\.txt/);assert.equal(stat(l).returned("评审").length,0);
-  assert.throws(()=>fgit(x,"merge","dev"));change(x,"解决冲突\n");fgit(x,"add","src/app.txt");fgit(x,"commit","--no-edit");
+  assert.throws(()=>fgit(x,"merge","--no-edit","dev"));
+  assert.match(fgit(x,"ls-files","-u"),/src\/app\.txt/);
+  assert.equal(fgit(x,"rev-parse","MERGE_HEAD"),f.git("rev-parse","dev"));
+  change(x,"解决冲突\n");fgit(x,"add","src/app.txt");fgit(x,"commit","-m","resolve fixture merge");
   const {commit}=await deliver(f,x);await control(x,{type:"settle"});l=await f.pump(x.dir,l=>!!stat(l).side("合入") && stat(l).done);
   assert.equal(l.last("评审")?.sha,commit);assert.doesNotMatch(readFileSync(l.last("评审")!.check!.evidence.find(p=>p.includes("review-input"))!,"utf8"),/他人独立改动|outside\.txt/);
   assert.equal(f.git("rev-parse","dev^2"),commit);
@@ -207,3 +279,4 @@ test("A9 · 四轮后只等一次、显示收敛与四选项；加两轮后按�
   await until(x.dir,()=>stat(new Ledger(x.dir)).busy,Boolean);change(x,"fifth\n");await deliver(f,x);await control(x,{type:"settle"});
   const l=await f.pump(x.dir,l=>stat(l).returned("评审").length===5);assert.equal(stat(l).allowance("评审"),6);assert.equal(stat(l).wait,undefined);
 });
+}

@@ -34,7 +34,7 @@ export type Wait = "需求疑问"|"轮数用完"|"开发推不动"|"环境修不
 export interface Receipt {commit:string; tree:string; note:string; at:string; images:string[]}
 export interface Job {
   step:Step; sha:string; key:string; retry?:boolean; source?:number; devBefore?:string;
-  note?:string; images?:string[]; file?:string; auto?:boolean; target?:string; repair?:number
+  note?:string; images?:string[]; file?:string; auto?:boolean; target?:string; repair?:number; intent?:number
 }
 export interface Outcome { result:string; kind?:Kind; text?:string; check?:Check; value?:any; flaky?:string; blocker?:string; baseFiles?:Record<string,string> }
 export interface Entry extends Partial<Job>, Partial<Outcome> {

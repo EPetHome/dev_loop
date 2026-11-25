@@ -13,8 +13,16 @@ if (process.platform === "darwin") {
   // Projects can override TMPDIR for their scripts; keep the harness root fixed.
   const root = process.env.DEV_LOOP_FIXTURE_TMP || realpathSync(tmpdir()), spawn = cp.spawn;
   cp.spawn = function (command, args, options) {
-    const interpreter = Array.isArray(args) && !options?.shell && interpreterFor(command);
-    return interpreter ? spawn(interpreter, [command, ...args], options) : spawn.apply(this, arguments);
+    if (Array.isArray(args) && !options?.shell) {
+      // 线上替身先过原许可管道；只把许可后的 exec 脚本改成解释器输入。
+      if (command === "/bin/sh" && args[0] === "-c" && args[2] === "dev-loop-start") {
+        const interpreter = interpreterFor(args[3]);
+        if (interpreter) return spawn(command, [...args.slice(0,3), interpreter, ...args.slice(3)], options);
+      }
+      const interpreter = interpreterFor(command);
+      if (interpreter) return spawn(interpreter, [command, ...args], options);
+    }
+    return spawn.apply(this, arguments);
   };
   syncBuiltinESMExports();
 

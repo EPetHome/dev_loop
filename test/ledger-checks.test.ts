@@ -36,8 +36,8 @@ test("R2-7 · 不稳重跑被杀后接管仍按第二次不稳发回",async t=>{
   const timeout=()=>locked(x.dir,l=>{const {sha,key}=state(l),j=l.add({type:"开始",step:"复测",sha,key});l.add({type:"复测",step:"复测",sha,key,ref:j.n,kind:"超时",result:"失败"});});
   change(new Ledger(x.dir),"第一次");await receiver(f,x.dir);timeout();const first=await f.pump(x.dir,complete);assert(first.last("复测")?.flaky);
   change(first,"第二次");const {commit}=await receiver(f,x.dir);timeout();thaw(x.dir,"pause");
-  const pending=await f.pump(x.dir,()=>existsSync(join(x.dir,"retest-started")),32);process.kill(state(pending).running!.owner!.pid,"SIGKILL");
-  const l=await f.pump(x.dir,l=>state(l).returned("复测").length || l.last("完成")?.sha===commit,32);
+  const pending=await f.pump(x.dir,()=>existsSync(join(x.dir,"retest-started")));process.kill(state(pending).running!.owner!.pid,"SIGKILL");
+  const l=await f.pump(x.dir,l=>state(l).returned("复测").length>0 || l.last("完成")?.sha===commit);
   assert(l.rows.some(r=>r.type==="复测" && r.sha===commit && r.kind==="重试" && !r.check));
   assert.match(l.last("复测")?.text || "",/第二次不稳/);assert(!l.rows.some(r=>r.type==="评审" && r.sha===commit));
 });

@@ -27,6 +27,7 @@ export function phaseView(l:Ledger,s:CardState) {
     if (step && phase!==`${step}中`) detail=`正在${step}`;
   } else {
     if (!s.ready) phase="准备中";
+    else if (!s.side("合入") && s.rows.findLast(r=>r.n>s.last && r.sha===s.sha && r.type==="合入" && r.intent)?.result==="失败") phase="合入失败";
     else if (s.done) {
       const rollback=l.last("退回");
       if (rollback?.result==="成功" && rollback.n>(s.side("部署")?.n || 0)) phase="已退回";
