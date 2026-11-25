@@ -2,7 +2,7 @@ import { hostname } from "node:os";
 import { join } from "node:path";
 import { atomicWrite, readJson, jsonLines, writeJson, maybe } from "../infra/files.ts";
 import { idleSleep } from "../infra/idle-sleep.ts";
-import { state, resets } from "./state.ts";
+import { state, resets, type CardState } from "./state.ts";
 import { Ledger, hasLedger, batchResult, type Entry, type Phase } from "./store.ts";
 import { binding, evidence } from "./inputs.ts";
 export const waitName=(r:Entry)=>r.wait==="轮数用完"
@@ -14,21 +14,41 @@ const choices={
   "环境修不好":["续跑：修好后在同一步重试","停：保留现场"]
 };
 const stage:Partial<Record<string,Phase>>={准备:"准备中",收货:"开发中",开窗口:"开发中",复测:"复测中",评审:"评审中",合入:"收尾中",部署:"部署中",推送:"推送中",释放:"收尾中"};
+export function phaseView(l:Ledger,s:CardState) {
+  const {wait,stop,suspended,proofs,delivery}=s, working=s.running || s.queued;
+  const released=s.side("释放")?.value?.released===true;
+  let phase:Phase | "本人中止", detail:string | undefined;
+  if (stop) phase=stop.result==="已放弃" && stop===l.last("停") ? "已放弃" : "已停止";
+  else if (wait) phase="等你";
+  else if (suspended) phase="本人中止";
+  else if (working) {
+    const step=working.step;
+    phase=(step && stage[step]) || "开发中";
+    if (step && phase!==`${step}中`) detail=`正在${step}`;
+  } else {
+    if (!s.ready) phase="准备中";
+    else if (s.done) {
+      const rollback=l.last("退回");
+      if (rollback?.result==="成功" && rollback.n>(s.side("部署")?.n || 0)) phase="已退回";
+      else if (s.side("推送")) phase="已推送";
+      else if (s.side("部署")) phase="已部署";
+      else if (s.side("合入")) phase="已合入";
+      else phase="完成";
+    } else if (!s.todo.length && proofs?.verified) phase="收尾中";
+    else if (!s.todo.length && delivery && !proofs?.review) phase="已交付";
+    else phase="开发中";
+    if (released) detail="已释放";
+  }
+  return {phase,working,released,detail};
+}
 export function report(l:Ledger,verbose=false) {
-  const s=state(l),{t,rows,wait,stop,proofs,delivery}=s, working=s.running || s.queued, unreviewed=delivery && !proofs?.review;
-  const final=["退回","推送","部署","合入"].find(k=>k==="退回" ? l.last(k)?.result==="成功" && l.last(k)!.n>(s.side("部署")?.n || 0) : s.side(k));
-  const phase:Phase=stop ? stop.result==="已放弃" && stop===l.last("停") ? "已放弃" : "已停止"
-    : wait ? "等你"
-    : s.suspended ? "开发中"
-    : working ? stage[working.step!] || "开发中"
-    : !s.ready ? "准备中"
-    : s.done ? ({合入:"已合入",部署:"已部署",推送:"已推送",退回:"已退回"} as const)[final as "合入"] || "完成"
-    : proofs?.verified && !s.todo.length ? "收尾中"
-    : !s.todo.length && unreviewed ? "已交付" : "开发中";
+  const s=state(l),{t,rows,wait,stop,proofs,delivery}=s;
+  const {phase:displayPhase,working,released}=phaseView(l,s);
+  const phase=displayPhase==="本人中止" ? "开发中" : displayPhase; // 保持 PA 的 loop.phase 取值。
   const options=wait?.wait ? choices[wait.wait] : [],
     message=stop ? "任务已停止；保留分支和证据"
       : wait ? `${wait.wait}：${wait.text}\n不回就保留现场。\n${options.join(" / ")}`
-      : s.suspended ? "本人中止，等本人说话"
+      : displayPhase==="本人中止" ? "本人中止，等本人说话"
       : s.done && proofs?.accepted && !proofs.verified ? `${phase}（接受未验证）`
       : working ? `正在${working.step}` : (s.todo.at(-1)?.todo || phase);
   const test=rows.findLast(r=>r.type==="复测" && r.sha===delivery?.commit && r.check), c=test?.check;
@@ -55,7 +75,7 @@ export function report(l:Ledger,verbose=false) {
     actions:["查询","续跑","答复","停止","放弃"],warnings,
     loop:{phase,wait:wait ? waitName(wait) : null,commit:delivery?.commit || null,
       delivery:delivery ? {commit:delivery.commit,tree:delivery.tree,note:delivery.note,at:delivery.at} : null,
-      prepared:s.ready,ready:s.ready,released:s.side("释放")?.value?.released===true,abandoned:phase==="已放弃",reused:false,
+      prepared:s.ready,ready:s.ready,released,abandoned:phase==="已放弃",reused:false,
       session:s.window?.owner ? {...s.window.owner,host:"pi",id:s.window.value?.id,file:s.window.file,
         ...(!s.windowLive ? {endedAt:s.windowEvent?.at} : {})} : null,
       launcher:null,startingSession:null,activeProcess:null,finisher:null,afterCommit:null,bucket:null,
