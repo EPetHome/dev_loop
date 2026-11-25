@@ -2,12 +2,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
-import { join } from "node:path";
-import { existsSync } from "node:fs";
-import { alive, identity, retireGroup, signalProcess } from "../src/infra/exec.ts";
-import { stop } from "../src/core/lifecycle.ts";
-import { update, statusOf } from "../src/core/store.ts";
-import { fixture, write } from "./helpers.ts";
+import { alive, identity, retireGroup, signalProcess, childExec } from "../src/infra/exec.ts";
 const p = {pid: 700001, startedAt: "test process identity"};
 /** 只替换系统调用，不制造真实僵尸或向假 PID 发信号；稳定复现 macOS EPERM。 */
 function mockPs(t: TestContext, stat: string | Error) {
@@ -70,22 +65,8 @@ test("signalProcess：ESRCH 仍忽略，不查询 stat", t => {
   t.mock.method(process, "kill", () => { throw Object.assign(new Error("gone"), {code: "ESRCH"}); });
   assert.doesNotThrow(() => signalProcess(p, true)); assert.equal(queried.length, 1);
 });
-test("停止/放弃：释放防睡租约；首个进程僵尸 EPERM 不阻断后续终止或 worktree 清理", async t => {
-  const f = fixture(t), task = await f.prepare(); mockPs(t, "Z");
-  update(task.dir, s => {
-    s.loop.startingSession = {...p, launchId: "fake"}; s.loop.activeProcess = {...p, pid: p.pid + 1};
-    s.loop.launcher = {...p, pid: p.pid + 2}; s.loop.session = {...p, pid: p.pid + 3, host: "pi", id: "fake"};
-  });
-  // 固定租约身份，避免已退出的 true 替身是否已被回收影响系统调用矩阵。
-  write(join(task.dir, "idle-sleep.json"), JSON.stringify({...p, pid: p.pid + 4, renewAt: Date.now() + 60000}));
-  const killed: number[] = [];
-  t.mock.method(process, "kill", (pid: number, signal?: NodeJS.Signals | number) => {
-    killed.push(pid); assert.equal(signal, pid === p.pid + 4 ? "SIGTERM" : "SIGKILL");
-    if (pid === p.pid) throw Object.assign(new Error("zombie"), {code: "EPERM"}); return true;
-  });
-  const s = stop(task.dir, true);
-  assert.deepEqual(killed, [p.pid + 4, p.pid, -(p.pid + 1), -(p.pid + 2), p.pid + 3]);
-  assert.equal(existsSync(join(task.dir, "idle-sleep.json")), false);
-  assert.equal(s.state, "cancelled"); assert.equal(statusOf(task.dir).loop.abandoned, true); assert.equal(existsSync(task.worktree), false);
-  assert.ok(f.git("show-ref", "--verify", "refs/heads/" + task.branch)); assert.equal(existsSync(join(task.dir, "checks.jsonl")), true);
+test("真实进程超时保留原文、整组退出；UTF-8 跨块不裂开",async()=>{
+  const cwd=process.cwd(), code=`process.stdout.write('你好'.repeat(60000))`;
+  assert.equal((await childExec(process.execPath,["-e",code],{cwd,timeoutMs:3000})).stdout,"你好".repeat(60000));
+  const r=await childExec("/bin/sh",["-c","sleep 10 & wait"],{cwd,timeoutMs:30});assert(r.killed);assert.notEqual(r.code,0);
 });

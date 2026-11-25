@@ -4,16 +4,14 @@ import type { Check } from "./store.ts";
 import type { ExecResult } from "../infra/exec.ts";
 import { stripVTControlCharacters } from "node:util";
 export function legacyResult(command: string, log: string, run?: ExecResult) {
-  const evidence = [log], detail = "命令：" + command;
-  if (!run || run.code === 0 && !run.killed) return {result:run ? "通过" : "没验证",evidence,detail};
+  const evidence=[log],detail="命令："+command; if (!run || run.code===0 && !run.killed) return {result:run?"通过":"没验证",evidence,detail};
   const lines = run.output.trimEnd().split(/\r?\n/);
   return {result:"失败",evidence,detail:[`复测失败${run.killed ? "（超时或取消）" : ""}，请修复后重新交付。`,detail,
     "输出最后 60 行：",...lines.slice(-60),"error/fail 行：",...lines.filter(s => /error|fail/i.test(s))].join("\n")};
 }
 const bytes = Buffer.byteLength;
 export function clip(text: string, limit: number, tail = false): string {
-  const b = Buffer.from(text); if (b.length <= limit) return text;
-  let cut = tail ? b.length - limit + 3 : limit - 3;
+  const b=Buffer.from(text); if (b.length<=limit) return text; let cut=tail ? b.length-limit+3 : limit-3;
   while ((b[cut] & 0xc0) === 0x80) cut += tail ? 1 : -1; // 不切断 UTF-8 字符
   return tail ? "…" + b.toString("utf8", cut) : b.toString("utf8", 0, cut) + "…";
 }

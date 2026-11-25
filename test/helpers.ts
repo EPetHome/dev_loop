@@ -1,115 +1,68 @@
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, readdirSync, chmodSync, rmSync, realpathSync, watch, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, appendFileSync, chmodSync, rmSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { execFileSync, execFile, spawn } from "node:child_process";
-import { once } from "node:events";
 import { promisify } from "node:util";
-import { createTask, statusOf, type Task } from "../src/core/store.ts";
-import { prepare } from "../src/core/lifecycle.ts";
-import { signalProcess, identity, type Identity } from "../src/infra/exec.ts";
-import { optionalJson } from "../src/infra/files.ts";
+import { setTimeout as delay } from "node:timers/promises";
 import { fixtureMarker } from "./fixture-process.mjs";
-// 所有测试（含子进程）强制替身，绝不调用本机 caffeinate。
-process.env.LOOP_CAFFEINATE_CMD = "/usr/bin/true";
-// macOS 的 /usr/bin/git 每次都通过 Xcode shim；测试直接使用它解析到的同一 Git。
-if (process.platform === "darwin" && execFileSync("/bin/sh", ["-c", "command -v git"], {encoding:"utf8"}).trim() === "/usr/bin/git") {
-  const gitPath = execFileSync("/usr/bin/xcrun", ["--find", "git"], {encoding:"utf8"}).trim();
-  process.env.PATH = dirname(gitPath) + ":" + process.env.PATH;
+import { Ledger, allTasks, hasLedger } from "../src/core/store.ts";
+import { signalProcess } from "../src/infra/exec.ts";
+import { report } from "../src/core/view.ts";
+import { binding, evidence } from "../src/core/inputs.ts";
+process.env.LOOP_CAFFEINATE_CMD="/usr/bin/true";
+if (process.platform==="darwin" && execFileSync("/bin/sh",["-c","command -v git"],{encoding:"utf8"}).trim()==="/usr/bin/git") process.env.PATH=dirname(execFileSync("/usr/bin/xcrun",["--find","git"],{encoding:"utf8"}).trim())+":"+process.env.PATH;
+export const ROOT=resolve(import.meta.dirname,".."), NODE=process.execPath;
+if (process.platform==="darwin") {
+  const preload="--import="+new URL("./fixture-process.mjs",import.meta.url).href;
+  process.env.DEV_LOOP_FIXTURE_TMP=realpathSync(tmpdir()); if (!process.env.NODE_OPTIONS?.includes(preload)) process.env.NODE_OPTIONS=[process.env.NODE_OPTIONS,preload].filter(Boolean).join(" ");
 }
-if (process.platform === "darwin") {
-  const preload = "--import=" + new URL("./fixture-process.mjs",import.meta.url).href;
-  process.env.DEV_LOOP_FIXTURE_TMP = realpathSync(tmpdir());
-  if (!process.env.NODE_OPTIONS?.includes(preload)) process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS,preload].filter(Boolean).join(" ");
+export const PASS="## 结论：通过\n## 必修\n无\n## 小问题\n- 建议示例\n## 需求疑问\n- 疑问示例\n## 上轮必修复查\n无\n";
+export const MUST="## 结论：需返修\n## 必修\n1. 位置：src/app.txt:1\n   触发：输入 bad 时\n   问题：返回错误结果\n   依据：需求 A1\n   建议：修正结果\n## 小问题\n- 不要退回此建议\n## 需求疑问\n- 不要退回此疑问\n## 上轮必修复查\n无\n";
+export const getJson=<T=any>(p:string):T=>JSON.parse(readFileSync(p,"utf8"));
+export const write=(p:string,s:string|Buffer)=>{mkdirSync(dirname(p),{recursive:true});writeFileSync(p,s);return p;};
+export const sq=(s:string)=>"'"+s.replaceAll("'","'\\''")+"'";
+export function writeFixtureScript(file:string,interpreter:"sh"|"node",body:string,{direct=false}={}) {
+  const sh=interpreter==="sh"; write(file,"#!"+(sh?"/bin/sh":NODE)+"\n"+(direct?"":(sh?"# ":"// ")+fixtureMarker+"\n")+body);chmodSync(file,0o755); return file;
 }
-export const ROOT = resolve(import.meta.dirname, "..");
-export const NODE = process.execPath;
-// 仅用于测试驱动防卡死；并发复测时不能比正常多进程交接更早终止。业务超时仍由各测试显式验证。
-const FIXTURE_GUARD_MS = 60_000;
-export const PASS = "## 结论：通过\n## 必修\n无\n## 小问题\n- 建议示例\n## 需求疑问\n- 疑问示例\n## 上轮必修复查\n无\n";
-export const MUST = "## 结论：需返修\n## 必修\n1. 位置：src/app.txt:1\n   触发：输入 bad 时\n   问题：返回错误结果\n   依据：需求 A1\n   建议：修正结果\n## 小问题\n- 不要退回此建议\n## 需求疑问\n- 不要退回此疑问\n## 上轮必修复查\n无\n";
-export const getJson = <T = any>(p: string): T => JSON.parse(readFileSync(p, "utf8"));
-export const write = (p: string, s: string) => { mkdirSync(resolve(p, ".."), { recursive: true }); writeFileSync(p, s); };
-export function writeFixtureScript(file: string, interpreter: "sh" | "node", body: string, {direct = false} = {}) {
-  const sh = interpreter === "sh", shebang = "#!" + (sh ? "/bin/sh" : NODE);
-  write(file, shebang + "\n" + (direct ? "" : (sh ? "# " : "// ") + fixtureMarker + "\n") + body);
-  chmodSync(file,0o755);
-}
-export function fixture(t: {after: (f: () => any) => any}, options: {test?: string; reviewer?: string; config?: any; card?: any; cliTimeoutMs?: number; tasksName?: string} = {}) {
-  const base = mkdtempSync(join(tmpdir(), "dev-loop-test-")), repo = join(base, "repo with 空格"), root = join(base, options.tasksName ?? "tasks");
-  mkdirSync(repo); mkdirSync(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-  git("init", "--template=", "-b", "dev");
-  appendFileSync(join(repo, ".git", "config"), "\n[user]\n\tname = Loop Test\n\temail = loop-test@example.invalid\n");
-  write(join(repo, "src/app.txt"), "good\n"); write(join(repo, "outside.txt"), "protected\n");
-  write(join(repo, "prompt.md"), "实现 good；不要改 scope 外文件。\n");
-  write(join(repo, "criteria.md"), "A1. 操作：读取 app\n预期：good\n");
-  write(join(repo, "AGENTS.md"), "初始规则\n");
-  write(join(repo, ".gitignore"), "dist/\nlocal.txt\n");
-  write(join(repo, "local.txt"), "local secret fixture\n");
-  const reviewer = options.reviewer || "printf '%s' " + sq(PASS);
-  writeFixtureScript(join(repo,"reviewer.sh"),"sh",'printf "review\\n" >> "$LOOP_TASK_DIR/order"\n' + reviewer + "\n");
-  const command = options.test ?? 'printf "test\\n" >> "$LOOP_TASK_DIR/order"; if grep -q bad src/app.txt; then echo "Error: failed app"; echo "tail marker"; exit 1; fi';
-  write(join(repo, ".autoreview.json"), JSON.stringify({ reviewerCmd: "./reviewer.sh", localFiles: ["local.txt"], ...options.config }));
-  const raw = {version: 1, name: "one", nature: "开发", base: "dev", target: "dev", host: "pi",
-    flow: ["开发评审", "测试"], tasks: [{name: "task", prompt: "prompt.md", scope: ["src/**"], test: command}],
-    acceptance: "criteria.md", ...options.card};
-  const card = join(repo, "card.json"); write(card, JSON.stringify(raw));
-  git("add", "."); git("commit", "-m", "fixture");
-  const launch = join(base, "fake-launch.cjs");
-  writeFixtureScript(launch,"node",`const fs = require('node:fs'), file = process.env.LOOP_TASK_DIR + '/opened.json';
-fs.writeFileSync(file + '.tmp',JSON.stringify({cwd:process.cwd(),args:process.argv.slice(2),task:process.env.LOOP_TASK_DIR}));
-fs.renameSync(file + '.tmp',file);\n`);
-  const env: NodeJS.ProcessEnv = {...process.env, LOOP_TASK_DIR: undefined, LOOP_HOST: undefined, LOOP_TASKS_ROOT: root, LOOP_LAUNCH_CMD: launch, PATH: resolve(NODE, "..") + ":" + process.env.PATH};
-  let task: Task | undefined;
-  t.after(() => {
-    if (existsSync(root)) for (const entry of readdirSync(root,{withFileTypes:true})) {
-      if (!entry.isDirectory()) continue;
-      const dir = join(root,entry.name), status = join(dir,"status.json"), lease = join(dir,"idle-sleep.json");
-      if (existsSync(status)) {
-        const {loop} = statusOf(dir);
-        signalProcess(loop.activeProcess,true); signalProcess(loop.launcher,true);
-      }
-      signalProcess(optionalJson<Identity>(lease));
+export function fixture(t:{after(f:()=>any):any}, options:{test?:string;reviewer?:string;config?:any;card?:any;cliTimeoutMs?:number;tasksName?:string}={}) {
+  const base=realpathSync(mkdtempSync(join(tmpdir(),"dev-loop-test-"))), repo=join(base,"repo with 空格"), root=join(base,options.tasksName || "tasks");mkdirSync(repo);
+  const git=(...args:string[])=>execFileSync("git",args,{cwd:repo,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim(); git("init","--template=","-b","dev");
+  appendFileSync(join(repo,".git","config"),"\n[user]\n\tname = Loop Test\n\temail = loop-test@example.invalid\n");
+  write(join(repo,"src/app.txt"),"good\n");write(join(repo,"outside.txt"),"protected\n");write(join(repo,"prompt.md"),"实现 good；不要改 scope 外文件。\n");write(join(repo,"criteria.md"),"A1. 操作：读取 app\n预期：good\n");
+  write(join(repo,".gitignore"),"dist/\nlocal.txt\n");write(join(repo,"local.txt"),"local secret fixture\n");
+  writeFixtureScript(join(repo,"reviewer.sh"),"sh",'printf "review\\n" >> "$LOOP_TASK_DIR/order"\n'+(options.reviewer || "printf '%s' "+sq(PASS))+"\n");
+  const command=options.test ?? 'printf "test\\n" >> "$LOOP_TASK_DIR/order"; if grep -q bad src/app.txt; then echo "Error: failed app"; exit 1; fi';
+  write(join(repo,".autoreview.json"),JSON.stringify({reviewerCmd:"reviewer.sh",localFiles:["local.txt"],retry:{delaysMin:[0,0,0]},inboxIntervalMs:15,windowStartupSec:3,...options.config}));
+  const raw={version:1,name:"one",nature:"开发",base:"dev",target:"dev",host:"pi",flow:["开发评审","测试"],tasks:[{name:"task",prompt:"prompt.md",scope:["src/**"],test:command}],acceptance:"criteria.md",...options.card};
+  const card=write(join(repo,"card.json"),JSON.stringify(raw));git("add",".");git("commit","-m","fixture");
+  const launch=writeFixtureScript(join(base,"fake-launch.cjs"),"node",`import(${JSON.stringify(new URL("./fake-window.ts",import.meta.url).href)}).then(m=>m.fakeWindow()).catch(e=>{console.error(e);process.exitCode=1;});\n`);
+  const model=writeFixtureScript(join(base,"fake-pi.cjs"),"node",`const fs=require('node:fs'),f=process.env.LOOP_TASK_DIR+'/model'; process.stdout.write(fs.existsSync(f)?fs.readFileSync(f,'utf8'):'等本人');\n`);
+  const env:NodeJS.ProcessEnv={...process.env,LOOP_TASK_DIR:undefined,LOOP_ROLE:undefined,LOOP_JOB:undefined,LOOP_WAKE:"manual",LOOP_TASKS_ROOT:root,LOOP_LAUNCH_CMD:launch,PI_BIN:model,PATH:dirname(NODE)+":"+process.env.PATH};
+  const cli=(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>promisify(execFile)(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd,env:{...env,...extraEnv},timeout:options.cliTimeoutMs || 15000,maxBuffer:16*1024*1024});
+  const call=async(args:string[],cwd=repo,extraEnv:NodeJS.ProcessEnv={})=>{const r=await cli([...args,"--json"],cwd,extraEnv);return JSON.parse(r.stdout || "null");};
+  const proc=(args:string[],extraEnv:NodeJS.ProcessEnv={})=>spawn(NODE,[join(ROOT,"src/cli/main.ts"),...args],{cwd:repo,env:{...env,...extraEnv},stdio:"ignore"});
+  t.after(()=>{
+    for (const dir of allTasks(root).filter(hasLedger)) {
+      const l=new Ledger(dir);
+      for (const row of l.rows.filter(r=>["开始","子进程","窗口","调度"].includes(r.type))) signalProcess(row.owner,row.type==="子进程" && row.status!=="窗口");
     }
-    rmSync(base,{recursive:true,force:true,maxRetries:2}); // 进程清空 launcher 后可能还在写最后一份摘要。
+    rmSync(base,{recursive:true,force:true,maxRetries:2});
   });
-  return {base, repo, root, card, raw, git, env,
-    async prepare() { task = createTask(card, root); await prepare(task.dir); return task; },
-    async cli(args: string[], cwd = repo, extraEnv: NodeJS.ProcessEnv = {}) {
-      return promisify(execFile)(join(ROOT, "bin/loop"), args, {cwd, env: {...env, ...extraEnv}, timeout: options.cliTimeoutMs ?? FIXTURE_GUARD_MS});
+  return {base,repo,root,card,raw,git,env,cli,call,proc,
+    async prepare() {const r=await call(["启动",card]);await call(["准备",r.executionId]);return new Ledger(r.taskDir).task;},
+    async pump(dir:string,pick:(l:Ledger)=>boolean,max=120) {
+      for(let i=0;i<max;i++) {const l=new Ledger(dir);if(pick(l))return l; const r=await call(["tick","--all"]);if(r.errors.length)throw new Error(JSON.stringify(r.errors));await delay(18);}
+      throw new Error("tick 未到预期："+readFileSync(join(dir,"ledger.jsonl"),"utf8").slice(-4300)+(existsSync(join(dir,"worker.log")) ? readFileSync(join(dir,"worker.log"),"utf8").slice(-2000) : ""));
     }
   };
 }
-export const sq = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'";
-/** 真实 hook CLI + 宿主进程替身，不调用模型或安装插件。 */
-export async function hook(f: ReturnType<typeof fixture>, dir: string, eventName: string, event: Record<string, unknown> = {}) {
-  return new Promise<{stdout: string; stderr: string}>((accept, reject) => {
-    const child = execFile(NODE, [join(ROOT, "hosts/hook.ts"), eventName], {cwd: f.repo, env: {...f.env, LOOP_TASK_DIR: dir}, timeout: FIXTURE_GUARD_MS},
-      (error, stdout, stderr) => error ? reject(error) : accept({stdout, stderr}));
-    child.stdin!.end(JSON.stringify(event));
-  });
+export async function until<T>(dir:string,get:()=>T,ready:(v:T)=>boolean,file?:string,timeoutMs=5000):Promise<T> {
+  const deadline=Date.now()+timeoutMs; while(Date.now()<deadline) {
+    try {const v=get();if(ready(v))return v;}catch(e){if((e as NodeJS.ErrnoException).code!=="ENOENT")throw e;} await delay(15);
+  }
+  throw new Error("等不到："+(file || dir));
 }
-export async function hostProcess(t: {after: (f: () => any) => any}) {
-  const child = spawn(NODE, ["-e", 'process.on("message",()=>process.exit(0));process.send("ready");'], {stdio: ["ignore", "ignore", "ignore", "ipc"]});
-  const closed = once(child, "close"); await once(child, "message"); const owner = identity(child.pid!);
-  t.after(async () => { signalProcess(owner); await closed; });
-  return {owner, async exit() { child.send("exit"); await closed; }};
-}
-// 等待夹具用真实定时器，不跟着测试里的业务时钟一起快进。
-const pollEvery = setInterval, stopPolling = clearInterval;
-/** 目录用事件，跨进程日志和临时文件用条件轮询；保留相同截止时间。 */
-export function until<T>(dir: string, get: () => T, ready: (v: T) => boolean, file?: string, timeoutMs = FIXTURE_GUARD_MS): Promise<T> {
-  return new Promise((accept, reject) => {
-    const signal = AbortSignal.timeout(timeoutMs);
-    let watcher: ReturnType<typeof watch> | undefined, timer: ReturnType<typeof setInterval> | undefined;
-    const close = () => { watcher?.close(); stopPolling(timer); signal.removeEventListener("abort",abort); };
-    const check = () => {
-      try { const value = get(); if (ready(value)) { close(); accept(value); } }
-      catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") { close(); reject(e); } }
-    };
-    const abort = () => { close(); reject(new Error(`等待文件事件超时（${timeoutMs}ms）：${file || dir}`)); };
-    // 直接读条件：文件若在首轮 stat 基线采集前改变，watchFile 可以漏掉通知。
-    if (file) timer = pollEvery(check,50); else watcher = watch(dir,{recursive:true},check);
-    signal.addEventListener("abort", abort, {once:true}); check();
-  });
-}
+const direct=(dir:string,cmd:string)=>JSON.parse(execFileSync(NODE,[join(ROOT,"src/cli/main.ts"),cmd,...(cmd==="交付" ? [] : [dir]),"--json"],{env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:dir,LOOP_TASKS_ROOT:dirname(dir),LOOP_WAKE:"manual"},encoding:"utf8",stdio:["ignore","pipe","pipe"]}));
+export const deliver=(dir:string)=>direct(dir,"交付"), statusOf=(dir:string)=>report(new Ledger(dir));
+export async function settle(dir:string) {direct(dir,"复测");direct(dir,"评审");}
+export function checked(dir:string,sha:string) {const l=new Ledger(dir),b=binding(l,sha);return evidence(l.rows,sha,b.key,b.tree).verified;}

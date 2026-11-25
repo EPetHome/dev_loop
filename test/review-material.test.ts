@@ -2,10 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { basename, join } from "node:path";
 import { copyFileSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
-import { fixture, write, sq, MUST, PASS, ROOT } from "./helpers.ts";
-import { deliver } from "../src/core/deliver.ts";
-import { settle } from "../src/core/settle.ts";
-import { checksOf, statusOf } from "../src/core/store.ts";
+import { fixture, write, sq, MUST, PASS, ROOT, deliver, settle, statusOf } from "./helpers.ts";
+import { checksOf, Ledger } from "../src/core/store.ts";
 import { git } from "../src/infra/git.ts";
 import { parseReview } from "../src/core/review-parse.ts";
 
@@ -17,8 +15,8 @@ test("R1 A5：必修模板与解析器约定的触发标签和路径行号一致
   assert.match(format[2], /`触发：[^`]+`/);
   assert.match(format[2], /`位置：相对路径:行(?:或起-止)?`/);
   const example = [...format[2].matchAll(/`([^`]+)`/g)].map(m=>m[1].replace(/相对路径:行(?:或起-止)?/,"src/app.ts:12-18"));
-  const parsed = parseReview("## 必修\n1. " + example.join("\n   ") + "\n## 小问题\n无\n");
-  assert.deepEqual(parsed, {ok:true, review:{mustFix:[example.join(" ")]}});
+  const parsed = parseReview("## 结论：需返修\n## 必修\n1. " + example.join("\n   ") + "\n## 小问题\n无\n");
+  assert.ok(parsed.ok); assert.deepEqual(parsed.review.mustFix,[example.join(" ")]);
 });
 
 const projectRules = (input: string) => input.split("## 项目评审规则\n\n")[1]?.split("\n\n## 本轮改动")[0];
@@ -79,8 +77,8 @@ test("W1 A17 / 问题单 A3：7.3 MB 日志、超长单行，材料保留完整�
   f.git("add", "large-log.cjs"); f.git("commit", "-m", "large log fixture");
   const task = await f.prepare(); write(join(task.worktree, "src/app.txt"), "good material diff\n");
   const {commit} = deliver(task.dir); await settle(task.dir);
-  const path = join(task.dir, "review-input-r1.md"), log = join(task.dir, "test-" + commit + ".log");
-  const material = readFileSync(path, "utf8"), original = readFileSync(log, "utf8"), body = material.split("## 复测结果\n\n")[1];
+  const path=join(task.dir,"review-input-r1.md"), log=new Ledger(task.dir).last("复测")!.check!.evidence[0];
+  const material=readFileSync(path,"utf8"), original=readFileSync(log,"utf8"), body=material.split("## 复测结果\n\n")[1].split("\n\n## 上一轮必修")[0];
   const bytes = Buffer.byteLength(original), bodyBytes = Buffer.byteLength(body), bodyLines = body.split("\n").length;
   const checks = checksOf(task.dir).filter(c => ["复测", "评审"].includes(c.step));
   keepMaterial("A17-large", [path, log, ...checks.flatMap(c => c.step === "评审" ? c.evidence : [])]);
@@ -107,9 +105,9 @@ test("W1 A17：读取靠前的失败测试名与计数，长命令、长测试�
   // 内层报告含预期失败，外层任务命令成功，验证实际送出的材料，不改变判定复测结果的规则。
   write(join(f.repo, "failing-subreport.cjs"), "console.log(" + JSON.stringify(subreport.join("\n")) + ");\n");
   f.git("add", "failing-subreport.cjs"); f.git("commit", "-m", "inner report fixture");
-  const task = await f.prepare(), {commit} = deliver(task.dir); await settle(task.dir);
-  const path = join(task.dir, "review-input-r1.md"), log = join(task.dir, "test-" + commit + ".log");
-  const material = readFileSync(path, "utf8"), body = material.split("## 复测结果\n\n")[1];
+  const task=await f.prepare(); write(join(task.worktree,"src/app.txt"),"good log fixture\n"); const {commit}=deliver(task.dir); await settle(task.dir);
+  const path=join(task.dir,"review-input-r1.md"), log=new Ledger(task.dir).last("复测")!.check!.evidence[0];
+  const material=readFileSync(path,"utf8"), body=material.split("## 复测结果\n\n")[1].split("\n\n## 上一轮必修")[0];
   keepMaterial("A17-names", [path, log]);
   t.diagnostic(JSON.stringify({commit, end: statusOf(task.dir).loop.phase, logBytes: readFileSync(log).byteLength, materialBytes: Buffer.byteLength(material), bodyBytes: Buffer.byteLength(body), bodyLines: body.split("\n").length}));
   assert.ok(Buffer.byteLength(body) <= 8192 && body.split("\n").length <= 30);
@@ -140,11 +138,11 @@ test("A8：删除文件只列原行数、中文/制表路径；修改和新增 d
 test("增量评审删除文件按上次评审commit计行，需求变化仍按起点完整diff但不含删除内容", async t => {
   const f = fixture(t, {reviewer: 'if [ "$1" = 1 ]; then printf %s ' + sq(MUST) + '; else printf %s ' + sq(PASS) + '; fi'});
   write(join(f.repo, "src/old.txt"), "old-base-secret\n"); f.git("add", "src/old.txt"); f.git("commit", "-m", "old file");
-  const task = await f.prepare(); write(join(task.worktree, "src/old.txt"), "round-one\nsecond-line\n"); deliver(task.dir); await settle(task.dir);
+  const task = await f.prepare(); write(join(task.worktree, "src/old.txt"), "round-one\nsecond-line\n"); deliver(task.dir); await settle(task.dir); await f.pump(task.dir,l=>!!l.last("发回"));
   rmSync(join(task.worktree, "src/old.txt")); deliver(task.dir); await settle(task.dir);
   let input = readFileSync(join(task.dir, "review-input-r2.md"), "utf8");
   assert.match(input, /src\/old.txt（原 2 行）/); assert.doesNotMatch(input, /-round-one|-old-base-secret/);
-  write(join(f.repo, "prompt.md"), "需求改变后完整评审"); deliver(task.dir); await settle(task.dir);
-  input = readFileSync(join(task.dir, "review-input-r3.md"), "utf8");
+  write(join(f.repo, "prompt.md"), "需求改变后完整评审"); await settle(task.dir);
+  input=readFileSync(join(task.dir,"review-input-r2.md"),"utf8");
   assert.match(input, /需求已变化/); assert.match(input, /src\/old.txt（原 1 行）/); assert.doesNotMatch(input, /old-base-secret/);
 });

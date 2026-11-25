@@ -1,0 +1,16 @@
+{
+  "developerModel": "openai-codex/gpt-6.2-sol", "developerThinking": "max",
+  "reviewerModel": "openai-codex/gpt-6-astra", "reviewerThinking": "xhigh",
+  "triageModel": "openai-codex/gpt-6.2-sol", "triageThinking": "xhigh",
+  "retry": {"times": 3, "delaysMin": [1, 4, 16]},
+  "cardRetryBudget": 10, "newSessionAtContext": 0.5, "tickIntervalSec": 60,
+  "maxParallelCards": 1, "notifyAutoSummary": true,
+  "limits": {
+    "测试": {"maxRepairs": 3, "timeoutMin": 20},
+    "开发评审": {"maxRepairs": 4, "timeoutMin": 60},
+    "部署": {"maxRepairs": 2, "timeoutMin": 20}
+  },
+  "windowStartupSec": 60, "inboxIntervalMs": 1000, "snapshotTimeoutMin": 5,
+  "pushTimeoutSec": 120, "pushVerifyTimeoutSec": 30,
+  "reviewerCmd": "", "setup": "", "localFiles": []
+}

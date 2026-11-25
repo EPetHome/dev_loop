@@ -5,24 +5,29 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PI_BIN="${PI_BIN:-/Users/Admin/.local/bin/pi}"
 PI_NODE_BIN="${PI_NODE_BIN:-/Users/Admin/.hermes/node/bin}"
 permission="${PERMISSION_EXTENSION:-/Users/Admin/.pi/agent/npm/node_modules/@gotgenes/pi-permission-system/src/index.ts}"
-cwd="$PWD" model="openai-codex/gpt-6.2-sol" thinking="max" session="" sid="" name="" prompt="" dry="${PI_DEV_DRY_RUN:-0}"
+cwd="$PWD" model="" thinking="" session="" sid="" session_dir="" name="" prompt="" dry="${PI_DEV_DRY_RUN:-0}"
 die() { echo "pi-dev: $*" >&2; exit 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --cwd|--model|--thinking|--session|--session-id|--name)
+    --cwd|--model|--thinking|--session|--session-id|--session-dir|--name)
       [[ $# -ge 2 && -n "$2" ]] || die "$1 缺值"
       key="${1#--}"; key="${key//-/_}"
       case "$key" in session_id) sid="$2";; *) printf -v "$key" '%s' "$2";; esac
       shift 2;;
     --dry-run) dry=1; shift;;
-    --help|-h) echo 'bin/pi-dev [--cwd 目录] [--model openai-codex/gpt-6.2-sol] [--thinking max] [--session 会话 | --session-id 编号] [--name 名称] [--dry-run] [提示词文件]'; exit 0;;
+    --help|-h) echo 'bin/pi-dev [--cwd 目录] [--model 模型] [--thinking 档位] [--session 会话 | --session-id 编号] [--session-dir 目录] [--name 名称] [--dry-run] [提示词文件]'; exit 0;;
     -*) die "未知选项 $1";;
     *) [[ -z "$prompt" ]] || die "只能给一份提示词"; prompt="$1"; shift;;
   esac
 done
 [[ -d "$cwd" ]] || die "目录不存在：$cwd"
 cwd="$(cd "$cwd" && pwd)"
-[[ -n "$prompt" || -n "$session" ]] || die "缺提示词或恢复会话"
+[[ -n "$prompt" || -n "$session" || -n "${LOOP_WINDOW_JOB:-}" ]] || die "缺提示词或恢复会话"
+if [[ -z "$model" || -z "$thinking" ]]; then
+  settings="$("${LOOP_NODE:-$PI_NODE_BIN/node}" -e 'const c=require(process.argv[1]); console.log(c.developerModel+" "+c.developerThinking)' "$here/config/defaults.json")"
+  read -r default_model default_thinking <<< "$settings"
+  model="${model:-$default_model}" thinking="${thinking:-$default_thinking}"
+fi
 if [[ -n "$prompt" ]]; then
   prompt="${prompt#@}"
   [[ "$prompt" = /* ]] || prompt="$PWD/$prompt"
@@ -53,6 +58,7 @@ if [[ -n "${LOOP_TASK_DIR:-}" && "$cwd" -ef "$LOOP_TASK_DIR/worktree" && -d "$cw
 fi
 [[ -z "$session" ]] || args+=(--session "$session")
 [[ -z "$sid" ]] || args+=(--session-id "$sid")
+[[ -z "$session_dir" ]] || args+=(--session-dir "$session_dir")
 [[ -z "$name" ]] || args+=(--name "$name")
 [[ -z "$prompt" ]] || args+=("@$prompt")
 if [[ "$dry" = 1 ]]; then printf 'cd %q\n' "$cwd"; printf '%q ' "$PI_BIN" "${args[@]}"; printf '\n'; exit 0; fi

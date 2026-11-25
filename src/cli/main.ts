@@ -1,118 +1,87 @@
-import { mkdirSync, existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { APP_ROOT, tasksRoot } from "../infra/paths.ts";
-import { appendJson, ifPresent, jsonLines, withLock, readText, errorText } from "../infra/files.ts";
-import { createTask, taskOf, statusOf, allTasks, locate, LoopError, type Task } from "../core/store.ts";
-import { InputError, UnsupportedError } from "../core/card.ts";
-import { confirmDelivery, deliver } from "../core/deliver.ts";
-import { resume, stop } from "../core/lifecycle.ts";
-import { merge } from "../steps/merge.ts";
-import { push, type PushResult } from "../steps/push.ts";
-import { deploy, rollback } from "../steps/deploy.ts";
+import { APP_ROOT, entrypoint, wake } from "../infra/paths.ts";
+import { errorText, readText } from "../infra/files.ts";
+import { allTasks, locate, locked, taskOf, hasLedger, LoopError, Ledger, type Step } from "../core/store.ts";
+import { InputError } from "../core/card.ts";
+import { state } from "../core/state.ts";
+import { publicStatus, publish } from "../core/view.ts";
+import { signalProcess } from "../infra/exec.ts";
+import { startCards } from "./start.ts";
+import { worker } from "./worker.ts";
+import { tick } from "./tick.ts";
 import { prove } from "../steps/proof.ts";
-import { validateStart } from "./start.ts";
-import { finish } from "./finish.ts";
-import { queued } from "./queue.ts";
-import { background } from "./background.ts";
-import { companion } from "./companion.ts";
-import { comparison, publicStatus, releaseWorktree } from "./inspect.ts";
-interface Options { command: string; target?: string; other?: string; all: boolean; task?: string; dispatch?: string; instruction?: string; note: string; words?: string; commit?: string; deliveryCommit?: string; acceptEnvironment?: string; acceptUnverified: boolean; push: boolean; automatic: boolean }
-function options(args: string[]): Options {
-  const command = args.shift() || "帮助", out: Options = {command,all:false,note:"",acceptUnverified:false,push:false,automatic:false};
-  const flags = {"--all":"all",...(command === "合入" ? {"--接受未验证":"acceptUnverified","--推送":"push"} as const : {}),...(command === "收尾" ? {"--auto":"automatic"} as const : {})} as const;
-  const fields = {"--交付提交":"deliveryCommit","--接受环境缺项":"acceptEnvironment","--task":"task","--派单编号":"dispatch",
-    "--指令编号":"instruction","--说明":"note","--话":"words","--text-file":"file",...(["合入","部署"].includes(command) ? {"--commit":"commit"} as const : {})} as const;
+import { comparison, timer } from "./inspect.ts";
+const help=()=>readText(join(APP_ROOT,"README.md")).split(/^## 命令\s*$/m)[1].split(/^## /m)[0].trim();
+const tools:Record<string,Step>={准备:"准备",开窗口:"开窗口",复测:"复测",评审:"评审",合入:"合入",部署:"部署",推送:"推送",释放:"释放",陪跑:"陪跑",退回:"退回"};
+function options(args:string[]) {
+  const command=args.shift() || "帮助", files:string[]=[], images:string[]=[], edges:string[]=[], values:Record<string,string>={}, flags=new Set<string>();
+  const specs:Record<string,string[]>={"--话":["启动","开工","答复","续跑","加轮","停止","放弃","合入","提问"],"--text-file":["答复","续跑","交付"],"--说明":["交付"],"--派单编号":["启动","开工"],"--指令编号":["启动","开工"],"--commit":Object.keys(tools),"--task":[command]};
   while (args.length) {
-    const arg = args.shift()!, flag = Object.hasOwn(flags,arg) && flags[arg as keyof typeof flags];
-    if (arg === "--brief" || arg === "--json") continue;
-    if (flag) { out[flag] = true; continue; }
-    const field = Object.hasOwn(fields,arg) ? fields[arg as keyof typeof fields] : undefined;
-    if ((field === "deliveryCommit" || field === "acceptEnvironment") && (out.command !== "续跑" || out[field])) throw new InputError("仅可在续跑时指定一次 " + arg);
-    if (field) {
-      const value = args.shift(); if (value === undefined || (field !== "words" && (!value || value.startsWith("--")))) throw new InputError(arg + " 缺值");
-      if (field === "file") out[["续跑","答复"].includes(command) ? "words" : "note"] = readText(resolve(value)); else out[field] = value;
-    } else if (arg.startsWith("-")) throw new InputError("未知选项：" + arg);
-    else if (out.target) { if(out.command==="对比" && !out.other)out.other=arg; else throw new InputError("只能指定一个卡或执行编号（对比最多两个）"); }
-    else out.target = arg;
+    const a=args.shift()!;
+    if (["--json","--brief","--all"].includes(a) || command==="合入" && ["--接受未验证","--推送"].includes(a)) {flags.add(a);continue;}
+    if (a==="--截图" && command==="交付") {while (args[0] && !args[0].startsWith("--")) images.push(resolve(args.shift()!)); if(!images.length)throw new InputError(a+" 缺值");continue;}
+    if (a==="--依赖" && ["启动","开工"].includes(command)) {if(!args[0] || args[0].startsWith("--"))throw new InputError(a+" 缺值"); edges.push(args.shift()!);continue;}
+    if (specs[a]?.includes(command)) {const v=args.shift();if(v===undefined || v.startsWith("--"))throw new InputError(a+" 缺值");values[a]=v;}
+    else if (a.startsWith("-")) throw new InputError("未知选项："+a); else files.push(a);
   }
-  if ((out.deliveryCommit || out.acceptEnvironment) && (out.words !== undefined || out.note || out.deliveryCommit && out.acceptEnvironment)) throw new InputError("--交付提交 或 --接受环境缺项 不能与另一确认选项或附言同时使用");
-  if (command !== "启动" && (out.instruction || out.dispatch)) throw new UnsupportedError("第 4 步才支持续跑/停止等 PA 指令编号；本步编号只用于启动回执"); return out;
+  const text=values["--text-file"]===undefined ? undefined : readText(resolve(values["--text-file"]));
+  return {command,files,images,edges,values,flags,words:values["--话"] ?? text,note:values["--说明"] ?? text ?? "",target:files[0],all:flags.has("--all")};
 }
-function matching(target?: string): string[] {
-  if (!target) { const dir = locate(process.cwd()); return dir ? [dir] : []; }
-  const dirs = allTasks(), full = existsSync(target) ? realpathSync(target) : resolve(target);
-  return dirs.filter((d)=>{const t=taskOf(d);return t.executionId===target || d===full || t.card===full;});
+function matching(target?:string) {
+  if (!target) {const dir=locate(process.cwd());return dir ? [dir] : [];}
+  const full=existsSync(target) ? realpathSync(target) : resolve(target);
+  return allTasks().filter(d=>{const t=taskOf(d);return t.executionId===target || d===full || t.card===full;});
 }
-function select(o: Options): string {
-  const dirs = matching(o.target).filter((d)=>!o.task || taskOf(d).name===o.task).sort((a,b)=>taskOf(b).createdAt.localeCompare(taskOf(a).createdAt));
-  if (!dirs.length) throw new InputError("找不到执行，请指定卡路径或执行编号");
-  const active=dirs.filter(d=>["working","input_required","failed"].includes(statusOf(d).state));
-  if (active.length>1) throw new InputError("此卡有多个活动执行，请明确指定执行编号"); return active[0] || dirs[0];
+function select(target?:string,task?:string,newOnly=true) {
+  const dirs=matching(target).filter(d=>!task || taskOf(d).name===task).sort((a,b)=>taskOf(b).createdAt.localeCompare(taskOf(a).createdAt));
+  const active=dirs.filter(d=>["working","input_required","failed"].includes(publicStatus(d).state));
+  if (active.length>1) throw new InputError("此卡有多个活动执行，请明确指定执行编号");
+  const dir=active[0] || dirs[0]; if (!dir || newOnly && !hasLedger(dir)) throw new InputError("没有可推进的新版执行；旧执行只读查询"); return dir;
 }
-// README 的命令表也是 CLI 帮助，避免参数和说明维护两份。
-const help = () => readText(join(APP_ROOT,"README.md")).split(/^## 命令\s*$/m)[1].split(/^## /m)[0].trim();
-export async function main(args = process.argv.slice(2)): Promise<unknown> {
-  const o=options([...args]), root=tasksRoot();
-  if (["帮助","help","--help","-h"].includes(o.command)) return help();
-  if (o.command==="启动") {
-    if (!o.target) throw new InputError("启动需要开发卡路径");
-    let t: Task | undefined;
-    const create = () => {
-      const found = o.instruction && allTasks(root).flatMap(d=>jsonLines<any>(join(d,"instructions.jsonl"))).find(i=>i.id===o.instruction && i.type==="启动");
-      if (found) return found.result;
-      validateStart(resolve(o.target!)); t = createTask(resolve(o.target!),root,o.dispatch || null);
-      const result = {executionId:t.executionId,taskDir:t.dir,status:join(t.dir,"status.json"),state:"working",warnings:statusOf(t.dir).warnings};
-      if (o.instruction) appendJson(join(t.dir,"instructions.jsonl"),{id:o.instruction,type:"启动",result});
-      return result;
-    };
-    if (o.instruction) mkdirSync(root,{recursive:true});
-    const receipt = o.instruction ? withLock(join(root,"instructions.lock"),create) : create();
-    if (t) await background(t); return receipt;
+export async function main(args=process.argv.slice(2)):Promise<unknown> {
+  if ([undefined,"帮助","help","--help","-h"].includes(args[0])) return help();
+  if (process.env.LOOP_ROLE && !["查询","交付","提问"].includes(args[0])) throw new InputError("开发窗口只可提问、交付、查询");
+  if (args[0]==="_worker") return worker(args[1],{step:args[3] as Step},Number(args[2]));
+  const o=options([...args]), {command,files,words,target}=o;
+  if (command==="启动" || command==="开工") return startCards(files,o.edges,words || "",o.values["--派单编号"],o.values["--指令编号"]);
+  if (files.length>(["对比","加轮"].includes(command)?2:1) || o.all && target) throw new InputError("参数过多或 --all 与执行编号同时指定");
+  if (command==="查询") return {complete:true,executions:(o.all ? allTasks() : matching(target)).map(publicStatus)};
+  if (command==="tick") return tick(target ? select(target,undefined,false) : o.all ? undefined : locate(process.cwd()));
+  if (command==="安装定时" || command==="卸载定时") return timer(command==="安装定时");
+  if (command==="交付") {if(target)throw new InputError("请在登记的工作区交付");return worker(select(),{step:"收货",note:o.note,images:o.images});}
+  const dir=select(command==="提问" ? undefined : target,o.values["--task"]);
+  if (command==="证明") {if (target!==taskOf(dir).executionId)throw new InputError("证明须指定执行编号"); const result=await prove(taskOf(dir));locked(dir,publish);return result;}
+  if (command==="对比") return comparison(dir,files[1] && select(files[1]));
+  if (Object.hasOwn(tools,command)) {
+    const result=await worker(dir,{step:tools[command],target:o.values["--commit"]},undefined,o.flags.has("--接受未验证") ? words ?? "合入 --接受未验证" : undefined);
+    if (command==="合入" && o.flags.has("--推送")) return {...result,push:await worker(dir,{step:"推送"})}; return result;
   }
-  if(o.command==="查询") {
-    if(o.all && o.target)throw new InputError("--all 与卡/执行编号不能同时使用");
-    return {complete:true,executions:(o.all ? allTasks(root) : matching(o.target)).map(publicStatus)};
-  }
-  if(o.command==="交付") {
-    const dir=locate(process.cwd()); if (!dir) throw new InputError("当前目录没有任务；请在登记的 worktree 内交付或设置 LOOP_TASK_DIR"); return deliver(dir,o.note);
-  }
-  if(o.command==="续跑" || o.command==="答复") {
-    const dir = select(o), t = taskOf(dir), confirmFlag = o.deliveryCommit ? "--交付提交" : o.acceptEnvironment ? "--接受环境缺项" : "";
-    if (confirmFlag && o.target !== t.executionId) throw new InputError(confirmFlag+" 须指定查询给出的执行编号");
-    if (o.deliveryCommit) {
-      const receipt=confirmDelivery(dir,o.deliveryCommit);
-      if(receipt.status.loop.phase==="已交付")await background(t,{delivery:receipt.commit});
-      return {executionId:t.executionId,...receipt};
+  if (!["答复","续跑","加轮","停止","放弃","提问"].includes(command)) throw new InputError("未知命令："+command);
+  if (command==="提问" && !(words || target)?.trim() || command==="答复" && !words?.trim() || words!==undefined && !words.trim()) throw new InputError("话不能为空");
+  let abandon=false;
+  const result=locked(dir,l=>{
+    const s=state(l), {executionId}=l.task;
+    if (command==="停止" || command==="放弃") {
+      abandon=command==="放弃"; l.add({type:"停",result:abandon ? "已放弃" : "已停止",text:words});
+      for (const p of l.rows.filter(r=>r.type==="子进程" && s.starts.some(j=>r.ref===j.n))) signalProcess(p.owner,p.status!=="窗口");
+      s.starts.forEach(j=>signalProcess(j.owner));
+      signalProcess(s.queued?.owner); signalProcess(s.window?.owner); return publish(l);
     }
-    const result = resume(dir,o.words,o.command === "答复",o.acceptEnvironment), {reviewRequest,phase} = result.status.loop;
-    const mode = result.retest ? {retest:result.retest} : reviewRequest ? {review:reviewRequest} : phase === "收尾中" ? "finish"
-      : !result.reused && !result.running ? "resume" : undefined;
-    if (mode) await background(t,mode); return {executionId:t.executionId,...result};
-  }
-  if(o.command==="停止" || o.command==="放弃") return stop(select(o),o.command==="放弃");
-  if(o.command==="对比") return comparison(select(o),o.other?select({...o,target:o.other}):undefined);
-  if(o.command==="陪跑") { const dir=select(o); await companion(dir); return {executionId:taskOf(dir).executionId}; }
-  if(o.command==="释放") return releaseWorktree(select(o));
-  if(o.command==="收尾") return finish(select(o),o.automatic);
-  if (o.command === "证明") {
-    const id = o.target;
-    if (!id || !/^[a-zA-Z0-9_-]+$/.test(id) || o.all) throw new InputError("证明须指定一个执行编号");
-    const t = ifPresent(() => taskOf(join(root,id)));
-    if (t?.executionId !== id || o.task && o.task !== t.name) throw new InputError("找不到该执行或任务名不符");
-    return prove(t);
-  }
-  if (["合入","退回","部署"].includes(o.command)) {
-    const dir = select(o); return queued(dir,async () => {
-      if (o.command === "部署") return deploy(dir,o);
-      if (o.command === "退回") return rollback(dir);
-      const r: ReturnType<typeof merge> & {push?: PushResult} = merge(dir,o);
-      if (o.push) r.push = await push(dir); return r;
-    });
-  }
-  if(["整合","验收","开发"].includes(o.command))throw new UnsupportedError("本步不支持此命令。\n"+help());
-  throw new InputError("未知命令："+o.command+"\n"+help());
+    if (s.stop?.result==="已放弃" || s.side("释放")?.value?.released) throw new InputError("工作区已释放或放弃");
+    if (command==="提问") {l.add({type:"疑问",wait:"需求疑问",text:words || target});return {executionId,status:publish(l)};}
+    if (command==="答复" && !s.wait && !s.suspended && !s.rows.some(r=>r.type==="答复" && r.n>s.last)) throw new InputError("答复只在等本人或本人中止时接收");
+    const add=command==="加轮" ? Number(files[1]) : s.wait?.wait==="轮数用完" ? 1 : 0;
+    if (command==="加轮" && (!Number.isSafeInteger(add) || add<1 || s.wait?.wait!=="轮数用完")) throw new InputError("仅在轮数用完时指定正整数加轮");
+    if (add) l.add({type:"加轮",level:s.wait!.level,count:add,text:words || `${command} ${add}`});
+    if (words) l.add({type:"答复",text:words,...(s.wait?.wait!=="环境修不好" && {todo:"本人答复："+words})});
+    if (!add && !words || command==="续跑" && s.stop) l.add({type:"续跑",text:words || "续跑",...(s.wait?.wait==="开发推不动" || s.wait?.wait==="需求疑问" || s.suspended ? {todo:"继续按当前待办；有疑问先提问。"} : {})});
+    return {executionId,reused:false,running:s.windowLive,status:publish(l)};
+  });
+  wake(dir); if(abandon) await worker(dir,{step:"放弃"}).catch(()=>{}); return result;
 }
-if(process.argv[1] && resolve(process.argv[1])===join(APP_ROOT,"src/cli/main.ts")) {
-  main().then(result=>{console.log(typeof result==="string"?result:process.argv.includes("--json")?JSON.stringify(result):JSON.stringify(result,null,2));})
-    .catch(e=>{console.error(JSON.stringify({error:{category:e instanceof InputError || e instanceof LoopError?e.category:/EACCES|EPERM|Permission denied/.test(String(e))?"权限不足":"工具内部错误",raw:errorText(e),...(e instanceof LoopError && e.result !== undefined ? {result:e.result} : {})}}));process.exitCode=1;});
-}
+if (process.argv[1] && resolve(process.argv[1])===entrypoint) main().then(r=>{
+  if (r!==undefined) console.log(typeof r==="string" ? r : JSON.stringify(r,null,process.argv.includes("--json")?0:2));
+}).catch(e=>{
+  const {category="工具内部错误",result}=e;console.error(JSON.stringify({error:{category,raw:errorText(e),result}}));process.exitCode=1;
+});

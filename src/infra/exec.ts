@@ -1,5 +1,4 @@
 import { spawn, execFileSync } from "node:child_process";
-import { openSync, closeSync } from "node:fs";
 import { setTimeout as delay } from "node:timers/promises";
 export interface Identity { pid: number; startedAt: string }
 let ownStart = ""; // 只缓存本进程；外部 PID 可能复用。
@@ -45,14 +44,4 @@ export function childExec(command: string, args: string[], options: ExecOptions)
     try { if (child.pid && onSpawn) onSpawn(identity(child.pid)); }
     catch (e) { collect("stderr",String(e)); kill(); } if (signal?.aborted) kill();
   });
-}
-export async function detach(command: string, args: string[], log: string, cwd: string, env: NodeJS.ProcessEnv, acknowledge = false) {
-  const fd = openSync(log,"a"); try {
-    const child = spawn(command,args,{cwd,env,detached:true,stdio:acknowledge?["ignore",fd,fd,"ipc"]:["ignore",fd,fd]});
-    await new Promise<void>((ok,no) => {
-      child.once("error",no).once(acknowledge ? "message" : "spawn",ok);
-      if (acknowledge) child.once("exit",(code,signal)=>no(new Error("下一卡启动未登记："+(signal || code))));
-    });
-    if (child.connected) child.disconnect(); child.unref();
-  } finally { closeSync(fd); }
 }
