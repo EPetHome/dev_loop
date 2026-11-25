@@ -16,16 +16,29 @@ const help=()=>readText(join(APP_ROOT,"README.md")).split(/^## 命令\s*$/m)[1].
 const tools:Record<string,Step>={准备:"准备",开窗口:"开窗口",复测:"复测",评审:"评审",合入:"合入",部署:"部署",推送:"推送",释放:"释放",陪跑:"陪跑",退回:"退回"};
 function options(args:string[]) {
   const command=args.shift() || "帮助", files:string[]=[], images:string[]=[], edges:string[]=[], values:Record<string,string>={}, flags=new Set<string>();
-  const specs:Record<string,string[]>={"--话":["启动","开工","答复","续跑","加轮","停止","放弃","合入","提问"],"--text-file":["答复","续跑","交付"],"--说明":["交付"],"--派单编号":["启动","开工"],"--指令编号":["启动","开工"],"--commit":Object.keys(tools),"--task":[command]};
+  const specs:Record<string,string[]>={
+    "--话":["启动","开工","答复","续跑","加轮","停止","放弃","合入","提问"],"--text-file":["答复","续跑","交付"],"--说明":["交付"],
+    "--派单编号":["启动","开工"],"--指令编号":["启动","开工"],"--commit":Object.keys(tools),"--task":[command]
+  };
   while (args.length) {
     const a=args.shift()!;
     if (["--json","--brief","--all"].includes(a) || command==="合入" && ["--接受未验证","--推送"].includes(a)) {flags.add(a);continue;}
-    if (a==="--截图" && command==="交付") {while (args[0] && !args[0].startsWith("--")) images.push(resolve(args.shift()!)); if(!images.length)throw new InputError(a+" 缺值");continue;}
-    if (a==="--依赖" && ["启动","开工"].includes(command)) {if(!args[0] || args[0].startsWith("--"))throw new InputError(a+" 缺值"); edges.push(args.shift()!);continue;}
+    if (a==="--截图" && command==="交付") {
+      while (args[0] && !args[0].startsWith("--")) images.push(resolve(args.shift()!));
+      if(!images.length)throw new InputError(a+" 缺值");
+      continue;
+    }
+    if (a==="--依赖" && ["启动","开工"].includes(command)) {
+      if(!args[0] || args[0].startsWith("--"))throw new InputError(a+" 缺值");
+      edges.push(args.shift()!);
+      continue;
+    }
     if (specs[a]?.includes(command)) {const v=args.shift();if(v===undefined || v.startsWith("--"))throw new InputError(a+" 缺值");values[a]=v;}
     else if (a.startsWith("-")) throw new InputError("未知选项："+a); else files.push(a);
   }
-  const text=values["--text-file"]===undefined ? undefined : readText(resolve(values["--text-file"])); return {command,files,images,edges,values,flags,words:values["--话"] ?? text,note:values["--说明"] ?? text ?? "",target:files[0],all:flags.has("--all")};
+  const text=values["--text-file"]===undefined ? undefined : readText(resolve(values["--text-file"]));
+  return {command,files,images,edges,values,flags,words:values["--话"] ?? text,
+    note:values["--说明"] ?? text ?? "",target:files[0],all:flags.has("--all")};
 }
 function matching(target?:string) {
   if (!target) {const dir=locate(process.cwd());return dir ? [dir] : [];}
@@ -50,7 +63,12 @@ export async function main(args=process.argv.slice(2)):Promise<unknown> {
   if (command==="安装定时" || command==="卸载定时") return timer(command==="安装定时");
   if (command==="交付") {if(target)throw new InputError("请在登记的工作区交付");return worker(select(),{step:"收货",note:o.note,images:o.images});}
   const dir=select(command==="提问" ? undefined : target,o.values["--task"]);
-  if (command==="证明") {if (target!==taskOf(dir).executionId)throw new InputError("证明须指定执行编号"); const result=await prove(taskOf(dir));locked(dir,publish);return result;}
+  if (command==="证明") {
+    if (target!==taskOf(dir).executionId)throw new InputError("证明须指定执行编号");
+    const result=await prove(taskOf(dir));
+    locked(dir,publish);
+    return result;
+  }
   if (command==="对比") return comparison(dir,files[1] && select(files[1]));
   if (Object.hasOwn(tools,command)) {
     const result=await worker(dir,{step:tools[command],target:o.values["--commit"]},undefined,o.flags.has("--接受未验证") ? words ?? "合入 --接受未验证" : undefined);

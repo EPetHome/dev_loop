@@ -10,7 +10,8 @@ import { entrypoint, tasksRoot } from "../infra/paths.ts";
 import { atomicWrite } from "../infra/files.ts";
 import { InputError } from "../core/card.ts";
 export async function comparison(dir:string,other?:string) {
-  const l=new Ledger(dir), deployment=(d:Ledger)=>d.rows.findLast(r=>r.type==="部署" && r.result==="成功"), a=deployment(l), b=other && deployment(new Ledger(other)), report=join(dir,`comparison-${Date.now()}.md`);
+  const l=new Ledger(dir), deployment=(d:Ledger)=>d.rows.findLast(r=>r.type==="部署" && r.result==="成功"),
+    a=deployment(l), b=other && deployment(new Ledger(other)), report=join(dir,`comparison-${Date.now()}.md`);
   let diff="没有基线"; if (a && (!other || b)) {
     const current=b ? join(b.value.evidenceDir,"snapshot-after.json") : join(dir,`snapshot-live-${Date.now()}.json`);
     if (!b) await checkout(l.task.repo,a.sha!,cwd=>snapshot(l.task,cwd,a.sha!,current,"live"));
@@ -20,7 +21,11 @@ export async function comparison(dir:string,other?:string) {
 }
 export function timerPlist(label:string,root:string,seconds=defaults().tickIntervalSec) {
   const xml=(s:string)=>s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-  return `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${[process.execPath,entrypoint,"tick","--all"].map(p=>`<string>${xml(p)}</string>`).join("")}</array><key>EnvironmentVariables</key><dict><key>LOOP_TASKS_ROOT</key><string>${xml(root)}</string><key>PATH</key><string>${xml(process.env.PATH || "/usr/bin:/bin")}</string></dict><key>StartInterval</key><integer>${seconds}</integer></dict></plist>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Label</key><string>${label}</string><key>ProgramArguments</key><array>${
+    [process.execPath,entrypoint,"tick","--all"].map(p=>`<string>${xml(p)}</string>`).join("")
+  }</array><key>EnvironmentVariables</key><dict><key>LOOP_TASKS_ROOT</key><string>${xml(root)}</string><key>PATH</key><string>${
+    xml(process.env.PATH || "/usr/bin:/bin")
+  }</string></dict><key>StartInterval</key><integer>${seconds}</integer></dict></plist>`;
 }
 export function timer(install:boolean) {
   if (process.platform!=="darwin") throw new InputError("launchd 只支持 macOS");

@@ -7,5 +7,8 @@ export function compare(before: unknown, after: unknown): string[] {
     return out;
   };
   const a=flatten(before), b=flatten(after);
-  return [...new Set([...a.keys(),...b.keys()])].sort().flatMap(path=>!a.has(path)?["新增 "+path+"："+b.get(path)]:!b.has(path)?["减少 "+path+"："+a.get(path)]:a.get(path)!==b.get(path)?["变化 "+path+"："+a.get(path)+" → "+b.get(path)]:[]);
+  return [...new Set([...a.keys(),...b.keys()])].sort().flatMap(path=>
+    !a.has(path)?["新增 "+path+"："+b.get(path)]
+      :!b.has(path)?["减少 "+path+"："+a.get(path)]
+      :a.get(path)!==b.get(path)?["变化 "+path+"："+a.get(path)+" → "+b.get(path)]:[]);
 }

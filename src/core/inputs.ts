@@ -41,8 +41,10 @@ export function inputs(t:Task) {
 }
 export function binding(l:Ledger,sha:string) {
   const t=l.task,{config:c}=t,{prompt,acceptance,test,e2e,...hashes}=inputs(t), base=baseOf(l,sha), pinnedTree=tree(t.repo,sha);
-  const files=fileHashes(t.repo,c.localFiles), sketch=t.版式 ? readText(t.版式.草图) : "", images=l.delivery?.commit===sha ? l.delivery.images : l.rows.findLast(r=>r.type==="提交" && r.sha===sha)?.value.images || [];
-  const key=digest(JSON.stringify([sha,pinnedTree,base,hashes,test,files,c.setup,c.limits,readText(reviewPrompt),c.reviewerCmd,c.reviewerModel,c.reviewerThinking,sketch,images.map((p:string)=>digest(readFileSync(p)))]));
+  const files=fileHashes(t.repo,c.localFiles), sketch=t.版式 ? readText(t.版式.草图) : "",
+    images=l.delivery?.commit===sha ? l.delivery.images : l.rows.findLast(r=>r.type==="提交" && r.sha===sha)?.value.images || [];
+  const key=digest(JSON.stringify([sha,pinnedTree,base,hashes,test,files,c.setup,c.limits,readText(reviewPrompt),
+    c.reviewerCmd,c.reviewerModel,c.reviewerThinking,sketch,images.map((p:string)=>digest(readFileSync(p)))]));
   return {sha,tree:pinnedTree,key,base,hashes,prompt,acceptance,test,e2e,files,sketch,images};
 }
 export function evidence(rows:Entry[],sha:string,key:string,pinnedTree:string) {
@@ -50,7 +52,8 @@ export function evidence(rows:Entry[],sha:string,key:string,pinnedTree:string) {
   const test=rows.findLast(r=>r.type==="复测" && match(r)), review=rows.findLast(r=>r.type==="评审" && match(r) && r.check!.attempt===test?.check?.attempt);
   return {test,review,accepted:acceptanceOf(rows,sha,key),verified:test?.check?.result==="通过" && review?.check?.result==="通过" && !review.blocker};
 }
-export const acceptanceOf=(rows:Entry[],sha?:string,key?:string)=>rows.findLast(r=>r.type==="接受未验证" && r.sha===sha && (key===undefined || r.key===key) && r.text?.trim());
+export const acceptanceOf=(rows:Entry[],sha?:string,key?:string)=>rows.findLast(r=>
+  r.type==="接受未验证" && r.sha===sha && (key===undefined || r.key===key) && r.text?.trim());
 export function requireGate(l:Ledger,sha:string) {
   if (!l.delivery || l.delivery.commit!==sha) throw new InputError("版本不是最后一次收货提交");
   const b=binding(l,sha), {verified,accepted}=evidence(l.rows,sha,b.key,b.tree);

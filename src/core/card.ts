@@ -26,7 +26,8 @@ const object = (v: any, label: string, keys?: string) => {
 const text = (v: any, label: string): string => {
   if (typeof v !== "string" || !v.trim() || /[\0\r\n]/.test(v)) throw new InputError(label+" 须为非空单行字符串"); return v.trim();
 };
-export const observed = (v: unknown): v is Observation => v === null || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v) || typeof v === "string" && !!v.trim();
+export const observed = (v: unknown): v is Observation =>
+  v === null || typeof v === "boolean" || typeof v === "number" && Number.isFinite(v) || typeof v === "string" && !!v.trim();
 export const checkId = (c: Checkpoint) => typeof c === "string" ? c : c.id;
 function list<T>(v: any, label: string, parse: (entry: any) => T, key: (entry: T) => string): T[] {
   if (!Array.isArray(v)) throw new InputError(label + " 须为数组");
@@ -42,7 +43,8 @@ export const parseE2e = (value: unknown): Scenario[] => list(value,"e2e",v => {
     return {id:text(id,"检查点 id"),expected};
   },checkId);
   if (!steps.length) throw new InputError("e2e.checks 不能为空");
-  return {id:text(id,"场景 id"),paths,checks:steps,dependencies:dependencies === undefined ? undefined : list(dependencies,"e2e.dependencies",d => text(d,"外部依赖"),d => d)};
+  return {id:text(id,"场景 id"),paths,checks:steps,
+    dependencies:dependencies === undefined ? undefined : list(dependencies,"e2e.dependencies",d => text(d,"外部依赖"),d => d)};
 },s => s.id);
 const parseProofs = (value: unknown, repo: string) => list<Proof>(value,"proofs", entry => {
   const {issue,before,testFiles,test,expected,beforeActual,scenario,checkpoint,testName} = object(entry,"proofs 项",
@@ -86,7 +88,8 @@ export function parseDevelopmentCard(content: string, file: string, repo: string
     if (step === "提交") throw new UnsupportedError("开发卡的 flow 不写提交：请改写合入，提交已由 bin/loop 交付完成");
     if (!order.includes(step)) throw new UnsupportedError("不支持 flow " + step);
   }
-  if (raw.nature !== "开发" || raw.flow[0] !== "开发评审" || raw.flow.some((s: string, i: number) => i && order.indexOf(s) <= order.indexOf(raw.flow[i - 1]))) throw new InputError("flow 须按 开发评审, 测试, 合入, 部署, 推送 的顺序且不重复");
+  if (raw.nature !== "开发" || raw.flow[0] !== "开发评审" || raw.flow.some((s: string, i: number) => i && order.indexOf(s) <= order.indexOf(raw.flow[i - 1])))
+    throw new InputError("flow 须按 开发评审, 测试, 合入, 部署, 推送 的顺序且不重复");
   if (raw.flow.some((s: string) => ["部署", "推送"].includes(s)) && !raw.flow.includes("合入")) throw new InputError("flow 写部署或推送须包含合入");
   if (raw.target !== "dev") throw new InputError("target 必须为 dev，不碰 main");
   const base = text(raw.base ?? raw.target,"base"); if (base === "main" || base.startsWith("-")) throw new InputError("base 不合法或是 main");

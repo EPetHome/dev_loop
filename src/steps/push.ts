@@ -21,7 +21,8 @@ export function scan(repo: string, commits: string[]): string[] {
     const diff = (...args: string[]) => git(repo,["-c","core.quotePath=false","diff-tree","--root",...args,sha]), short = sha.slice(0,7);
     const patch = diff("-p","-U0","--no-renames","--no-ext-diff","--no-textconv"), added = diff("-r","--name-only","-z","--diff-filter=A","--no-commit-id");
     for (const file of added.split("\0")) {
-      const name = basename(file); if (/^\.env(?:\.|$)/.test(name) && ![".env.example",".env.sample",".env.template"].includes(name)) hits.push(`${short} ${file}:1 .env 文件`);
+      const name = basename(file);
+      if (/^\.env(?:\.|$)/.test(name) && ![".env.example",".env.sample",".env.template"].includes(name)) hits.push(`${short} ${file}:1 .env 文件`);
     }
     let file = "", line = 0, hunk = false;
     for (const text of patch.split("\n")) {
@@ -63,8 +64,10 @@ export async function push(l:Ledger,j:Entry):Promise<Outcome> {
   const sent = await network(["push", "--no-follow-tags", "origin", commit + ":refs/heads/dev"]);
   if (!sent.code && !sent.killed) return finish("已推送",sent.output);
   const verified=await network(["ls-remote","origin","refs/heads/dev"],Math.min(timeoutMs,t.config.pushVerifyTimeoutSec*1000));
-  if (verified.code || verified.killed) return finish("推送结果不确定",sent.output+"\n"+verified.output,auth(sent.output) ? "环境" : "重试","git -C "+shellQuote(t.repo)+" ls-remote origin refs/heads/dev");
+  if (verified.code || verified.killed) return finish("推送结果不确定",sent.output+"\n"+verified.output,
+    auth(sent.output) ? "环境" : "重试","git -C "+shellQuote(t.repo)+" ls-remote origin refs/heads/dev");
   if (verified.stdout.trim().split(/\s+/)[0]===commit) return finish("已推送",sent.output+"\n已核对远端");
-  const temporary=sent.killed || /could not resolve|unable to access|connection|could not read from remote|network|timed out|remote end hung up/i.test(sent.output);
+  const temporary=sent.killed ||
+    /could not resolve|unable to access|connection|could not read from remote|network|timed out|remote end hung up/i.test(sent.output);
   return finish("推送失败",sent.output || "push 超时",temporary && !auth(sent.output) ? "重试" : "环境");
 }

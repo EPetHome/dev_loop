@@ -23,7 +23,8 @@ const treeFiles = (repo: string, commit: string, env: NodeJS.ProcessEnv, paths: 
 function isolatedGit() {
   const fixed = Object.entries({"core.hooksPath":"/dev/null","core.fsmonitor":"false","core.ignoreStat":"false",
     "core.sparseCheckout":"false","core.symlinks":"true","submodule.recurse":"false"});
-  return Object.assign(historyEnv(),{GIT_CONFIG_COUNT:String(fixed.length)},...fixed.map(([k,v],i) => ({[`GIT_CONFIG_KEY_${i}`]:k,[`GIT_CONFIG_VALUE_${i}`]:v})));
+  return Object.assign(historyEnv(),{GIT_CONFIG_COUNT:String(fixed.length)},
+    ...fixed.map(([k,v],i) => ({[`GIT_CONFIG_KEY_${i}`]:k,[`GIT_CONFIG_VALUE_${i}`]:v})));
 }
 function extract(t: Task, p: Proof, commit: string, env: NodeJS.ProcessEnv) {
   const dirs=t.config.proofTestDirs || []; requireReport(fullSHA.test(p.before) && fullSHA.test(commit),"证明须绑定已登记的完整提交 SHA");
@@ -76,7 +77,8 @@ function mount(cwd: string, commit: string, {t,env,p,files}: Pair) {
     checkPin(cwd,commit,allowed,env); roots.forEach(verifyView);
     for (const f of files) {
       const name = evidenceFile(cwd,f.path), mode = lstatSync(name).mode & 0o111;
-      requireReport(realpathSync.native(name) === join(cwd,f.path) && Boolean(mode) === (f.mode === "100755") && digest(readFileSync(name)) === f.sha256,"运行时测试材料偏离交付内容："+f.path);
+      requireReport(realpathSync.native(name) === join(cwd,f.path) && Boolean(mode) === (f.mode === "100755") && digest(readFileSync(name)) === f.sha256,
+        "运行时测试材料偏离交付内容："+f.path);
     }
   };
 }
@@ -87,7 +89,9 @@ function sandbox(cwd: string, {t,env}: Pair) {
   return {...env,PATH:PATH || "/usr/bin:/bin",HOME,TMPDIR,XDG_CONFIG_HOME:join(HOME,"config"),XDG_CACHE_HOME:join(HOME,"cache"),
     XDG_DATA_HOME:join(HOME,"data"),GIT_ALLOW_PROTOCOL:"file",GIT_LITERAL_PATHSPECS:undefined};
 }
-const attemptPlan=(t:Task,p:Proof,binding:Binding,attempt:string)=>({executionId:t.executionId,attempt,proof:p,setup:t.config.setup,timeoutMin:t.limits.测试.timeoutMin,...binding});
+const attemptPlan=(t:Task,p:Proof,binding:Binding,attempt:string)=>({
+  executionId:t.executionId,attempt,proof:p,setup:t.config.setup,timeoutMin:t.limits.测试.timeoutMin,...binding
+});
 function replayPlan({t,p,attempt,binding}: Pick<Pair,"t"|"p"|"attempt"|"binding">, commit: string) {
   const ids = {executionId:t.executionId,attempt,commit}, {expected} = p;
   return p.scenario === undefined ? {...ids,testName:p.testName,expected}
@@ -116,7 +120,8 @@ async function replay(pair: Pair, commit: string, dir: string) {
       const run = await projectCommand(work,"test",join(dir,"test.log"),{...opts,command:p.test,planEnv:{[scene ? "LOOP_E2E_DIR" : "LOOP_PROOF_DIR"]:dir}});
       requireReport(run,"证明命令没有执行"); code=run.code; verify(); observation=readObservation(dir,plan,p,run,evidence);
       const pass = observation.actual === expected, red = scene ? 1 : 76;
-      requireReport(!run.killed && observation.expected === expected && observation.status === (pass ? "通过" : "失败") && run.code === (pass ? 0 : red),"目标断言的预期、实得、状态或命令退出码不一致");
+      requireReport(!run.killed && observation.expected === expected && observation.status === (pass ? "通过" : "失败") && run.code === (pass ? 0 : red),
+        "目标断言的预期、实得、状态或命令退出码不一致");
     },warning => warnings.push(warning));
   } catch (e) { reason = errorText(e); }
   requireReport(realpathSync(dir) === dir,"证明证据目录已改变："+dir);
@@ -146,7 +151,8 @@ async function advance(t: Task, p: Proof, binding: Binding, root: string, signal
     beforeRun=await replay(pair,p.before,join(dir,"before")); afterRun=await replay(pair,binding.commit,join(dir,"after"));
     evidence.push(...beforeRun.evidence,...afterRun.evidence);
     const actual = beforeRun.observation?.actual;
-    const red = beforeRun.reason || (actual === p.beforeActual ? "" : actual === p.expected ? "旧版也通过，未抓住原问题" : `旧版实得不符合登记的原问题值 ${JSON.stringify(p.beforeActual)}`);
+    const red = beforeRun.reason || (actual === p.beforeActual ? ""
+      : actual === p.expected ? "旧版也通过，未抓住原问题" : `旧版实得不符合登记的原问题值 ${JSON.stringify(p.beforeActual)}`);
     const green = afterRun.reason || (afterRun.observation?.actual === p.expected ? "" : "修复版目标断言仍失败");
     reason = [red && "旧版："+red,green && "修复版："+green].filter(Boolean).join("\n");
   } catch (e) {
@@ -159,7 +165,8 @@ async function advance(t: Task, p: Proof, binding: Binding, root: string, signal
     `旧版 ${p.before} 实得：${show(beforeRun?.observation?.actual)}；修复版 ${binding.commit} 实得：${show(afterRun?.observation?.actual)}`,
     reason && "原因："+clip(reason.replaceAll("\n","；"),600)].filter(Boolean).join("\n");
   const result:Verdict=reason?"未证明":"已证明", r={...plan,...span(start),step,result,detail,evidence,report,materials,
-    evidenceHashes:hashEvidence(dir,evidence),materialDigest:materials.length ? digest(JSON.stringify(materials)) : undefined,beforeRun,afterRun,reason} satisfies Check & Record<string,unknown>;
+    evidenceHashes:hashEvidence(dir,evidence),materialDigest:materials.length ? digest(JSON.stringify(materials)) : undefined,
+    beforeRun,afterRun,reason} satisfies Check & Record<string,unknown>;
   writeJson(report,r); return r;
 }
 type Attempt = Awaited<ReturnType<typeof advance>>;
@@ -207,7 +214,9 @@ function publish(t: Task, r: Attempt) {
   const {attempt,result,commit,tree,promptHash,acceptanceHash,e2eHash,startedAt,endedAt,durationMs,detail,evidence,report} = r;
   requireReport(proofVerdict(result),"证明归档的结论不合法");
   locked(t.dir,l=>{
-    if (!l.checks.some(c=>c.step===step && c.attempt===attempt)) l.add({type:step,check:{step,result,commit,tree,promptHash,acceptanceHash,e2eHash,startedAt,endedAt,durationMs,attempt,detail,evidence}});
+    if (!l.checks.some(c=>c.step===step && c.attempt===attempt)) l.add({type:step,check:{
+      step,result,commit,tree,promptHash,acceptanceHash,e2eHash,startedAt,endedAt,durationMs,attempt,detail,evidence
+    }});
   });
   batchResult(t,["",`## ${endedAt} · ${step}`,`执行：${t.executionId}`,`结果：${result}`,detail,
     `证据：[本次记录](${report.split("/").map(encodeURIComponent).join("/")})`],`<!-- dev-loop-proof:${attempt} -->`);
@@ -230,7 +239,8 @@ export async function prove(t: Task) {
     try {
       for (const p of t.proofs || []) {
         if (controller.signal.aborted) break;
-        const matches = (r: Attempt) => r.result === "已证明" && r.commit === binding.commit && r.tree === binding.tree && JSON.stringify(r.proof) === JSON.stringify(p);
+        const matches = (r: Attempt) => r.result === "已证明" && r.commit === binding.commit && r.tree === binding.tree
+          && JSON.stringify(r.proof) === JSON.stringify(p);
         const matching = saved.find(matches), current = matching && readSaved(matching.attempt);
         if (current && matches(current)) proofs.push({...current,reused:true});
         else {

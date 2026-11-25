@@ -12,7 +12,12 @@ export const optionalJson = <T>(path: string) => ifPresent(() => readJson<T>(pat
 export const maybe = <T>(read: () => T) => { try { return read(); } catch { return undefined; } };
 export const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 export function atomicWrite(path: string, text: string | Buffer): void {
-  const temp=path+"."+randomUUID()+".tmp"; try {mkdirSync(dirname(path),{recursive:true});writeFileSync(temp,text);renameSync(temp,path);}finally{rmSync(temp,{force:true});}
+  const temp=path+"."+randomUUID()+".tmp";
+  try {
+    mkdirSync(dirname(path),{recursive:true});
+    writeFileSync(temp,text);
+    renameSync(temp,path);
+  }finally{rmSync(temp,{force:true});}
 }
 export const writeJson = (path: string, value: unknown) => atomicWrite(path, JSON.stringify(value, null, 2) + "\n");
 // 账本的 LF 才提交一帧；用 JSON 不可能产生的 NUL 废弃未提交尾帧，不改写历史字节。
@@ -25,9 +30,13 @@ export class BusyError extends Error {}
 // 锁附着在本进程持有的 fd；进程被杀由内核释放，不能 unlink 锁文件。
 export function lock(path: string, waitMs = 0): () => void {
   const fd = openSync(path,"a",0o600), mac = process.platform === "darwin", secs = String(Math.ceil(waitMs/1000));
-  const {status,error,stderr} = spawnSync(mac ? "/usr/bin/lockf" : "flock",mac ? ["-s","-t",secs,"3"] : ["-E","75","-w",secs,"3"],{stdio:["ignore","ignore","pipe",fd]});
+  const {status,error,stderr} = spawnSync(mac ? "/usr/bin/lockf" : "flock",mac ? ["-s","-t",secs,"3"] : ["-E","75","-w",secs,"3"],
+    {stdio:["ignore","ignore","pipe",fd]});
   if (status === 0) return () => closeSync(fd);
   closeSync(fd); if (status === 75) throw new BusyError("任务正在处理，请稍后重试"); throw error || new Error("不能取得文件锁："+stderr);
 }
-export function withLock<T>(path: string, action: () => T, waitMs = 2000): T { const release = lock(path,waitMs); try { return action(); } finally { release(); } }
+export function withLock<T>(path: string, action: () => T, waitMs = 2000): T {
+  const release = lock(path,waitMs);
+  try { return action(); } finally { release(); }
+}
 export async function underLock<T>(path:string,action:()=>Promise<T>,waitMs=0) {const release=lock(path,waitMs);try{return await action();}finally{release();}}

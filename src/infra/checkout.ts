@@ -44,7 +44,8 @@ export async function privateCheckout<T>(repo: string, commit: string, excluded:
   try {
     const format = gitText(repo,["rev-parse","--show-object-format"],env);
     gitText(root,["init","--template=","--object-format="+format,cwd],env);
-    gitText(cwd,["fetch","--no-tags","--no-recurse-submodules","--no-write-fetch-head","--no-auto-maintenance","--",repo,commit],{...env,GIT_ALLOW_PROTOCOL:"file"});
+    gitText(cwd,["fetch","--no-tags","--no-recurse-submodules","--no-write-fetch-head","--no-auto-maintenance","--",repo,commit],
+      {...env,GIT_ALLOW_PROTOCOL:"file"});
     gitText(cwd,["checkout","--detach",commit],env);
     return await run(cwd);
   } finally { removeTree(root,warning); }
