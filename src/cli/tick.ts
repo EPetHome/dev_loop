@@ -9,6 +9,7 @@ import { state, success, returnedMessage, resets, batchReady, batchPresent, pend
 import { candidate } from "../core/receive.ts";
 import { publish } from "../core/view.ts";
 import { newContext } from "../hosts/launch.ts";
+import { recoverWindowMerge } from "../steps/merge.ts";
 const circle="⓪①②③④⑤⑥⑦⑧";
 export function decide(l:Ledger,now=Date.now()) {
   const s=state(l), {rows,t,ready,wait,stop,settled,sha,key,proofs,complete}=s;
@@ -68,7 +69,7 @@ export function decide(l:Ledger,now=Date.now()) {
   const devFault=settled && settled.ending!=="stop" && !settled.aborted && settled.n>cutoff && settled.n>=(s.window?.n || 0);
   const pending=s.todo.length>0, workPending=s.todo.some(r=>r.step!=="开窗口"), returned=(r:Entry)=>rows.some(e=>e.type==="发回" && e.ref===r.n);
   const rotate=(settled?.n || 0)>(s.window?.n || 0) && (newContext(settled) || (settled?.context || 0)>=cfg.newSessionAtContext);
-  if ((pending || devFault || s.windowEvent?.status==="忙" && !s.windowLive) && (!s.windowLive || rotate))
+  if ((pending || devFault || !s.windowLive && (s.windowEvent?.status==="忙" || s.mergeNotices.length)) && (!s.windowLive || rotate))
     return attempt(3,"开窗口",{key:"",file:rotate && s.windowLive ? "新会话" : undefined});
   if (devFault && !returned(settled)) {
     if (settled.ending!=="error") return say(3,"非 stop："+settled.ending+"，不收货、不评审、不扣轮数",{type:"发回",ref:settled.n,todo:undefined});
@@ -134,8 +135,9 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now(),env=process.
       for (const dead of state(l,false).starts.filter(r=>!alive(r.owner))) {
         const opened=dead.step==="开窗口" && l.rows.some(r=>r.type==="窗口" && r.status==="开" && r.ref===dead.n);
         if (!opened) for (const e of l.rows.filter(r=>r.type==="子进程" && r.ref===dead.n)) signalProcess(e.owner,e.status!=="窗口");
-        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,intent:dead.intent,
-          result:opened ? "成功" : "失败",...(!opened && {kind:"重试",text:"工具进程已退出，未留下结论"})},now);
+        const fallback=opened ? {result:"成功"} : {result:"失败",kind:"重试" as const,text:"工具进程已退出，未留下结论"};
+        const outcome=dead.step==="合入" && dead.intent ? recoverWindowMerge(l,dead) : fallback;
+        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,intent:dead.intent,...outcome},now);
       }
       const decision=decide(l,now); if (decision) {
         const {job,...row}=decision;
@@ -152,7 +154,7 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now(),env=process.
           l.add(row,now); advance=row.type==="完成" || row.type==="合入意图";
         }
       }
-      if ((l.open.batch?.length || 0)>1) {
+      if (l.task.after.length && (l.open.batch?.length || 0)>1) {
         const s=state(l); if (s.done) signalProcess(s.window?.owner);
       }
       publish(l);

@@ -24,7 +24,9 @@ export const batchPresent=(l:Ledger)=>siblings(l,l.open.batch || []).every(Boole
 export function batchReady(l:Ledger) {
   const before=(l.open.batch || []).slice(0,l.open.batch?.indexOf(l.task.executionId) ?? 0);
   const peers=siblings(l,before).flatMap(p=>p ? [state(p)] : []);
-  return peers.filter(p=>p.windowLive || !p.done && !p.stop).length<(l.open.limit || 1) && siblings(l,l.open.deps || []).every(p=>p && state(p).side("合入"));
+  // 已完成的手动收尾窗口仍可接收原话，但不占开发名额。
+  return peers.filter(p=>p.done ? p.t.after.length>0 && p.windowLive : p.windowLive || !p.stop).length<(l.open.limit || 1)
+    && siblings(l,l.open.deps || []).every(p=>p && state(p).side("合入"));
 }
 export function state(l:Ledger, evaluate=true) {
   const {rows,task:t,delivery}=l, commit=delivery?.commit, b=evaluate && commit ? maybe(()=>binding(l,commit)) : undefined;
@@ -39,6 +41,8 @@ export function state(l:Ledger, evaluate=true) {
   const todo=rows.filter(r=>r.todo && r.n>Math.max(last,accepted?.n || 0) && !(r.type==="答复" && r.n<(receipt?.n || 0))),
     sent=rows.filter(r=>r.type==="送达" && r.ref===window?.n), sentIds=new Set(sent.flatMap(r=>r.sent || []));
   const undelivered=todo.filter(r=>!sentIds.has(r.n)), starts=pendingStarts(l), running=starts.find(r=>r.step!=="收货" && alive(r.owner));
+  const notified=new Set(rows.filter(r=>r.type==="合入送达").map(r=>r.ref));
+  const mergeNotices=rows.filter(r=>r.type==="合入" && r.intent && !notified.has(r.n));
   const schedule=rows.findLast(r=>r.type==="调度" && r.owner),
     queued=schedule?.owner && !rows.some(r=>r.type==="开始" && r.source===schedule.n
       || r.type==="合入" && r.intent && r.ref===schedule.n) && alive(schedule.owner) ? schedule : undefined;
@@ -50,7 +54,7 @@ export function state(l:Ledger, evaluate=true) {
     || !t.after.length && proofs?.test?.check?.result==="没验证" && proofs.review?.check?.result==="通过" && !proofs.review.blocker)
     && t.after.every(step=>side(step)) && (!t.after.length || !!side("释放"));
   return {t,rows,delivery,sha,key,b,proofs,ready,wait,stop,window,windowEvent,windowLive,busy,settled,suspended,
-    todo,undelivered,sent,starts,running,queued,side,returned,allowance,done,last,complete};
+    todo,undelivered,sent,starts,running,queued,side,returned,allowance,done,last,complete,mergeNotices};
 }
 export type CardState = ReturnType<typeof state>;
 export const returnedMessage=(s:CardState,step:"复测"|"评审"|"部署",raw:string)=>{

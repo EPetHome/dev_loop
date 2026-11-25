@@ -10,11 +10,11 @@ interface Context {
 }
 interface Pi {
   on(event:string,handler:(e:any,c:Context)=>any):void;
-  sendMessage(message:{customType:string;content:string;display:boolean},opts:{triggerTurn:boolean}):void
+  sendMessage(message:{customType:string;content:string;display:boolean;details?:number},opts:{triggerTurn:boolean}):void
 }
 export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clearInterval}={}) {
   const dir=env.LOOP_TASK_DIR, ref=Number(env.LOOP_WINDOW_JOB); if (!dir || !hasLedger(dir) || !ref || env.LOOP_PI_WINDOW_OWNER!==String(process.ppid)) return;
-  let window=0, mergeNotice=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
+  let window=0, timer:ReturnType<typeof setInterval>|undefined, sending=false, title="";
   const content=(msg:any)=>Array.isArray(msg?.content)
     ? msg.content.filter((p:any)=>p.type==="text").map((p:any)=>p.text).join("\n") : String(msg?.content || "");
   const event=(data:Partial<Entry>)=>{
@@ -31,13 +31,15 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
         || !pendingStarts(l).some(r=>r.step==="开窗口" && r.n===ref) || state(l,false).windowLive) return;
       return l.add({type:"窗口",status:"开",ref,owner:identity(),file:ctx.sessionManager.getSessionFile(),value:{id}});
     });
-    if (!opened) {ctx.shutdown?.(); return;} window=mergeNotice=opened.n; wake(dir,env);
+    if (!opened) {ctx.shutdown?.(); return;} window=opened.n; wake(dir,env);
     timer=every(()=>{
       try {
         const ui=ctx.hasUI && ctx.ui, l=new Ledger(dir), s=state(l,!!ui);
         if (s.stop) {ctx.shutdown?.(); return;}
         if (s.window?.n!==window) return;
-        const sent=s.sent.length, opening=!sent && env.LOOP_OPENING, entries=s.undelivered;
+        const {mergeNotices}=s, entries=s.undelivered;
+        const receiptWindow=s.complete && !s.t.after.length && !s.todo.length;
+        const opening=!s.sent.length && !receiptWindow && env.LOOP_OPENING;
         if (!sending && !s.busy && !s.wait && !s.suspended && (!s.running || s.running.step==="开窗口") && ctx.isIdle?.()!==false && (opening || entries.length)) {
           sending=true;
           try {
@@ -51,11 +53,16 @@ export function registerPi(pi:Pi, {env=process.env,every=setInterval,clear=clear
           const visible=phase==="完成" && s.proofs?.verified && !s.complete ? "收尾中" : phase;
           const next=`【${visible}】${s.t.name}${detail ? " · "+detail : ""} · 已用 ${s.returned("评审").length} 评审轮`;
           if (next!==title) {ui.setStatus("dev-loop","dev-loop "+next);ui.setTitle(next);title=next;}
-          for (const r of l.rows.filter(r=>r.n>mergeNotice && r.type==="合入" && r.intent)) {
-            const text=r.result==="成功" ? `本地 dev ${r.value.result}：${r.value.devAfter}（未推送、未部署）`
-              : `合入失败：${r.text || r.result}`;
-            pi.sendMessage({customType:"dev-loop-merge",content:text,display:true},{triggerTurn:false});
-            mergeNotice=r.n;
+          if (ctx.isIdle?.()!==false) for (const r of mergeNotices) {
+            const customType="dev-loop-merge", shown=()=>ctx.sessionManager.getBranch().some(e=>
+              e.type==="custom_message" && e.customType===customType && e.details===r.n && e.display);
+            if (!shown()) {
+              const text=r.result==="成功" ? `本地 dev ${r.value.result}：${r.value.devAfter}（未推送、未部署）`
+                : `合入失败：${r.text || r.result}`;
+              pi.sendMessage({customType,content:text,display:true,details:r.n},{triggerTurn:false});
+            }
+            // 若会话写完、账本送达尚未写就崩窗，重开可从会话认出同一条消息。
+            if (shown()) locked(dir,current=>current.add({type:"合入送达",ref:r.n,source:window}));
           }
         }
       } catch(e) {console.error("dev-loop 待办：",e);}

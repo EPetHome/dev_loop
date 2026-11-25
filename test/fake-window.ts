@@ -7,11 +7,18 @@ export function fakeWindow() {
   const dir=process.env.LOOP_TASK_DIR!, id=process.env.LOOP_EXPECT_SESSION!, file=arg("--session") || join(arg("--session-dir")!,id+".jsonl"), handlers=new Map<string,Function>();
   if (!existsSync(file)) writeFileSync(file,JSON.stringify({type:"session",id})+"\n");
   let idle=true,assistant:any,percent:number|null=null;
-  const ctx={cwd:process.cwd(),hasUI:false,mode:"tui",getContextUsage:()=>({percent}),isIdle:()=>idle,shutdown:()=>setImmediate(()=>process.exit(0)),
-    sessionManager:{getBranch:()=>assistant ? [{message:assistant}] : [],getSessionId:()=>id,getSessionFile:()=>file}};
+  const hasUI=process.env.TEST_WINDOW_UI==="yes", transcript=jsonLines<any>(file).slice(1);
+  const ctx={cwd:process.cwd(),hasUI,mode:"tui",getContextUsage:()=>({percent}),isIdle:()=>idle,shutdown:()=>setImmediate(()=>process.exit(0)),
+    ui:{setStatus:()=>{},setTitle:(title:string)=>writeFileSync(join(dir,`title-${process.pid}`),title)},
+    sessionManager:{getBranch:()=>assistant ? [...transcript,{message:assistant}] : transcript,getSessionId:()=>id,getSessionFile:()=>file}};
   const emit=(name:string,event?:any)=>handlers.get(name)?.(event,ctx);
-  registerPi({on:(name,fn)=>{handlers.set(name,fn);},sendMessage:(message)=>{
-    appendFileSync(join(dir,"inbox.jsonl"),JSON.stringify({pid:process.pid,content:message.content})+"\n");idle=false;setImmediate(()=>emit("agent_start"));
+  registerPi({on:(name,fn)=>{handlers.set(name,fn);},sendMessage:(message,{triggerTurn})=>{
+    appendFileSync(join(dir,"inbox.jsonl"),JSON.stringify({pid:process.pid,...message,triggerTurn})+"\n");
+    if (triggerTurn) {idle=false;setImmediate(()=>emit("agent_start"));}
+    else {
+      const entry={type:"custom_message",...message};
+      appendFileSync(file,JSON.stringify(entry)+"\n");transcript.push(entry);
+    }
   }});
   emit("session_start"); let read=0;
   setInterval(()=>{

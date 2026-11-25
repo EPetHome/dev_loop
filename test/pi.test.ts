@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { registerPi } from "../src/hosts/pi.ts";
 import { Ledger, locked, type Entry, type Task } from "../src/core/store.ts";
 import { binding } from "../src/core/inputs.ts";
@@ -11,14 +12,14 @@ import { fixture, write, until, PASS, sq } from "./helpers.ts";
 function windowView(x: Task, receiveMessages = false) {
   const start = locked(x.dir, l => l.add({type: "开始", step: "开窗口"}));
   let refresh: (() => void) | undefined, title: string | undefined, status: string | undefined;
-  const messages: string[] = [];
+  const messages: string[] = [], branch: unknown[] = [];
   const ctx = {
     cwd: x.worktree, mode: "tui", hasUI: true, isIdle: () => receiveMessages,
     ui: {
       setTitle: (text: string) => { title = text; },
       setStatus: (key: string, text?: string) => { assert.equal(key, "dev-loop"); status = text; }
     },
-    sessionManager: {getSessionId: () => "test-session", getSessionFile: () => undefined, getBranch: () => []},
+    sessionManager: {getSessionId: () => "test-session", getSessionFile: () => undefined, getBranch: () => branch},
     shutdown: () => assert.fail("窗口不应关闭")
   };
   const handlers = new Map<string, (event: unknown, context: typeof ctx) => unknown>();
@@ -27,6 +28,7 @@ function windowView(x: Task, receiveMessages = false) {
     assert.equal(m.display, true);
     assert.equal(opts.triggerTurn, false, "通知不应另开模型轮次");
     messages.push(m.content);
+    branch.push({type: "custom_message", ...m});
   }}, {
     env: {LOOP_TASK_DIR: x.dir, LOOP_WINDOW_JOB: String(start.n), LOOP_PI_WINDOW_OWNER: String(process.ppid),
       LOOP_EXPECT_SESSION: "test-session", LOOP_WAKE: "manual"},
@@ -149,6 +151,46 @@ test("N4 A1/A3 · 完成后 Pi 原话只触发一次本地合入，窗口显示�
   assert.equal(f.git("rev-list", "--count", "--merges", "dev"), "1");
   assertWindow(view, x, "已合入");
   assert.equal(view.messages.length, 1);
+});
+
+for (const applied of [true, false]) test(`N4 返修 2 · 合入 worker 在快进${applied ? "后" : "前"}退出，仅补真实结论`, async t => {
+  const f = fixture(t), tipFile = join(f.base, "intended-merge");
+  const shim = write(join(f.base, "kill-window-merge.mjs"), `
+import cp from 'node:child_process'; import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const spawn=cp.spawnSync, tipFile=${JSON.stringify(tipFile)};
+cp.spawnSync=(cmd,args,...opts)=>{
+  if(cmd==='git' && args[0]==='merge' && args.includes('--ff-only') && !fs.existsSync(tipFile)) {
+    ${applied ? "const result=spawn(cmd,args,...opts); if (result.status!==0) return result;" : ""}
+    fs.writeFileSync(tipFile,args.at(-1)); process.kill(process.pid,'SIGKILL');
+  }
+  return spawn(cmd,args,...opts);
+}; syncBuiltinESMExports();`);
+  f.env.NODE_OPTIONS = [f.env.NODE_OPTIONS, `--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
+  const {x, view, commit} = await receipt(f), before = f.git("rev-parse", "dev");
+  await complete(f, x);
+  view.input("合入");
+  await f.pump(x.dir, () => existsSync(tipFile));
+  const tip = readFileSync(tipFile, "utf8");
+  assert.equal(f.git("rev-parse", "dev"), applied ? tip : before);
+  if (applied) f.git("commit", "--allow-empty", "-m", "advance dev before receipt recovery");
+  const head = f.git("rev-parse", "dev");
+  const l = await f.pump(x.dir, l => !!l.last("合入"));
+  const result = l.last("合入")!;
+  assert.equal(result.result, applied ? "成功" : "失败");
+  if (applied) {
+    assert.equal(result.value.devAfter, tip, "回执应是原合入提交，不是后来 dev 的 HEAD");
+    assert.equal(f.git("rev-parse", `${tip}^2`), commit);
+  } else assert.match(result.text!, /未确认.*合入/);
+  assertWindow(view, x, applied ? "已合入" : "合入失败");
+  assert.equal(view.messages.length, 1);
+  assert(view.messages[0].includes(applied ? tip : result.text!));
+  await tickTwice(f);
+  const after = new Ledger(x.dir);
+  assert.equal(after.rows.filter(r => r.type === "窗口原话").length, 1);
+  assert.equal(quoteIntents(after).length, 1);
+  assert.equal(after.rows.filter(r => r.type === "合入").length, 1);
+  assert.equal(f.git("rev-parse", "dev"), head);
+  assert.equal(f.git("rev-list", "--count", "--merges", "dev"), applied ? "1" : "0");
 });
 
 test("N4 A2 · 评审中说合入，通过后旧原话不补成意图", async t => {

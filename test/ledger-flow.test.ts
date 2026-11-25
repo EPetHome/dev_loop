@@ -2,6 +2,7 @@ import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { randomUUID } from "node:crypto";
@@ -20,7 +21,9 @@ async function control(t:Task,fields:any) {
   if (fields.type==="close") await until(t.dir,()=>stat(new Ledger(t.dir)).windowLive,v=>!v);
   else await until(t.dir,()=>jsonLines<any>(join(t.dir,"window-control-ack.jsonl")),rows=>rows.some(r=>r.id===id));
 }
-const inbox=(t:Task)=>jsonLines<{pid:number;content:string}>(join(t.dir,"inbox.jsonl"));
+const inbox=(t:Task)=>jsonLines<{pid:number;content:string;customType?:string;triggerTurn?:boolean}>(join(t.dir,"inbox.jsonl"));
+const mergeNotices=(t:Task)=>inbox(t).filter(r=>r.customType==="dev-loop-merge");
+const titleOf=(t:Task,pid:number)=>readFileSync(join(t.dir,`title-${pid}`),"utf8");
 const wakeToWindow=async(f:ReturnType<typeof fixture>,dir:string)=>(await f.pump(dir,l=>stat(l).busy)).task;
 const change=(t:Task,text="repaired\n")=>write(join(t.worktree,"src/app.txt"),text);
 const deliver=(f:ReturnType<typeof fixture>,t:Task,...opts:string[])=>f.call(["交付",...opts],t.worktree,{LOOP_TASK_DIR:t.dir,LOOP_ROLE:"development"});
@@ -185,6 +188,68 @@ test("A7/T15/T16 · 未授权无写入；重复开工返回同号；依赖推迟
   const a2=await wakeToWindow(f,changed.taskDir);change(a2);await deliver(f,a2);await control(a2,{type:"settle"});
   const next=join(f.root,changed.executions[1]);const prepared=await f.pump(next,l=>!!l.last("准备好"));assert.equal(prepared.task.baseCommit,f.git("rev-parse","dev"));
   assert.equal(new Ledger(a2.dir).rows.filter(r=>r.type==="窗口" && r.status==="开").length,1);
+});
+
+test("N4 返修 1 · 同批下一卡开窗后，已完成卡仍可在原 Pi 窗口合入",async t=>{
+  const f=fixture(t), bpath=write(join(f.repo,"B.json"),JSON.stringify({...f.raw,name:"B",tasks:[{...f.raw.tasks[0],name:"B"}]}));
+  f.env.TEST_WINDOW_UI="yes";
+  const batch=await f.call(["开工",f.card,bpath]), x=await wakeToWindow(f,batch.taskDir), bdir=join(f.root,batch.executions[1]);
+  assert(!new Ledger(bdir).last("准备好"));
+  const owner=stat(new Ledger(x.dir)).window!.owner!;
+  change(x);const {commit}=await deliver(f,x);await control(x,{type:"settle"});
+  await f.pump(x.dir,l=>!!l.last("完成"));
+  const next=await f.pump(bdir,l=>stat(l).busy);
+  assert.equal(stat(new Ledger(x.dir)).windowLive,true,"下一卡开窗不能关闭前一张完成卡");
+  await until(x.dir,()=>titleOf(x,owner.pid),s=>s.startsWith("【完成】"));
+  await control(x,{type:"input",text:"合入"});
+  const l=await f.pump(x.dir,l=>!!l.last("合入"));
+  const tip=l.last("合入")!.value.devAfter;
+  assert.equal(f.git("rev-parse","dev"),tip);
+  assert.equal(f.git("rev-parse","dev^2"),commit);
+  await control(x,{type:"settle"}); // Pi 空闲时将不触发模型的说明写进会话。
+  const notices=await until(x.dir,()=>mergeNotices(x),rows=>rows.length>0);
+  assert.deepEqual(notices.map(n=>[n.pid,n.triggerTurn]),[[owner.pid,false]]);
+  assert.match(notices[0].content,new RegExp(tip));
+  await until(x.dir,()=>titleOf(x,owner.pid),s=>s.startsWith("【已合入】"));
+  assert.equal(stat(new Ledger(bdir)).window?.n,stat(next).window?.n);
+});
+
+test("N4 返修 3 · Pi 在结论前崩窗，重开原会话补发一条合入说明",async t=>{
+  const f=fixture(t);f.env.TEST_WINDOW_UI="yes";
+  // 新窗保存说明后、登记已送达前再杀一次 Pi，检查会话去重而不靠进程内游标。
+  const interrupted=join(f.base,"notice-before-ack"), shim=write(join(f.base,"kill-before-notice-ack.mjs"),`
+import fs from 'node:fs'; import {syncBuiltinESMExports} from 'node:module';
+const append=fs.appendFileSync, marker=${JSON.stringify(interrupted)};
+fs.appendFileSync=(path,data,...opts)=>{
+  if (typeof path==='string' && path.endsWith('/ledger.jsonl') && String(data).includes('"type":"合入送达"') && !fs.existsSync(marker)) {
+    fs.writeFileSync(marker,String(process.pid)); process.kill(process.pid,'SIGKILL');
+  }
+  return append(path,data,...opts);
+}; syncBuiltinESMExports();`);
+  f.env.NODE_OPTIONS=[f.env.NODE_OPTIONS,`--import=${pathToFileURL(shim).href}`].filter(Boolean).join(" ");
+  const x=await open(f), old=stat(new Ledger(x.dir)).window!;
+  change(x);await deliver(f,x);await control(x,{type:"settle"});
+  await f.pump(x.dir,l=>!!l.last("完成"));
+  await control(x,{type:"input",text:"合入"});
+  process.kill(old.owner!.pid,"SIGKILL");
+  const merged=await f.pump(x.dir,l=>!!l.last("合入"));
+  assert.equal(stat(merged).windowLive,false);
+  assert.deepEqual(mergeNotices(x),[]);
+  const result=merged.last("合入")!, tip=result.value.devAfter;
+  const reopenedAfterResult=(l:Ledger)=>l.rows.find(r=>r.type==="窗口" && r.status==="开" && r.n>result.n);
+  const reopened=reopenedAfterResult(await f.pump(x.dir,l=>!!reopenedAfterResult(l)))!;
+  assert.equal(reopened.file,old.file);
+  const notices=await until(x.dir,()=>mergeNotices(x),rows=>rows.length>0);
+  assert.deepEqual(notices.map(n=>[n.pid,n.triggerTurn]),[[reopened.owner!.pid,false]]);
+  assert.match(notices[0].content,new RegExp(tip));
+  await until(x.dir,()=>readFileSync(interrupted,"utf8"),pid=>Number(pid)===reopened.owner!.pid);
+  const acknowledged=await f.pump(x.dir,l=>l.last("合入送达")?.ref===result.n);
+  const last=stat(acknowledged).window!;
+  assert(last.n>reopened.n);
+  assert.equal(last.file,old.file);
+  assert.equal(acknowledged.last("合入送达")?.source,last.n);
+  await until(x.dir,()=>titleOf(x,last.owner!.pid),s=>s.startsWith("【已合入】"));
+  assert.equal(mergeNotices(x).length,1);
 });
 
 test("A8 · 冲突清单发回，合入 dev 后起点前移、他人文件不进 diff，重新检查再合入",async t=>{
