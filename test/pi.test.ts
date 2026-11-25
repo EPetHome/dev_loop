@@ -1,24 +1,43 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import fs, { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { registerPi } from "../src/hosts/pi.ts";
 import { Ledger, locked, type Entry, type Task } from "../src/core/store.ts";
 import { binding } from "../src/core/inputs.ts";
 import { alive, identity } from "../src/infra/exec.ts";
+import { maybe } from "../src/infra/files.ts";
 import { fixture, write, writeFixtureScript, until, PASS, sq } from "./helpers.ts";
+
+type SessionEntry = {type:string; id:string; parentId:string|null; message?:{role:string;content:string}; details?:number};
+const history = [
+  {type:"message",id:"first-turn",parentId:null,message:{role:"user",content:"先实现第一项"}},
+  {type:"message",id:"first-answer",parentId:"first-turn",message:{role:"assistant",content:"已实现第一项"}},
+];
+function reloadBranch(file:string) {
+  // Pi 解析有效 JSON，各帧按 id 关联，最后一条的 parentId 一直追到根。
+  const entries=readFileSync(file,"utf8").split("\n").map(line=>maybe(()=>JSON.parse(line) as SessionEntry))
+    .filter((e): e is SessionEntry=>!!e && e.type!=="session");
+  const byId=new Map(entries.map(e=>[e.id,e])), branch:SessionEntry[]=[];
+  for (let e=entries.at(-1); e; e=e.parentId ? byId.get(e.parentId) : undefined) branch.unshift(e);
+  return branch;
+}
 
 function windowView(x: Task, receiveMessages = false, persist = appendFileSync) {
   const start = locked(x.dir, l => l.add({type: "开始", step: "开窗口"}));
-  const file = write(join(x.dir, "sessions", "test-session.jsonl"), '{"type":"session","id":"test-session"}\n');
+  const file=write(join(x.dir,"sessions","test-session.jsonl"),
+    [{type:"session",id:"test-session"},...history].map(e=>JSON.stringify(e)+"\n").join(""));
   let refresh: (() => void) | undefined, title: string | undefined, status: string | undefined;
-  const messages: string[] = [], branch: unknown[] = [];
+  const messages: string[] = [], branch: SessionEntry[] = [...history];
+  const link=()=>({id:`entry-${branch.length}`,parentId:branch.at(-1)?.id ?? null});
   const ctx = {
     cwd: x.worktree, mode: "tui", hasUI: true, isIdle: () => receiveMessages,
     ui: {
       setTitle: (text: string) => { title = text; },
-      setStatus: (key: string, text?: string) => { assert.equal(key, "dev-loop"); status = text; }
+      setStatus: (key: string, text?: string) => { assert.equal(key, "dev-loop"); status = text; },
+      notify: (text:string)=>{ assert(receiveMessages); messages.push(text); }
     },
     sessionManager: {getSessionId: () => "test-session", getSessionFile: () => file, getBranch: () => branch},
     shutdown: () => assert.fail("窗口不应关闭")
@@ -29,7 +48,7 @@ function windowView(x: Task, receiveMessages = false, persist = appendFileSync) 
     assert.equal(m.display, true);
     assert.equal(opts.triggerTurn, false, "通知不应另开模型轮次");
     // Pi 先更新内存，写入失败由宿主捕获；只有存入会话才发出显示事件。
-    const entry = {type: "custom_message", ...m};
+    const entry = {type: "custom_message", ...m, ...link()};
     branch.push(entry);
     try { persist(file, JSON.stringify(entry) + "\n"); }
     catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOSPC") return; throw e; }
@@ -46,7 +65,12 @@ function windowView(x: Task, receiveMessages = false, persist = appendFileSync) 
     input: (text: string, source = "interactive") => handlers.get("input")!({text, source}, ctx),
     busy: () => handlers.get("agent_start")!({}, ctx),
     abort: () => handlers.get("agent_settled")!({aborted: true}, ctx),
-    refresh: () => { refresh!(); return {title, status}; }, messages
+    refresh: () => { refresh!(); return {title, status}; },
+    laterTurn: (content:string)=>{
+      const entry={type:"message",...link(),message:{role:"user",content}};
+      branch.push(entry); appendFileSync(file,JSON.stringify(entry)+"\n");
+      return entry;
+    }, file, branch, messages
   };
 }
 
@@ -314,15 +338,27 @@ exit 0
   assert.equal(f.git("rev-list", "--count", "--merges", "dev"), "1");
 });
 
-test("N4 复审 2 · Pi 会话写满时不记送达，恢复后实际重发一次", async t => {
+for (const how of ["缺换行","截断 UTF-8 后已有后续对话"]) test(`N4 复审 2 · Pi 会话写满时不记送达，恢复后实际重发一次（${how}）`, async t => {
   const f = fixture(t);
   let full = true, attempts = 0;
   const {x, view, commit} = await receipt(f, (file, bytes) => {
     attempts++;
     if (!full) return appendFileSync(file, bytes);
-    if (attempts === 1) appendFileSync(file, String(bytes).slice(0, -1)); // JSON 写完但换行没写入。
+    if (attempts===1) {
+      const frame=Buffer.from(String(bytes));
+      const end=how==="缺换行" ? frame.length-1 : frame.indexOf(Buffer.from("合入失败"))+1;
+      appendFileSync(file,frame.subarray(0,end));
+    }
     throw Object.assign(new Error("disk full"), {code: "ENOSPC"});
   });
+  const rename=fs.renameSync;
+  const diskFull=Object.assign(new Error("disk full"),{code:"ENOSPC"});
+  const keepFull=t.mock.method(fs,"renameSync",(from:fs.PathLike,to:fs.PathLike)=>{
+    if (to===view.file && full) throw diskFull;
+    rename(from,to);
+  });
+  syncBuiltinESMExports();
+  t.after(()=>{keepFull.mock.restore();syncBuiltinESMExports();});
   locked(x.dir, l => l.add({type: "完成", sha: commit}));
   view.input("合入");
   const refused = (await f.pump(x.dir, l => !!l.last("合入") || !!l.last("评审"))).last("合入")!;
@@ -333,17 +369,24 @@ test("N4 复审 2 · Pi 会话写满时不记送达，恢复后实际重发一�
   view.refresh();
   assert.deepEqual(view.messages, []);
   assert.equal(new Ledger(x.dir).last("合入送达"), undefined, "会话内存已有也不能提前确认");
-  full = false;
+  const original=readFileSync(view.file).subarray(0,Buffer.byteLength([
+    {type:"session",id:"test-session"},...history
+  ].map(e=>JSON.stringify(e)+"\n").join("")));
+  full=false;
+  const later=how==="缺换行" ? [] : [view.laterTurn("磁盘恢复后我又说了一句")];
   view.refresh();
   assert.equal(view.messages.length, 1);
   assert(view.messages[0].includes(refused.text!));
   assert.equal(new Ledger(x.dir).last("合入送达")?.ref, refused.n);
   view.refresh();
   assert.equal(view.messages.length, 1);
-  const file = new Ledger(x.dir).last("窗口")!.file!;
-  const messages = readFileSync(file, "utf8").split("\n").filter(line => line.includes('"customType":"dev-loop-merge"') && !line.endsWith("\0"));
-  assert.equal(messages.length, 1);
-  assert.equal(JSON.parse(messages[0]).details, refused.n);
+  const branch=reloadBranch(view.file), receiptEntries=branch.filter(e=>e.type==="custom_message");
+  assert.deepEqual(branch.filter(e=>e.type==="message"),[...history,...later],"重开时原对话和后续对话均可从活动叶回溯");
+  assert.deepEqual(readFileSync(view.file).subarray(0,original.length),original,"不变更之前的会话字节");
+  assert.equal(receiptEntries.length,1);
+  assert.equal(receiptEntries[0].details,refused.n);
+  assert.equal(receiptEntries[0].id,view.branch[history.length].id,"补齐原条目，不产生悬空父节点");
+  assert.deepEqual(branch,view.branch,"重载后的活动链和原 Pi 的内存链一致");
 });
 
 test("N4 A5 · 伪造完成遭合入工具拒绝，窗口说明原因且查询报缺证据", async t => {

@@ -9,7 +9,8 @@ export function fakeWindow() {
   let idle=true,assistant:any,percent:number|null=null;
   const hasUI=process.env.TEST_WINDOW_UI==="yes", transcript=jsonLines<any>(file).slice(1);
   const ctx={cwd:process.cwd(),hasUI,mode:"tui",getContextUsage:()=>({percent}),isIdle:()=>idle,shutdown:()=>setImmediate(()=>process.exit(0)),
-    ui:{setStatus:()=>{},setTitle:(title:string)=>writeFileSync(join(dir,`title-${process.pid}`),title)},
+    ui:{setStatus:()=>{},setTitle:(title:string)=>writeFileSync(join(dir,`title-${process.pid}`),title),
+      notify:(content:string)=>appendFileSync(join(dir,"inbox.jsonl"),JSON.stringify({pid:process.pid,content})+"\n")},
     sessionManager:{getBranch:()=>assistant ? [...transcript,{message:assistant}] : transcript,getSessionId:()=>id,getSessionFile:()=>file}};
   const emit=(name:string,event?:any)=>handlers.get(name)?.(event,ctx);
   registerPi({on:(name,fn)=>{handlers.set(name,fn);},sendMessage:(message,{triggerTurn})=>{
