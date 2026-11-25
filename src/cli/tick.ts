@@ -23,16 +23,19 @@ export function decide(l:Ledger,now=Date.now()) {
     if (!wait) return hold(8,"环境修不好",failed.text || "部署结果不明确，自动回退失败",{step:"部署"});
   }
   if (!batchPresent(l)) return;
-  if (stop) return stop===l.last("停") && stop.result==="已放弃" && !rows.some(r=>r.type==="放弃" && success(r)) && !s.running && !s.queued ? tool(2,"放弃") : undefined;
+  if (stop) return stop===l.last("停") && stop.result==="已放弃" && !rows.some(r=>r.type==="放弃" && success(r)) && !s.running && !s.queued
+    ? tool(2,"放弃") : undefined;
   if (wait) return say(1,"等待："+wait.wait);
   if (s.running || s.queued || s.busy || s.suspended) return say(2,s.suspended ? "本人中止，等本人说话" : s.busy ? "窗口忙" : "已有工具在跑");
   if ((!ready || !s.windowLive && s.todo.length) && !batchReady(l)) return say(0,"等待同批前置卡或窗口名额");
   const cutoff=rows.findLast(r=>resets.includes(r.type))?.n || 0;
   const retries=rows.filter(r=>r.retry && (r.type==="开始" || r.type==="发回")).length, cfg=t.config;
-  const lastEnd=(step:Step,hash=key,target?:string)=>rows.findLast(r=>r.type===step && !r.repair && r.n>cutoff && (!hash || r.key===hash) && (target===undefined || r.target===target));
+  const lastEnd=(step:Step,hash=key,target?:string)=>rows.findLast(r=>
+    r.type===step && !r.repair && r.n>cutoff && (!hash || r.key===hash) && (target===undefined || r.target===target));
   const tri=(cause:Entry)=>rows.findLast(r=>r.type==="分诊" && Number(r.target)===cause.n && !r.kind);
   const retry=(rule:number,step:Step,fail:Entry,attempts:number,again:()=>Decision):Decision=>{
-    if (attempts>=cfg.retry.times || retries>=cfg.cardRetryBudget) return hold(rule,"环境修不好",`${fail.text || step+"失败"}\n已自动重试 ${attempts} 次，本卡累计 ${retries} 次。`,{step});
+    if (attempts>=cfg.retry.times || retries>=cfg.cardRetryBudget) return hold(rule,"环境修不好",
+      `${fail.text || step+"失败"}\n已自动重试 ${attempts} 次，本卡累计 ${retries} 次。`,{step});
     if (now<Date.parse(fail.at)+cfg.retry.delaysMin[attempts]*60000) return say(rule,"按退避等候重试："+step,{step});
     return again();
   };
@@ -43,7 +46,8 @@ export function decide(l:Ledger,now=Date.now()) {
     if (how==="等本人") return hold(rule,"需求疑问",failure.text || "分诊不能确认原因",{step});
     if (how==="发回") return say(rule,failure.text || "请修复",{type:"发回",step,todo:failure.text || "请修复后交付",ref:failure.n});
     if (failure.kind==="超时" && retries<cfg.cardRetryBudget) return tool(rule,step,{...extra,retry:true});
-    const n=rows.filter(r=>r.type==="开始" && r.retry && r.step===step && r.n>cutoff && r.key===(extra.key ?? key) && (!extra.target || r.target===extra.target)).length;
+    const n=rows.filter(r=>r.type==="开始" && r.retry && r.step===step && r.n>cutoff && r.key===(extra.key ?? key)
+      && (!extra.target || r.target===extra.target)).length;
     return retry(rule,step,failure,n,()=>tool(rule,step,{...extra,retry:true}));
   };
   if (!ready) return attempt(0,"准备",{key:""});
@@ -56,7 +60,10 @@ export function decide(l:Ledger,now=Date.now()) {
     if (settled.ending!=="error") return say(3,"非 stop："+settled.ending+"，不收货、不评审、不扣轮数",{type:"发回",ref:settled.n,todo:undefined});
     const base=rows.findLast(r=>r.status==="闲" && r.ending==="stop")?.n || 0;
     const n=rows.filter(r=>r.retry && r.step==="开窗口" && r.type==="发回" && r.n>Math.max(cutoff,base)).length;
-    const raw=settled.error || settled.text || "无详情"; return retry(3,"开窗口",{...settled,text:raw},n,()=>say(3,"开发出错，退避后继续",{type:"发回",ref:settled.n,step:"开窗口",retry:true,todo:"继续。上次出错："+raw}));
+    const raw=settled.error || settled.text || "无详情";
+    return retry(3,"开窗口",{...settled,text:raw},n,()=>say(3,"开发出错，退避后继续",{
+      type:"发回",ref:settled.n,step:"开窗口",retry:true,todo:"继续。上次出错："+raw
+    }));
   }
   if (s.undelivered.length && s.windowLive) return say(2,"等窗口送达待办");
   const attemptRow=rows.findLast(r=>r.type==="收货" && r.n>s.last);
@@ -80,12 +87,14 @@ export function decide(l:Ledger,now=Date.now()) {
   const {test,review,verified,accepted}=proofs!, product=(r:Entry,step:"复测"|"评审"|"部署")=>{
     if (returned(r)) return;
     const items=r.value?.items || [], raw=r.text || (items.length ? "评审必修：\n"+items.join("\n") : "按检查原文修复后交付");
-    return say(8,raw,{type:"发回",ref:r.n,step,count:1,value:{items},todo:raw,...(s.returned(step).length+1>=s.allowance(step) && {wait:"轮数用完",level:step,text:returnedMessage(s,step,raw)})});
+    return say(8,raw,{type:"发回",ref:r.n,step,count:1,value:{items},todo:raw,
+      ...(s.returned(step).length+1>=s.allowance(step) && {wait:"轮数用完",level:step,text:returnedMessage(s,step,raw)})});
   };
   if (!accepted) {
     if (test?.kind==="产品") return product(test,"复测");
     if (!test?.check || !["通过","没验证"].includes(test.check.result)) return attempt(6,"复测");
-    if (review?.blocker) return rows.some(r=>r.n>review.n && (r.type==="答复" || r.type==="窗口原话")) ? attempt(7,"评审") : hold(8,"需求疑问",review.blocker,{ref:review.n,step:"评审"});
+    if (review?.blocker) return rows.some(r=>r.n>review.n && (r.type==="答复" || r.type==="窗口原话"))
+      ? attempt(7,"评审") : hold(8,"需求疑问",review.blocker,{ref:review.n,step:"评审"});
     if (review?.check?.result==="必修") return product(review,"评审");
     if (!review?.check || review.check.result!=="通过") return attempt(7,"评审");
     if (!verified) return t.after.length ? hold(8,"需求疑问","复测未验证，不能自动收尾；须有真实复测通过或本人接受未验证") : undefined;
@@ -110,7 +119,8 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now()) {
       for (const dead of state(l,false).starts.filter(r=>!alive(r.owner))) {
         const opened=dead.step==="开窗口" && l.rows.some(r=>r.type==="窗口" && r.status==="开" && r.ref===dead.n);
         if (!opened) for (const e of l.rows.filter(r=>r.type==="子进程" && r.ref===dead.n)) signalProcess(e.owner,e.status!=="窗口");
-        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,result:opened ? "成功" : "失败",...(!opened && {kind:"重试",text:"工具进程已退出，未留下结论"})},now);
+        l.add({type:dead.step!,step:dead.step,sha:dead.sha,key:dead.key,target:dead.target,repair:dead.repair,ref:dead.n,
+          result:opened ? "成功" : "失败",...(!opened && {kind:"重试",text:"工具进程已退出，未留下结论"})},now);
       }
       const decision=decide(l,now); if (decision) {
         const {job,...row}=decision;
@@ -118,7 +128,9 @@ export function tick(target?:string,root=tasksRoot(),now=Date.now()) {
         if (job) {
           const log=openSync(join(dir,"worker.log"),"a");
           try {
-            const id=(l.rows.at(-1)?.n || 0)+1, p=spawn(process.execPath,[entrypoint,"_worker",dir,String(id),job.step],{env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:undefined},detached:true,stdio:["ignore",log,log]});
+            const id=(l.rows.at(-1)?.n || 0)+1, p=spawn(process.execPath,[entrypoint,"_worker",dir,String(id),job.step],{
+              env:{...process.env,LOOP_ROLE:undefined,LOOP_TASK_DIR:undefined},detached:true,stdio:["ignore",log,log]
+            });
             p.on("error",console.error); p.unref(); l.add({...row,...job,owner:p.pid ? identity(p.pid) : undefined},now);
           } finally {closeSync(log);}
         } else if (row.type!=="调度" || l.last("调度")?.text!==row.text || l.last("调度")?.owner) {

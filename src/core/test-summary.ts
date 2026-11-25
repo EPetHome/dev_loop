@@ -17,7 +17,8 @@ export function clip(text: string, limit: number, tail = false): string {
 }
 export function testLogSummary(command: string, result: string, log: string, budget = 8192): string {
   let raw: Buffer | undefined; try { raw = readFileSync(log); } catch {} // 原文缺失不阻断补评审
-  const lines = raw?.toString("utf8").trimEnd().split(/\r\n|\r|\n/).map(stripVTControlCharacters) ?? [], counts: Record<string,number> = {}, names = new Set<string>();
+  const lines = raw?.toString("utf8").trimEnd().split(/\r\n|\r|\n/).map(stripVTControlCharacters) ?? [],
+    counts: Record<string,number> = {}, names = new Set<string>();
   for (const line of lines) {
     const count = /^(?:#|ℹ)\s+(pass|fail)\s+(\d{1,15})\s*$/.exec(line); if (count) counts[count[1]] = Number(count[2]);
     const maven = /^(?:\[(?:INFO|ERROR)\]\s+)?Tests run: (\d{1,15}), Failures: (\d{1,15}), Errors: (\d{1,15}), Skipped: (\d{1,15})\s*$/.exec(line);

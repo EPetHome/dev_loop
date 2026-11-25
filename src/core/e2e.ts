@@ -58,13 +58,16 @@ export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: strin
       const scene = scenarios.get(id); requireReport(scene,"缺少场景："+id);
       const steps = indexed(scene.steps,checks.map(checkId),id+" 检查点"), incomplete = new Set<string>();
       for (const [index,check] of checks.entries()) {
-        const name=checkId(check), step=steps.get(name), label=id+" / "+name; if (!step) { requireReport(incomplete.size && index === steps.size,"缺少检查点："+label); break; }
+        const name=checkId(check), step=steps.get(name), label=id+" / "+name;
+        if (!step) { requireReport(incomplete.size && index === steps.size,"缺少检查点："+label); break; }
         const {actual,dependency,error,cause} = step, expected = typeof check === "string" ? undefined : check.expected;
         requireReport(statuses.includes(step.status) && observed(actual),label+"：缺少有效状态或实得值 actual");
         if (witness) target = {status:step.status,actual};
         const status = step.status === "通过" && expected !== undefined && actual !== expected ? "失败" : step.status;
         if (!incomplete.has(status)) (status === "失败" ? failures : notes).push(
-          `${label}：${status}${expected === undefined ? "" : "；预期："+JSON.stringify(expected)}；实得：${typeof actual === "string" ? actual : JSON.stringify(actual)}`);
+          `${label}：${status}${expected === undefined ? "" : "；预期："+JSON.stringify(expected)}；实得：${
+            typeof actual === "string" ? actual : JSON.stringify(actual)
+          }`);
         if (status !== "通过") incomplete.add(status);
         load(() => {
           requireReport(Array.isArray(step.evidence) && step.evidence.length,"缺少证据");
@@ -73,7 +76,8 @@ export function e2eResult({dir,plan}: ReturnType<typeof planE2e>, command: strin
           if (status !== "未验证") return;
           const probe = paths[step.evidence.indexOf(step.probe)], invalid = "前置探测须与已声明依赖、不可用结果、诊断和原错一致";
           requireReport(cause === "外部环境" && dependencies?.includes(dependency) && typeof error === "string" && error.trim() && probe,invalid);
-          const proof = load(() => readJson<Binding & {dependency?: string; result?: string; error?: string}>(probe),`${invalid}；${step.probe} 不是探测记录：${error}`);
+          const proof = load(() => readJson<Binding & {dependency?: string; result?: string; error?: string}>(probe),
+            `${invalid}；${step.probe} 不是探测记录：${error}`);
           bind(proof,plan,"前置探测"); requireReport(proof.dependency === dependency && proof.result === "不可用" && proof.error === error,invalid);
           notes.push(`${label}：外部依赖 ${dependency}\n${error}`);
         },label);

@@ -28,7 +28,8 @@ export async function snapshot(t:Task,cwd:string,commit:string,out:string,mode:"
 export function differences(a:string,b:string) {try {return compare(readJson(a),readJson(b)).join("\n") || "无差异";}catch{return "没有基线";}}
 export function staticSnapshot(t:Task,cwd:string,commit:string,out:string,previous?:string) {
   const start=Date.now();try {
-    const dependencies=Object.fromEntries(["package-lock.json","pnpm-lock.yaml","yarn.lock","bun.lockb"].filter(p=>existsSync(join(cwd,p))).map(p=>[p,digest(readFileSync(join(cwd,p)))]));
+    const dependencies=Object.fromEntries(["package-lock.json","pnpm-lock.yaml","yarn.lock","bun.lockb"]
+      .filter(p=>existsSync(join(cwd,p))).map(p=>[p,digest(readFileSync(join(cwd,p)))]));
     writeJson(out,{commit,dependencies,files:previous?gitText(t.repo,["diff","--name-only",previous,commit,"--"]).split("\n").filter(Boolean):[]});
   } catch(e) {recordStep(t.dir,{step:"留痕",result:"失败",commit,...span(start),evidence:[],detail:String(e)});}
 }

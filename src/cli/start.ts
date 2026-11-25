@@ -13,10 +13,15 @@ export function startCards(files:string[],edges:string[],words:string,dispatch?:
   if (!files.length) throw new InputError("开工需要开发卡路径");
   let drafts:(Task & {title:string})[];
   try { drafts=files.map(path=>{
-    const {file,repo,card,cardHash}=readCard(resolve(path)), {acceptance,base,after}=card, task=card.tasks[0], config=loadConfig(repo,!!task.proofs?.length,card.limits,after.includes("部署"));
+    const {file,repo,card,cardHash}=readCard(resolve(path)), {acceptance,base,after}=card, task=card.tasks[0],
+      config=loadConfig(repo,!!task.proofs?.length,card.limits,after.includes("部署"));
     commitOf(repo,devRef); if (after.includes("推送")) gitText(repo,["remote","get-url","origin"]);
     if (after.includes("部署") && (!config.deploy?.check || !config.deploy.rollback)) throw new InputError("自动部署须登记 deploy.cmd/check/rollback");
-    return {...task,title:card.name,host:"pi",repo,card:file,cardHash,acceptance,base,after,config,limits:config.limits,createdAt:iso(),dispatchId:dispatch || null,baseCommit:"",executionId:"",worktree:"",dir:"",branch:"",proofs:task.proofs?.map(p=>({...p,before:p.before || ""}))};
+    return {
+      ...task,title:card.name,host:"pi",repo,card:file,cardHash,acceptance,base,after,config,limits:config.limits,
+      createdAt:iso(),dispatchId:dispatch || null,baseCommit:"",executionId:"",worktree:"",dir:"",branch:"",
+      proofs:task.proofs?.map(p=>({...p,before:p.before || ""}))
+    };
   }); } catch(e) {throw new InputError(errorText(e));}
   if (new Set(drafts.map(t=>t.card)).size!==drafts.length) throw new InputError("同批卡不得重复");
   const index=(s:string)=>{
@@ -34,18 +39,28 @@ export function startCards(files:string[],edges:string[],words:string,dispatch?:
   const hash=digest(JSON.stringify(drafts.map((t,i)=>{const h=inputs(t);return [t.card,t.cardHash,h.promptHash,h.acceptanceHash,[...deps[i]].sort()];})));
   let root=tasksRoot(); mkdirSync(root,{recursive:true,mode:0o700});root=realpathSync(root);
   const ids=drafts.map((t,i)=>[ascii(basename(t.repo)),ascii(t.name),hash.slice(0,12),String(i+1)].join("-")), leader=order[0];
-  const receipt=(l:Ledger)=>{const s=publish(l), t=l.task;return {executionId:t.executionId,taskDir:t.dir,status:join(t.dir,"status.json"),state:"working",warnings:s.warnings,...(ids.length>1 && {executions:ids})};};
+  const receipt=(l:Ledger)=>{
+    const s=publish(l), t=l.task;
+    return {executionId:t.executionId,taskDir:t.dir,status:join(t.dir,"status.json"),state:"working",
+      warnings:s.warnings,...(ids.length>1 && {executions:ids})};
+  };
   const result=withLock(join(root,"start.lock"),()=>{
     if (instruction) for (const dir of allTasks(root)) {
       if (hasLedger(dir)) {const l=new Ledger(dir); if(l.open.instruction===instruction)return receipt(l);}
-      else {const i=jsonLines<{id:string;type:string;result:unknown}>(join(dir,"instructions.jsonl")).find(x=>x.id===instruction && x.type==="启动"); if(i)return i.result;}
+      else {
+        const i=jsonLines<{id:string;type:string;result:unknown}>(join(dir,"instructions.jsonl")).find(x=>x.id===instruction && x.type==="启动");
+        if(i)return i.result;
+      }
     }
     for (const i of [...order.slice(1),leader]) {
       const t=drafts[i], executionId=ids[i], dir=join(root,executionId); if(hasLedger(dir))continue;
       Object.assign(t,{executionId,dir,branch:"dev-loop/"+executionId,worktree:join(dir,"worktree")});
       const temp=mkdtempSync(join(root,".open-"));
       try {
-        atomicWrite(ledgerFile(temp),JSON.stringify({n:1,at:t.createdAt,type:"开工",task:t,text:words,todo:"按开发卡开发、验证并交付。",batch:order.map(i=>ids[i]),deps:[...deps[i]].map(i=>ids[i]),limit:drafts[leader].config.maxParallelCards,...(i===leader && {instruction})})+"\n");
+        atomicWrite(ledgerFile(temp),JSON.stringify({
+          n:1,at:t.createdAt,type:"开工",task:t,text:words,todo:"按开发卡开发、验证并交付。",batch:order.map(i=>ids[i]),
+          deps:[...deps[i]].map(i=>ids[i]),limit:drafts[leader].config.maxParallelCards,...(i===leader && {instruction})
+        })+"\n");
         renameSync(temp,dir);
       } finally {rmSync(temp,{recursive:true,force:true});}
     }

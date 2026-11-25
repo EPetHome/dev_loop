@@ -1,4 +1,5 @@
-const sections=(output:string)=>Object.fromEntries([...output.matchAll(/^##[ \t]+([^\r\n]+)\r?$([\s\S]*?)(?=^##[ \t]|$(?![\s\S]))/gm)].map(m=>[m[1].trim(),m[2].trim()]));
+const sections=(output:string)=>Object.fromEntries(
+  [...output.matchAll(/^##[ \t]+([^\r\n]+)\r?$([\s\S]*?)(?=^##[ \t]|$(?![\s\S]))/gm)].map(m=>[m[1].trim(),m[2].trim()]));
 export function originalReview(output:string) {
   const parts=sections(output), titles=Object.keys(parts).filter(k=>/^结论\s*[:：]/.test(k)), body=parts.必修;
   if (titles.length!==1 || body===undefined) return;
