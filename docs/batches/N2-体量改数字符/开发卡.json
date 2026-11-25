@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "N2-体量改数字符",
+  "nature": "开发",
+  "base": "dev",
+  "target": "dev",
+  "host": "pi",
+  "flow": [
+    "开发评审",
+    "测试"
+  ],
+  "tasks": [
+    {
+      "name": "N2-体量改数字符",
+      "prompt": "../../prompt/提示词-N2-体量改数字符.md",
+      "scope": {
+        "allow": [
+          "src/**",
+          "test/**",
+          "README.md",
+          "docs/参考-运行细节.md"
+        ]
+      },
+      "test": "PATH=/Users/Admin/.hermes/node/bin:$PATH node --test test/*.test.ts"
+    }
+  ],
+  "limits": {
+    "测试": {
+      "maxRepairs": 3,
+      "timeoutMin": 20
+    },
+    "开发评审": {
+      "maxRepairs": 4,
+      "timeoutMin": 60
+    }
+  }
+}
